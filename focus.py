@@ -767,8 +767,27 @@ def _icon_image(color: str):
     return img
 
 
+def _panel_url(path: str = "") -> str:
+    """面板地址。端口可能不是默认的，所以问 dashboard 要，别硬编码。"""
+    import dashboard
+    dashboard.serve_background(open_browser=False)
+    return dashboard.base_url().rstrip("/") + path
+
+
+def _pending_ratings() -> int:
+    try:
+        import ratings
+        import report
+        items = report._timed(report.load(since=time.time() - 2 * 86400))
+        return len(ratings.pending(items))
+    except Exception:
+        log.exception("检查待评分失败")
+        return 0
+
+
 def run_tray(mon: Monitor) -> None:
     import pystray
+    import webbrowser
 
     def refresh(icon) -> None:
         label, color = STATES.get(mon.state, STATES["away"])
@@ -778,19 +797,34 @@ def run_tray(mon: Monitor) -> None:
     mon.on_state = lambda _s: refresh(icon)
 
     def on_block_end(block_start: float) -> None:
-        """提醒打分。通知本身不能阻断采集，所以整段都包起来。"""
+        """提醒打分。
+
+        气泡是点不出反应的 —— pystray 的 _on_notify 只处理左键和右键，
+        没有接 NIN_BALLOONUSERCLICK。所以文案里直接写清楚该点哪，
+        别让用户去点那个气泡。
+        """
         try:
-            icon.notify("刚才那 30 分钟你觉得自己专注吗？"
-                        "打开面板 →「自述评分」打个分（1–5）",
+            icon.notify(f"刚才那 30 分钟你觉得自己专注吗？"
+                        f"点托盘图标即可打分（待评 {_pending_ratings()} 个时段）",
                         "专注监视 · 该打个分了")
         except Exception:
             log.exception("托盘通知失败")
 
     mon.on_block_end = on_block_end
 
-    def on_dash(icon, _item):
-        import dashboard
-        dashboard.serve_background()
+    def on_panel(icon, _item):
+        webbrowser.open(_panel_url())
+
+    def on_rate(icon, _item):
+        webbrowser.open(_panel_url("/rate"))
+
+    def on_default(icon, _item):
+        """左键单击图标：有待评分就去评分页，否则打开面板。
+
+        这是 pystray 在 Windows 上唯一保证能触发的"特殊动作"
+        （HAS_DEFAULT_ACTION），比气泡可靠得多。
+        """
+        (on_rate if _pending_ratings() > 0 else on_panel)(icon, _item)
 
     def on_report(icon, _item):
         import report
@@ -810,7 +844,10 @@ def run_tray(mon: Monitor) -> None:
         _icon_image(STATES["away"][1]),
         "专注监视",
         menu=pystray.Menu(
-            pystray.MenuItem("实时面板", on_dash),
+            pystray.MenuItem("打开面板 / 去评分（左键点我）", on_default,
+                             default=True),
+            pystray.MenuItem("自述评分", on_rate),
+            pystray.MenuItem("实时面板", on_panel),
             pystray.MenuItem("生成报告", on_report),
             pystray.MenuItem("暂停/继续", on_pause),
             pystray.MenuItem("退出", on_quit),

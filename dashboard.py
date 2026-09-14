@@ -554,6 +554,16 @@ def serve_background(port: int = DEFAULT_PORT, open_browser: bool = True) -> str
     return url
 
 
+def base_url() -> str:
+    """当前面板的真实地址。
+
+    端口不一定等于 DEFAULT_PORT —— 被占用时会往后顺延，所以任何地方
+    都别硬编码 8787。
+    """
+    port = _server.server_port if _server is not None else DEFAULT_PORT
+    return f"http://127.0.0.1:{port}/"
+
+
 def main() -> None:
     url = serve_background()
     print(f"实时面板: {url}\nCtrl+C 停止")
