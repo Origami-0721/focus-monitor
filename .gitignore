@@ -1,0 +1,25 @@
+# ── 个人数据，绝对不要提交 ──
+# focus.db 里存着你的窗口标题（聊天、网站、游戏名），是实打实的个人数据。
+focus.db
+focus.db-*
+config.json
+focus.log
+focus.log.*
+
+# 生成的报告同样含个人统计
+report.html
+demo-report.html
+
+# ── 模型文件：首次运行自动下载（约 11MB）──
+models/
+
+# ── Python ──
+.venv/
+__pycache__/
+*.py[cod]
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

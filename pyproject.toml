@@ -1,0 +1,12 @@
+[project]
+name = "focus-monitor"
+version = "0.1.0"
+description = "摄像头 + 屏幕使用双路专注度监视器"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "mediapipe>=1.0",
+    "opencv-python>=4.10",
+    "numpy",
+    "pillow",
+    "pystray",
+]
