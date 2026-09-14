@@ -1257,6 +1257,23 @@ def selftest() -> None:
     # 时间空档不能拼：3 分钟专注 + 6 小时停机 + 3 分钟专注，绝不是一段心流
     assert _fl((0, 180, "focused"), (21600, 180, "focused")) == []
 
+    # 心流要求片段里"专注"（工作应用）占比 ≥50%。
+    # 旧定义只看"投入"，而投入包含中性 —— 于是"坐下来盯着屏幕"就算心流，
+    # 会话一开头就满足条件，印出"进入心流耗时 0 秒"。
+    assert _fl((0, 1800, "neutral")) == [], "纯中性是坐着看屏幕，不算心流"
+    assert _fl((0, 1800, "deskwork")) == [], "纯伏案也不算"
+    assert len(_fl((0, 1800, "focused"))) == 1
+    assert len(_fl((0, 900, "focused"), (900, 900, "neutral"))) == 1, "正好一半算过"
+    assert _fl((0, 600, "focused"), (600, 1200, "neutral")) == [], "只占 1/3 不算"
+
+    # 时段划分：边界值必须归下一段，错一格会让整天数据移位
+    def _at(hour):
+        return time.mktime((2026, 1, 1, hour, 0, 0, 0, 0, -1))
+    for _h, _want in ((0, "凌晨"), (3, "凌晨"), (5, "凌晨"), (6, "上午"),
+                      (11, "上午"), (12, "下午"), (17, "下午"),
+                      (18, "晚上"), (23, "晚上")):
+        assert report._band(_at(_h)) == _want, f"{_h} 点应属{_want}"
+
     def _sess(*blocks):
         return report._sessions(report._timed([r for b in blocks for r in _mk(*b)]))
 

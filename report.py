@@ -38,9 +38,25 @@ MAX_GAP = 5.0           # 样本间隔超过这个秒数就不计入任何状态
 AWAY_SAMPLE_CAP = 40.0  # 离开期间降频到 30 秒一条，容差给到 40 秒
 SESSION_GAP = 120.0     # 空档超过 2 分钟 → 新会话（待机 / 关机 / 崩溃）
 SESSION_AWAY = 900.0    # 连续离开超过 15 分钟 → 本次会话结束
-FLOW_MIN = 900.0        # 连续专注 ≥15 分钟算进入心流
+FLOW_MIN = 900.0        # 连续投入 ≥15 分钟才算心流片段
 FLOW_GAP = 60.0         # 心流片段内允许 ≤60 秒的短暂中断
-MIN_HOUR_DATA = 600.0   # 某个钟点至少累积 10 分钟才参与"黄金时段"排名，否则样本太少
+FLOW_FOCUS_RATIO = 0.5  # 片段里"专注"（工作应用）至少要占一半
+MIN_HOUR_DATA = 600.0   # 某个时段至少累积 10 分钟才参与排名，否则样本太少
+# 一个时段至少要这么多个"有进入耗时记录"的会话才给平均值。
+# 只有 1~2 个样本时求平均没有意义，直接显示"数据不足"比印个假数字诚实。
+MIN_BAND_SESSIONS = 3
+
+# 时段先做粗。样本够了再逐步压缩（4 段 → 每 3 小时 → 每小时）。
+TIME_BANDS = (("凌晨", 0), ("上午", 6), ("下午", 12), ("晚上", 18))
+
+
+def _band(ts: float) -> str:
+    """时间戳落在哪个时段。"""
+    h = time.localtime(ts).tm_hour
+    for name, start in reversed(TIME_BANDS):
+        if h >= start:
+            return name
+    return TIME_BANDS[0][0]
 
 
 def load(db_path: Path = DB_PATH, since: float | None = None) -> list[tuple]:
@@ -195,11 +211,17 @@ def _streaks(items: list[tuple]) -> list[tuple]:
                 if gap > FLOW_GAP:
                     break
             j += 1
-        if items[last][0] + items[last][1] - items[start][0] >= FLOW_MIN:
-            engaged = sum(items[k][1] for k in range(start, last + 1)
-                          if items[k][2] in ENGAGED)
-            out.append((items[start][0], items[last][0] + items[last][1],
-                        engaged, items[last][0] + items[last][1] - items[start][0]))
+        total = items[last][0] + items[last][1] - items[start][0]
+        if total >= FLOW_MIN:
+            span = range(start, last + 1)
+            engaged = sum(items[k][1] for k in span if items[k][2] in ENGAGED)
+            focused = sum(items[k][1] for k in span if items[k][2] == "focused")
+            # 光"看着屏幕"不算心流。要求这段里至少一半时间在真正的工作应用上 ——
+            # 否则"坐下来盯着桌面发呆 15 分钟"也算，这正是旧定义下会印出
+            # "进入心流耗时 0 秒"的根源（会话一开头就是 neutral，立刻满足条件）。
+            if focused >= total * FLOW_FOCUS_RATIO:
+                out.append((items[start][0], items[last][0] + items[last][1],
+                            engaged, total, focused))
         i = last + 1
     return out
 
@@ -275,6 +297,16 @@ def build_html(rows: list[tuple]) -> str:
     day_engaged: dict[str, float] = defaultdict(float)    # 每天投入时长
     hour_sessions: dict[int, int] = defaultdict(int)
     hour_entry: dict[int, list[float]] = defaultdict(list)
+    # ── 时段统计（4 段，替代原来按小时聚合）──
+    # 活跃/投入按"样本实际发生的时刻"算；会话数和进入耗时按"坐下的时刻"算。
+    # 两者回答的问题不同：前者是"这段时间我人在不在线"，后者是"我几点坐下来
+    # 更容易快速进入状态"。混用会让同一行自相矛盾（旧表里 14:00 那行就是：
+    # 99% 投入、21 分钟活跃，却 0 个会话）。
+    band_active: dict[str, float] = defaultdict(float)
+    band_engaged: dict[str, float] = defaultdict(float)
+    band_sessions: dict[str, int] = defaultdict(int)
+    band_entry: dict[str, list[float]] = defaultdict(list)   # 进入心流耗时
+    band_flow: dict[str, list[float]] = defaultdict(list)    # 心流片段持续时长
     tilt_bad = 0.0
     yaws: list[float] = []
     pitches: list[float] = []
@@ -290,9 +322,11 @@ def build_html(rows: list[tuple]) -> str:
             hour_active[lt.tm_hour] += dt
             hour_active_days[lt.tm_hour].add(day)
             day_active[day] += dt
+            band_active[_band(ts)] += dt
         if state in ENGAGED:
             hour_engaged[lt.tm_hour] += dt
             day_engaged[day] += dt
+            band_engaged[_band(ts)] += dt
         if present:
             yaws.append(yaw)
             pitches.append(pitch)
@@ -329,12 +363,14 @@ def build_html(rows: list[tuple]) -> str:
         if s_act < 60:
             continue                       # 不到 1 分钟的碎片不列入
         st = _streaks(s)
-        hour_sessions[time.localtime(s_start).tm_hour] += 1
+        b = _band(s_start)                 # 按"坐下"的时刻归属，不按心流发生的时刻
+        band_sessions[b] += 1
         entry = (st[0][0] - s_start) if st else None
         if entry is not None:
-            hour_entry[time.localtime(s_start).tm_hour].append(entry)
+            band_entry[b].append(entry)
         for k in st:
-            all_streaks.append((k[0], k[1], k[2], k[3], s_start))
+            band_flow[b].append(k[3])      # 片段总时长
+            all_streaks.append((k[0], k[1], k[2], k[3], s_start, k[4]))
         sess_rows.append((s_start, s_end, s_act, s_foc, len(st), entry))
 
     sess_rows.sort(key=lambda r: -r[0])
@@ -350,28 +386,37 @@ def build_html(rows: list[tuple]) -> str:
 
     streak_html = "".join(
         f'<tr><td>{_mdhm(a)}</td><td class="num">{_dur(d)}</td>'
-        f'<td class="num">{c / d * 100:.0f}%</td>'
+        f'<td class="num">{e / d * 100:.0f}%</td>'
         f'<td class="num">{_dur(a - s)}</td></tr>'
-        for a, b, c, d, s in all_streaks[:25]) or \
+        for a, b, c, d, s, e in all_streaks[:25]) or \
         '<tr><td colspan="4" class="muted">还没有 ≥15 分钟的心流片段</td></tr>'
 
-    # ── 黄金时段 ──
-    ranked = [(h, hour_active[h]) for h in hour_active if hour_active[h] >= MIN_HOUR_DATA]
-    ranked.sort(key=lambda kv: -hour_engaged[kv[0]] / kv[1])
-    skipped = [h for h in hour_active if hour_active[h] < MIN_HOUR_DATA]
-    hour_rows = []
-    for i, (h, _) in enumerate(ranked[:10]):
-        entry = hour_entry.get(h)
-        cls = ' class="best"' if i == 0 else ""     # 反斜杠不能出现在 f-string 表达式里
-        hour_rows.append(
-            f'<tr{cls}>'
-            f'<td>{h:02d}:00</td><td class="num">{_dur(hour_active[h])}</td>'
-            f'<td>{_rate_cell(hour_engaged[h] / hour_active[h] * 100)}</td>'
-            f'<td class="num">{hour_sessions.get(h, 0)}</td>'
-            f'<td class="num">{_dur(sum(entry) / len(entry)) if entry else "—"}</td>'
-            f'</tr>')
-    hour_html = "".join(hour_rows) or \
-        (f'<tr><td colspan="5" class="muted">还没有任何钟点累积到 '
+    # ── 时段（4 段，样本够了再逐步压缩到 3 小时 / 1 小时）──
+    ranked = [(b, band_active[b]) for b in band_active
+              if band_active[b] >= MIN_HOUR_DATA]
+    ranked.sort(key=lambda kv: -band_engaged[kv[0]] / kv[1])
+    skipped = [b for b in band_active if band_active[b] < MIN_HOUR_DATA]
+    band_rows = []
+    for i, (b, _) in enumerate(ranked):
+        entries = band_entry.get(b, [])
+        flows = band_flow.get(b, [])
+        cls = ' class="best"' if i == 0 else ""
+        # 样本不够就不给平均值 —— 1 个样本不叫"平均"，印出来是误导
+        entry_txt = (_dur(sum(entries) / len(entries))
+                     if len(entries) >= MIN_BAND_SESSIONS
+                     else f'<span class="muted">样本不足（{len(entries)}）</span>')
+        flow_txt = (_dur(sum(flows) / len(flows))
+                    if len(flows) >= MIN_BAND_SESSIONS
+                    else f'<span class="muted">样本不足（{len(flows)}）</span>')
+        band_rows.append(
+            f'<tr{cls}><td>{b}</td>'
+            f'<td class="num">{_dur(band_active[b])}</td>'
+            f'<td>{_rate_cell(band_engaged[b] / band_active[b] * 100)}</td>'
+            f'<td class="num">{band_sessions.get(b, 0)}</td>'
+            f'<td class="num">{entry_txt}</td>'
+            f'<td class="num">{flow_txt}</td></tr>')
+    hour_html = "".join(band_rows) or \
+        (f'<tr><td colspan="6" class="muted">还没有任何时段累积到 '
          f'{_dur(MIN_HOUR_DATA)} 的数据</td></tr>')
 
     legend = "".join(
@@ -444,7 +489,7 @@ def build_html(rows: list[tuple]) -> str:
 
     avg = lambda xs: sum(xs) / len(xs) if xs else 0.0  # noqa: E731
     days = len({time.strftime("%Y-%m-%d", time.localtime(r[0])) for r in rows})
-    best = f"{ranked[0][0]:02d}:00 前后" if ranked else "数据不足"
+    best = ranked[0][0] if ranked else "数据不足"
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -531,11 +576,17 @@ def build_html(rows: list[tuple]) -> str:
 
 <h2>黄金时段</h2>
 <table><thead><tr><th>时段</th><th class="num">活跃时长</th><th>有效投入占比</th>
-<th class="num">会话数</th><th class="num">平均进入心流耗时</th></tr></thead>
+<th class="num">会话数</th><th class="num">平均进入心流耗时</th>
+<th class="num">平均心流时长</th></tr></thead>
 <tbody>{hour_html}</tbody></table>
-<p class="note">按"有效投入占比"排序（{'+'.join(sorted(ENGAGED))} ÷ 活跃时长），只统计累积
-≥{_dur(MIN_HOUR_DATA)} 的钟点。{f"数据不足被排除的钟点：{', '.join(f'{h:02d}' for h in sorted(skipped))}。" if skipped else ""}
-"平均进入心流耗时"是从坐下到第一段 ≥15 分钟投入开始的间隔，只统计该钟点开始的会话。</p>
+<p class="note">
+时段先粗分四段，<b>等样本够了再逐步压缩到 3 小时、1 小时</b> —— 每小时只有 1~4 个会话时，
+"平均"没有意义。{f"活跃不足 {_dur(MIN_HOUR_DATA)} 被排除的时段：{', '.join(skipped)}。" if skipped else ""}<br>
+「平均进入心流耗时」= 从坐下到第一段心流之间的间隔，<b>按"坐下"的时刻归属</b>；
+「平均心流时长」= 心流片段本身持续多久。<br>
+心流 = 连续投入 ≥{_dur(FLOW_MIN)}，<b>且其中「专注」（工作应用）占比 ≥{FLOW_FOCUS_RATIO:.0%}</b> ——
+否则"坐下来盯着屏幕发呆"也会算进去，那正是以前会印出"进入心流耗时 0 秒"的原因。<br>
+两个平均值都要求该时段至少有 {MIN_BAND_SESSIONS} 个样本，不够就写"样本不足"，不印假数字。</p>
 
 <h2>自述对照（数据准不准）</h2>
 {self_html}
@@ -550,9 +601,10 @@ def build_html(rows: list[tuple]) -> str:
 
 <h3>心流片段</h3>
 <table><thead><tr><th>开始时间</th><th class="num">持续</th>
-<th class="num">有效专注占比</th><th class="num">距会话开始</th></tr></thead>
+<th class="num">其中专注占比</th><th class="num">距会话开始</th></tr></thead>
 <tbody>{streak_html}</tbody></table>
-<p class="note">心流 = 连续专注 ≥{_dur(FLOW_MIN)}，允许中间有 ≤{_dur(FLOW_GAP)} 的短暂中断。
+<p class="note">心流 = 连续投入 ≥{_dur(FLOW_MIN)}，允许中间有 ≤{_dur(FLOW_GAP)} 的短暂中断，
+且其中在工作应用上的时间 ≥{FLOW_FOCUS_RATIO:.0%}。
 {"仅显示最近 25 段。" if len(all_streaks) > 25 else ""}</p>
 </div></details>
 
