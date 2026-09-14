@@ -4,6 +4,8 @@
     uv run focus.py                    # 开启监视（托盘图标，退出用托盘菜单）
     uv run focus.py --install-startup  # 装开机自启，之后不用手动开
     uv run focus.py --uninstall-startup
+    uv run focus.py --toggle           # 切换开/关（桌面开关快捷方式调的就是它）
+    uv run focus.py --install-shortcut # 在桌面建一个开/关切换快捷方式
     uv run focus.py --stop             # 停掉正在运行的实例
     uv run focus.py --dashboard        # 实时面板（本地网页，每 3 秒自动刷新）
     uv run focus.py --report           # 生成 HTML 报告并打开
@@ -41,6 +43,7 @@ import sys
 import threading
 import time
 import urllib.request
+import webbrowser
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -750,30 +753,137 @@ def run_tray(mon: Monitor) -> None:
     icon.run()          # 阻塞在主线程，采集跑在 daemon 线程
 
 
-# ══════════════════════ 停止运行中的实例 ══════════════════════
+# ══════════════════════ 开 / 关 / 桌面开关 ══════════════════════
 
-def stop_running() -> None:
-    """停掉正在运行的实例。
+ICON_DIR = ROOT / "icons"
+LNK_NAME = "专注监视.lnk"
+PYW = ROOT / ".venv" / "Scripts" / "pythonw.exe"
 
-    靠 PID 文件，不去匹配命令行 —— 匹配要调 WMI，还可能误伤别的 python 进程。
+# 子进程一律不要弹控制台 —— 这些函数可能跑在 pythonw 下
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_DETACHED = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+
+def _desktop() -> Path:
+    return Path(os.environ.get("USERPROFILE", "")) / "Desktop"
+
+
+def ensure_icons() -> tuple[Path, Path]:
+    """生成「开」「关」两个图标。
+
+    快捷方式的图标是静态的，没法自己反映运行状态 —— 只能在每次切换时
+    连图标一起重写 .lnk，Explorer 会立刻刷新。
+    """
+    from PIL import Image, ImageDraw
+    ICON_DIR.mkdir(exist_ok=True)
+    on, off = ICON_DIR / "on.ico", ICON_DIR / "off.ico"
+    for p, color, bar in ((on, "#22c55e", False), (off, "#64748b", True)):
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((5, 5, 59, 59), fill=color)
+        if bar:                      # 关：中间一道横杠，和「开」一眼区分
+            d.rectangle((15, 27, 49, 37), fill="#0f172a")
+        img.save(p, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+    return on, off
+
+
+def _write_lnk(icon: Path) -> None:
+    """重写桌面快捷方式。.lnk 只能走 COM，交给 PowerShell，并隐藏它的窗口。"""
+    lnk = _desktop() / LNK_NAME
+    ps = (
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
+        "$s.TargetPath='%s';"
+        "$s.Arguments='\"%s\" --toggle';"
+        "$s.WorkingDirectory='%s';"
+        "$s.IconLocation='%s,0';"
+        "$s.Description='专注度监视（双击切换开/关）';"
+        "$s.Save()"
+    ) % (lnk, PYW, ROOT / "focus.py", ROOT, icon)
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                    "-Command", ps],
+                   creationflags=_NO_WINDOW, capture_output=True)
+
+
+def running_pid() -> int | None:
+    """仍在运行的实例 PID；PID 文件在但进程已死则返回 None。
+
+    只信 PID 文件不够 —— 被强杀时它不会被清理（这个坑踩过一次了）。
     """
     if not PID_PATH.exists():
-        print("没有找到运行中的实例。")
-        return
+        return None
     try:
         pid = int(PID_PATH.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
-        print("focus.pid 内容异常，已清理。")
+        return None
+    r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                       capture_output=True, text=True,
+                       creationflags=_NO_WINDOW)
+    return pid if str(pid) in (r.stdout or "") else None
+
+
+def stop_running() -> None:
+    """停掉正在运行的实例。"""
+    pid = running_pid()
+    if pid is None:
         PID_PATH.unlink(missing_ok=True)
+        print("没有找到运行中的实例。")
         return
-    r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, text=True)
-    # 强制结束不会走对方的 finally，PID 文件只能由这边清掉
-    PID_PATH.unlink(missing_ok=True)
-    if r.returncode == 0:
-        print(f"已停止专注监视（PID {pid}）。")
-    else:
-        print("进程已不存在，已清理 PID 文件。")
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                   capture_output=True, creationflags=_NO_WINDOW)
+    PID_PATH.unlink(missing_ok=True)     # 强杀不会走对方的 finally
+    print(f"已停止专注监视（PID {pid}）。")
+
+
+def wait_and_open(timeout: float = 120.0) -> None:
+    """等面板就绪再开浏览器。
+
+    模型加载要十几秒，启动后立刻打开只会看到「无法连接」。
+    """
+    try:
+        from dashboard import DEFAULT_PORT as port
+    except Exception:
+        port = 8787
+    url = f"http://127.0.0.1:{port}/"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=2).close()
+            webbrowser.open(url)
+            return
+        except Exception:
+            time.sleep(1.5)
+
+
+def toggle() -> None:
+    """桌面快捷方式的入口：切换开/关，并把图标改成当前状态。"""
+    on_icon, off_icon = ensure_icons()
+    if running_pid() is not None:
+        stop_running()
+        _write_lnk(off_icon)
+        print("已关闭专注监视。")
+        return
+    # DETACHED_PROCESS 是必须的：不脱离的话，开关一退出监视进程会被一起带走
+    subprocess.Popen([str(PYW), str(ROOT / "focus.py")], cwd=str(ROOT),
+                     creationflags=_DETACHED, close_fds=True)
+    _write_lnk(on_icon)
+    subprocess.Popen([str(PYW), str(ROOT / "focus.py"), "--wait-open"],
+                     cwd=str(ROOT), creationflags=_DETACHED, close_fds=True)
+    print("已启动专注监视，面板就绪后会自动打开。")
+
+
+def install_shortcut() -> None:
+    """建桌面开关，并清掉早期的三个快捷方式。"""
+    on_icon, off_icon = ensure_icons()
+    d = _desktop()
+    for old in ("专注监视面板.url", "启动专注监视.lnk", "停止专注监视.lnk"):
+        p = d / old
+        if p.exists():
+            p.unlink()
+            print(f"  已删除旧快捷方式: {old}")
+    _write_lnk(on_icon if running_pid() is not None else off_icon)
+    print(f"  已创建桌面开关: {d / LNK_NAME}")
+    print("  双击 = 开/关切换；图标绿点=运行中，灰底横杠=已停止")
 
 
 # ══════════════════════ 开机自启 ══════════════════════
@@ -987,6 +1097,10 @@ def main() -> None:
     ap.add_argument("--report", action="store_true", help="生成 HTML 报告并打开")
     ap.add_argument("--dashboard", action="store_true", help="起实时面板（本地网页）")
     ap.add_argument("--stop", action="store_true", help="停掉正在运行的实例")
+    ap.add_argument("--toggle", action="store_true", help="切换开/关（桌面快捷方式用）")
+    ap.add_argument("--install-shortcut", action="store_true", help="装桌面开关快捷方式")
+    ap.add_argument("--wait-open", action="store_true",
+                    help=argparse.SUPPRESS)   # 内部用：等面板就绪再开浏览器
     ap.add_argument("--selftest", action="store_true", help="跑自检，不开摄像头")
     ap.add_argument("--install-startup", action="store_true", help="装开机自启")
     ap.add_argument("--uninstall-startup", action="store_true", help="卸载开机自启")
@@ -1011,6 +1125,15 @@ def main() -> None:
         return
     if args.stop:
         stop_running()
+        return
+    if args.wait_open:
+        wait_and_open()
+        return
+    if args.toggle:
+        toggle()
+        return
+    if args.install_shortcut:
+        install_shortcut()
         return
 
     if sys.platform != "win32":
