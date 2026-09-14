@@ -29,6 +29,10 @@ _pages = {"panel": "/", "rate": "/rate", "report": "/report"}
 _started = False
 _window: "webview.Window | None" = None
 _lock = threading.Lock()
+# 「退出」放行开关：托盘退出时置 True，让 closing 事件放行关闭。
+# 否则点 X 的隐藏逻辑会把程序化关闭也拦下来 —— closing 返回 False
+# 会被 pywebview 当作 Cancel，窗口关不掉，GUI 循环永远挂着，进程残留。
+_quitting = False
 
 
 def _page_url(page: str) -> str:
@@ -82,11 +86,29 @@ def open_page(page: str = "panel") -> None:
             webbrowser.open(url)
 
 
-def _on_closing() -> bool:
-    """点 X = 最小化到托盘，不是退出 —— 监视器本来就应该常驻。
+def quit_app() -> None:
+    """托盘「退出」真正退干净：放行关闭 → 销毁窗口 → GUI 循环返回 → 进程退出。
 
-    pywebview 的 closing 事件返回 False 即取消关闭。
+    close 只差 on_quit 里 icon.stop() 不够：GUI 循环在主线程，窗口不销毁
+    app.Run() 永不返回，进程就留在任务管理器里。
     """
+    global _quitting
+    _quitting = True
+    try:
+        if _window is not None:
+            _window.destroy()
+    except Exception:
+        pass
+
+
+def _on_closing() -> bool:
+    """点 X = 隐藏到托盘，不是退出 —— 监视器本来就应该常驻。
+
+    pywebview 的 closing 事件返回 False 即取消关闭；真的退出时
+    quit_app() 已把 _quitting 置 True，这里放行返回 True。
+    """
+    if _quitting:
+        return True
     try:
         if _window is not None:
             _window.hide()

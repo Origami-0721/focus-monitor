@@ -1192,6 +1192,8 @@ def run_tray(mon: Monitor) -> None:
     def on_quit(icon, _item):
         mon.stop()
         icon.stop()
+        import window                     # 延迟：与其余菜单项保持一致
+        window.quit_app()                 # 销毁窗口 → GUI 循环返回 → 进程真正退出
 
     def on_pause(icon, _item):
         mon.paused = not mon.paused
