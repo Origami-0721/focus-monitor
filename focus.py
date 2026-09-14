@@ -578,6 +578,8 @@ class Monitor(threading.Thread):
         self._seq = 0
         last_face = last_pose = last_flush = time.time()
         last_away_write = 0.0
+        last_beat = time.time()
+        n_rows = 0
         fails = 0
         face_buf: deque[dict] = deque(maxlen=64)
         tilt_buf: deque[float] = deque(maxlen=8)
@@ -633,6 +635,11 @@ class Monitor(threading.Thread):
             if now - last_flush >= 1.0:
                 last_flush = now
                 maybe_reload_config()      # 设置页改完立即生效，不用重启
+                if now - last_beat >= 600:
+                    # 心跳：进程要是被静默干掉，日志里至少能看出它活到几点
+                    last_beat = now
+                    log.info("心跳：本次运行累计 %d 条样本，当前状态 %s",
+                             n_rows, self.state)
                 present = len(face_buf) > 0
                 yaw = float(np.median([f["yaw"] for f in face_buf])) if face_buf else 0.0
                 pitch = float(np.median([f["pitch"] for f in face_buf])) if face_buf else 0.0
@@ -652,6 +659,7 @@ class Monitor(threading.Thread):
                     (now, st, exe, title[:200], yaw, pitch, ear, tilt, lean,
                      1 if present else 0, idle_seconds()))
                 conn.commit()
+                n_rows += 1
 
                 # 离开期间降频落库；状态刚变成 away 的那一条永远要写
                 if st == "away" and self.state == "away" \
@@ -982,8 +990,14 @@ def main() -> None:
         run_tray(mon)
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        # 托盘跑在主线程，它一崩整个进程就没了。而 pythonw 没有 stderr，
+        # 栈会直接消失 —— 这是"绿点为什么悄悄不见了"的头号嫌疑，必须落盘。
+        log.exception("托盘异常退出")
+        raise
     finally:
         mon.stop()
+        log.info("专注监视已退出")
     print("已退出，运行 `uv run focus.py --report` 看报告")
 
 
