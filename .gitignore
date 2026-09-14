@@ -5,6 +5,7 @@ focus.db-*
 config.json
 focus.log
 focus.log.*
+focus.pid
 
 # 生成的报告同样含个人统计
 report.html

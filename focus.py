@@ -4,6 +4,7 @@
     uv run focus.py                    # 开启监视（托盘图标，退出用托盘菜单）
     uv run focus.py --install-startup  # 装开机自启，之后不用手动开
     uv run focus.py --uninstall-startup
+    uv run focus.py --stop             # 停掉正在运行的实例
     uv run focus.py --dashboard        # 实时面板（本地网页，每 3 秒自动刷新）
     uv run focus.py --report           # 生成 HTML 报告并打开
     uv run focus.py --selftest         # 跑自检，不开摄像头
@@ -35,6 +36,7 @@ import logging
 import math
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +58,7 @@ ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
 DB_PATH = ROOT / "focus.db"
 LOG_PATH = ROOT / "focus.log"
+PID_PATH = ROOT / "focus.pid"      # 运行中实例的 PID，供 --stop 用
 
 log = logging.getLogger("focus")
 
@@ -589,24 +592,36 @@ class Monitor(threading.Thread):
         lean = 0.0
 
         while self.running:
+            # 暂停必须真的把摄像头释放掉。以前只是跳过后处理，read 照跑，
+            # 指示灯还亮着 —— 用户以为关了其实没关。
+            if self.paused:
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                    log.info("已暂停，摄像头已释放")
+                time.sleep(0.5)
+                continue
+            if cap is None:
+                try:
+                    cap = open_camera(self.camera)
+                    log.info("已恢复，摄像头已重新打开")
+                except RuntimeError:
+                    time.sleep(3)
+                    continue
+
             ok, frame = cap.read()
             if not ok:
-                # 休眠唤醒后、或摄像头被别的程序抢走时，read 会一直失败，重开一次
+                # 休眠唤醒后、或摄像头被别的程序抢走时，read 会一直失败。
+                # 置空交给循环开头重开，重开逻辑只有一处。
                 fails += 1
                 if fails > 100:
                     cap.release()
-                    time.sleep(2)
-                    try:
-                        cap = open_camera(self.camera)
-                    except RuntimeError:
-                        time.sleep(15)
+                    cap = None
                     fails = 0
+                    continue
                 time.sleep(0.05)
                 continue
             fails = 0
-            if self.paused:
-                time.sleep(0.2)
-                continue
 
             now = time.time()
             h, w = frame.shape[:2]
@@ -675,7 +690,8 @@ class Monitor(threading.Thread):
                 face_buf.clear()
                 # tilt_buf 不清空：留成 4 秒的滚动窗口，中位数才压得住单帧跳变
 
-        cap.release()
+        if cap is not None:        # 暂停状态下退出时它已经是 None 了
+            cap.release()
         conn.close()
         log.info("采集线程已停止")
 
@@ -732,6 +748,32 @@ def run_tray(mon: Monitor) -> None:
         ))
     refresh(icon)
     icon.run()          # 阻塞在主线程，采集跑在 daemon 线程
+
+
+# ══════════════════════ 停止运行中的实例 ══════════════════════
+
+def stop_running() -> None:
+    """停掉正在运行的实例。
+
+    靠 PID 文件，不去匹配命令行 —— 匹配要调 WMI，还可能误伤别的 python 进程。
+    """
+    if not PID_PATH.exists():
+        print("没有找到运行中的实例。")
+        return
+    try:
+        pid = int(PID_PATH.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        print("focus.pid 内容异常，已清理。")
+        PID_PATH.unlink(missing_ok=True)
+        return
+    r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, text=True)
+    # 强制结束不会走对方的 finally，PID 文件只能由这边清掉
+    PID_PATH.unlink(missing_ok=True)
+    if r.returncode == 0:
+        print(f"已停止专注监视（PID {pid}）。")
+    else:
+        print("进程已不存在，已清理 PID 文件。")
 
 
 # ══════════════════════ 开机自启 ══════════════════════
@@ -944,6 +986,7 @@ def main() -> None:
     ap.add_argument("--camera", type=int, default=None, help="摄像头序号，默认自动挑")
     ap.add_argument("--report", action="store_true", help="生成 HTML 报告并打开")
     ap.add_argument("--dashboard", action="store_true", help="起实时面板（本地网页）")
+    ap.add_argument("--stop", action="store_true", help="停掉正在运行的实例")
     ap.add_argument("--selftest", action="store_true", help="跑自检，不开摄像头")
     ap.add_argument("--install-startup", action="store_true", help="装开机自启")
     ap.add_argument("--uninstall-startup", action="store_true", help="卸载开机自启")
@@ -966,6 +1009,9 @@ def main() -> None:
         import dashboard
         dashboard.main()
         return
+    if args.stop:
+        stop_running()
+        return
 
     if sys.platform != "win32":
         sys.exit("托盘和窗口监视依赖 Win32 API，当前只支持 Windows")
@@ -973,6 +1019,7 @@ def main() -> None:
     if not acquire_singleton():
         sys.exit("已经有一个实例在跑了（图标可能藏在任务栏的 ^ 折叠区里）")
 
+    PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
     setup_log()
     log.info("专注监视启动 camera=%s", args.camera)
 
@@ -997,6 +1044,7 @@ def main() -> None:
         raise
     finally:
         mon.stop()
+        PID_PATH.unlink(missing_ok=True)
         log.info("专注监视已退出")
     print("已退出，运行 `uv run focus.py --report` 看报告")
 
