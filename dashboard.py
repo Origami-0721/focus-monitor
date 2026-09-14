@@ -24,8 +24,8 @@ from collections import defaultdict
 
 import focus
 from focus import STATES
-from report import (FLOW_MIN, SESSION_GAP, _dur, _hm, _mdhm, _sessions,
-                    _streaks, _timed, load)
+from report import (FLOW_MIN, SESSION_GAP, _dur, _hm, _label, _mdhm,
+                    _sessions, _streaks, _timed, load)
 
 DEFAULT_PORT = 8787
 LIVE_WINDOW = 30 * 3600   # 实时面板只看最近 30 小时，够覆盖"今天"且不必全表扫
@@ -50,8 +50,12 @@ _NAV = ('<div class="nav"><a href="/">实时面板</a>'
 def _rate_page(msg: str = "") -> str:
     """自述评分页。
 
-    刻意不显示任何实测数据 —— 看到「这段测出 85%」就会被锚定，
+    刻意不显示任何实测**结论** —— 看到「这段测出 85%」就会被锚定，
     那收集到的就不是独立评价，没法用来验证测量准不准。
+
+    但会列出那半小时前台开过哪些窗口。那是事实、是回忆线索，不是评价；
+    而"想不起来干了啥"会直接让人放弃评分，数据同样废掉。
+    界线是：给事实，不给判断。
     """
     import ratings
 
@@ -68,6 +72,24 @@ def _rate_page(msg: str = "") -> str:
         for bs, r in done) or \
         '<tr><td colspan="3" class="muted">还没有评分记录</td></tr>'
 
+    # 每个块里前台开过哪些窗口 —— 只给"事实"，帮你回忆；
+    # 任何"测出来的结论"都不给，否则会锚定你的评分。
+    # 单趟分桶，不按块重复遍历全部样本（长期跑下来样本量很大）。
+    app_by_block: dict[float, dict[str, float]] = defaultdict(
+        lambda: defaultdict(float))
+    for x in items:
+        if x[2] == "away":          # 人不在时前台是什么，跟那半小时无关
+            continue
+        b = int(x[0] // ratings.BLOCK) * ratings.BLOCK
+        app_by_block[b][_label(x[3], x[4])] += x[1]
+
+    def _apps_line(start: float) -> str:
+        top = sorted(app_by_block.get(start, {}).items(), key=lambda kv: -kv[1])[:5]
+        if not top:
+            return ""
+        return ('<span class="rapps">'
+                + " · ".join(html.escape(a) for a, _ in top) + '</span>')
+
     if not todo:
         todo_html = (
             '<div class="alert good">当前没有待评分的时段。'
@@ -76,7 +98,9 @@ def _rate_page(msg: str = "") -> str:
         rows = "".join(
             f'<form method="post" action="/rate" class="rrow">'
             f'<input type="hidden" name="block_start" value="{p["start"]:.0f}">'
+            f'<span class="rleft">'
             f'<span class="rt">{_hm(p["start"])} – {_hm(p["end"])}</span>'
+            f'{_apps_line(p["start"])}</span>'
             f'<span class="rb">'
             + "".join(f'<button name="score" value="{s}">{s}</button>'
                       for s in (1, 2, 3, 4, 5))
@@ -84,7 +108,8 @@ def _rate_page(msg: str = "") -> str:
             for p in todo[:14])
         todo_html = (
             f'<p class="sub">共 {len(todo)} 个时段待评分，按最新的在前。'
-            f'凭记忆选一个数就行，别去看报告里的数字。</p>'
+            f'下面列的是那半小时前台开过的窗口，用来帮你回忆 —— '
+            f'<b>但专注度请凭当时的感受打，不要按窗口判断</b>。</p>'
             f'<div class="rlist">{rows}</div>')
 
     return f"""<div class="wrap">{_NAV}{banner}
@@ -449,8 +474,10 @@ _PAGE = """<!DOCTYPE html>
   .rlist { display:flex; flex-direction:column; gap:8px; }
   .rrow { display:flex; align-items:center; gap:16px; background:#1e293b;
           border:1px solid #334155; border-radius:10px; padding:10px 16px; }
-  .rt { font-size:15px; color:#cbd5e1; font-variant-numeric:tabular-nums;
-        min-width:132px; }
+  .rleft { display:flex; flex-direction:column; gap:3px; flex:1; min-width:0; }
+  .rt { font-size:15px; color:#cbd5e1; font-variant-numeric:tabular-nums; }
+  .rapps { font-size:12px; color:#64748b; white-space:nowrap; overflow:hidden;
+           text-overflow:ellipsis; }
   .rb { display:flex; gap:6px; }
   .rb button { background:#0f172a; color:#94a3b8; border:1px solid #475569;
         border-radius:8px; width:42px; padding:7px 0; font-size:14px;
