@@ -24,7 +24,8 @@ from collections import defaultdict
 
 import focus
 from focus import STATES
-from report import FLOW_MIN, _dur, _hm, _sessions, _streaks, _timed, load
+from report import (FLOW_MIN, _dur, _hm, _mdhm, _sessions, _streaks, _timed,
+                    load)
 
 DEFAULT_PORT = 8787
 LIVE_WINDOW = 30 * 3600   # 实时面板只看最近 30 小时，够覆盖"今天"且不必全表扫
@@ -42,7 +43,64 @@ def _today_bounds(now: float) -> tuple[float, float]:
 
 
 _NAV = ('<div class="nav"><a href="/">实时面板</a>'
+        '<a href="/rate">自述评分</a>'
         '<a href="/settings">设置</a><a href="/report">完整报告</a></div>')
+
+
+def _rate_page(msg: str = "") -> str:
+    """自述评分页。
+
+    刻意不显示任何实测数据 —— 看到「这段测出 85%」就会被锚定，
+    那收集到的就不是独立评价，没法用来验证测量准不准。
+    """
+    import ratings
+
+    now = time.time()
+    items = _timed(load(since=now - 2 * 86400))
+    todo = ratings.pending(items, now)
+    done = sorted(ratings.ratings_map().items(), reverse=True)[:12]
+
+    banner = f'<div class="alert good">{html.escape(msg)}</div>' if msg else ""
+    hist = "".join(
+        f'<tr><td>{_mdhm(bs)} – {_hm(bs + ratings.BLOCK)}</td>'
+        f'<td class="num">{r["score"]} / 5</td>'
+        f'<td>{html.escape(r["note"]) or "<span class=\"muted\">—</span>"}</td></tr>'
+        for bs, r in done) or \
+        '<tr><td colspan="3" class="muted">还没有评分记录</td></tr>'
+
+    if not todo:
+        todo_html = (
+            '<div class="alert good">当前没有待评分的时段。'
+            '完整记录满 30 分钟、且其中有效数据 ≥10 分钟，这里就会出现新的评分项。</div>')
+    else:
+        rows = "".join(
+            f'<form method="post" action="/rate" class="rrow">'
+            f'<input type="hidden" name="block_start" value="{p["start"]:.0f}">'
+            f'<span class="rt">{_hm(p["start"])} – {_hm(p["end"])}</span>'
+            f'<span class="rb">'
+            + "".join(f'<button name="score" value="{s}">{s}</button>'
+                      for s in (1, 2, 3, 4, 5))
+            + '</span></form>'
+            for p in todo[:14])
+        todo_html = (
+            f'<p class="sub">共 {len(todo)} 个时段待评分，按最新的在前。'
+            f'凭记忆选一个数就行，别去看报告里的数字。</p>'
+            f'<div class="rlist">{rows}</div>')
+
+    return f"""<div class="wrap">{_NAV}{banner}
+<h1>自述评分</h1>
+<p class="sub"><b>凭感觉打分，不要参考任何实测数据。</b>
+这里刻意不显示测量结果 —— 看到了就会被锚定，那收集到的评价就没法用来验证工具准不准了。</p>
+
+<h2>待评分</h2>
+{todo_html}
+
+<h2>评分记录</h2>
+<table class="hist"><thead><tr><th>时段</th><th>自评</th><th>备注</th></tr></thead>
+<tbody>{hist}</tbody></table>
+<p class="note">1 = 完全没在状态，3 = 一般，5 = 非常投入、进入心流。
+评分可在报告页和实测投入率做相关性对照 —— 那才是「数据和你感受对不对得上」的答案。</p>
+</div>"""
 
 
 def _live_html() -> str:
@@ -344,6 +402,21 @@ _PAGE = """<!DOCTYPE html>
   .alert ul { margin:8px 0 0; padding-left:20px; }
   .alert.good { background:#052e16; border:1px solid #22c55e; color:#86efac; }
   .alert.bad { background:#431407; border:1px solid #f59e0b; color:#fdba74; }
+  .rlist { display:flex; flex-direction:column; gap:8px; }
+  .rrow { display:flex; align-items:center; gap:16px; background:#1e293b;
+          border:1px solid #334155; border-radius:10px; padding:10px 16px; }
+  .rt { font-size:15px; color:#cbd5e1; font-variant-numeric:tabular-nums;
+        min-width:132px; }
+  .rb { display:flex; gap:6px; }
+  .rb button { background:#0f172a; color:#94a3b8; border:1px solid #475569;
+        border-radius:8px; width:42px; padding:7px 0; font-size:14px;
+        font-weight:600; cursor:pointer; }
+  .rb button:hover { background:#22c55e; color:#052e16; border-color:#22c55e; }
+  /* 不固定列宽的话三列会塌在一起：<th> 浏览器默认居中，加上列宽自动分配，
+     表头会挤成一坨（"自评备注" 连成一个词）。 */
+  .hist th, .hist td { text-align:left; }
+  .hist th:nth-child(1), .hist td:nth-child(1) { width:230px; }
+  .hist th:nth-child(2), .hist td:nth-child(2) { width:80px; text-align:right; }
 </style></head><body>
 <div id="live">__LIVE__</div>
 __JS__
@@ -405,6 +478,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             elif raw_path == "/settings":
                 self._send(_shell(_settings_page(saved="saved" in query,
                                                  reset="reset" in query)))
+            elif raw_path == "/rate":
+                self._send(_shell(_rate_page(
+                    "已记录。" if "done" in query else "")))
             elif raw_path == "/report":
                 from report import build_html
                 self._send(build_html(load()))
@@ -424,6 +500,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if path == "/settings/reset":
                 focus.reset_config()
                 self._redirect("/settings?reset=1")
+                return
+            if path == "/rate":
+                import ratings
+                try:
+                    bs = float((form.get("block_start") or [""])[0])
+                    sc = int((form.get("score") or [""])[0])
+                except ValueError:
+                    self._send(_shell(_rate_page("提交的数据不合法，请重新点一次。")), 400)
+                    return
+                if bs <= 0 or not 1 <= sc <= 5:     # 表单是用户输入，挡一道
+                    self._send(_shell(_rate_page("评分必须是 1–5。")), 400)
+                    return
+                ratings.save(bs, sc)
+                self._redirect("/rate?done=1")
                 return
             if path != "/settings":
                 self._send("<h1>404</h1>", 404)

@@ -22,6 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import focus
+import ratings
 from focus import DB_PATH, STATES
 
 ROOT = Path(__file__).resolve().parent
@@ -373,6 +374,29 @@ def build_html(rows: list[tuple]) -> str:
         f'<span class="hl">{h:02d}</span></div>'
         for h in range(24) if hour_active.get(h))
 
+    # ── 自述对照：自评分 vs 实测投入率 ──
+    pairs = ratings.paired(items)
+    corr = ratings.correlation(pairs)
+    by_score: dict[int, list[float]] = defaultdict(list)
+    for _bs, sc, measured in pairs:
+        by_score[sc].append(measured)
+    self_rows = "".join(
+        f'<tr><td>{s} / 5</td><td class="num">{len(v)}</td>'
+        f'<td>{_rate_cell(sum(v) / len(v) * 100)}</td></tr>'
+        for s, v in sorted(by_score.items()))
+    corr_txt = f"r = {corr:.2f}" if corr is not None else "样本不足"
+    self_html = (
+        f'<p class="sub" style="margin:0 0 14px">配对样本 {len(pairs)} 条 · '
+        f'相关系数 <b>{corr_txt}</b> —— {html.escape(ratings.verdict(corr, len(pairs)))}</p>'
+        + (f'<table><thead><tr><th>你的自评</th><th class="num">样本数</th>'
+           f'<th>平均实测投入率</th></tr></thead><tbody>{self_rows}</tbody></table>'
+           if by_score else
+           '<p class="muted">还没有可配对的评分。面板 →「自述评分」给过去的时段打分后，'
+           '这里会出现对照表。</p>')
+        + '<p class="note">实测投入率 = (专注 + 中性 + 伏案) ÷ 有效时长。'
+          '如果相关性强，说明这套判定和你的真实感受是一回事，黄金时段那张表才可信；'
+          '如果对不上，就先调阈值，别急着信报告里的其他结论。</p>')
+
     avg = lambda xs: sum(xs) / len(xs) if xs else 0.0  # noqa: E731
     days = len({time.strftime("%Y-%m-%d", time.localtime(r[0])) for r in rows})
     best = f"{ranked[0][0]:02d}:00 前后" if ranked else "数据不足"
@@ -447,6 +471,9 @@ def build_html(rows: list[tuple]) -> str:
 <p class="note">按"有效投入占比"排序（{'+'.join(sorted(ENGAGED))} ÷ 活跃时长），只统计累积
 ≥{_dur(MIN_HOUR_DATA)} 的钟点。{f"数据不足被排除的钟点：{', '.join(f'{h:02d}' for h in sorted(skipped))}。" if skipped else ""}
 "平均进入心流耗时"是从坐下到第一段 ≥15 分钟投入开始的间隔，只统计该钟点开始的会话。</p>
+
+<h2>自述对照（数据准不准）</h2>
+{self_html}
 
 <h2>会话明细</h2>
 <table><thead><tr><th>开始时间</th><th class="num">跨度</th><th class="num">活跃</th>

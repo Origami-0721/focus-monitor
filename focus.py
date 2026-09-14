@@ -116,6 +116,9 @@ AWAY_FACE = 20.0       # 人脸消失多少秒算离开
 AWAY_IDLE = 180.0      # 键鼠无操作多少秒算离开
 TILT_WARN = 12.0       # 肩线倾斜超过多少度算坐姿不良
 AWAY_WRITE_EVERY = 30.0  # 离开期间每 30 秒才落一条，否则整夜待机能把数据库撑爆
+# 连续投入超过这么久就别弹评分提醒 —— 在人正专注的时候打断是本末倒置，
+# 等自然断点（走神 / 离开 / 疲劳）再问。
+FLOW_QUIET = 300.0
 
 WORK_APPS = {
     "code.exe", "code - insiders.exe", "cursor.exe", "devenv.exe", "idea64.exe",
@@ -376,6 +379,16 @@ def ear_from(pts: list[tuple[float, float]]) -> float:
     return float(vert / (2.0 * horiz)) if horiz > 1e-6 else 0.0
 
 
+def should_prompt_rating(engaged_run: float, ratable: bool) -> bool:
+    """要不要弹评分提醒。
+
+    抽成独立函数是为了能断言 —— 这条规则是明确要求的行为：
+    **正在连续投入时不准打扰**，等断点再问。一直专注就一直不问，
+    因为那本来就是想要的状态，没什么好打分的。
+    """
+    return bool(ratable) and engaged_run < FLOW_QUIET
+
+
 def shoulder_tilt(lx: float, ly: float, rx: float, ry: float) -> float:
     """肩线相对水平的夹角（度）。参数是左右肩的像素坐标。
 
@@ -565,6 +578,10 @@ class Monitor(threading.Thread):
         self.paused = False
         self.state = "away"
         self.on_state = lambda s: None      # 托盘在这里挂回调更新图标
+        self.on_block_end = lambda bs: None  # 一个 30 分钟块结束且值得评时触发
+        self._last_prompted = 0.0
+        self._engaged_since: float | None = None   # 当前这段连续投入从何时开始
+        self._engaged_run = 0.0
 
     def run(self) -> None:
         log.info("采集线程启动 camera=%s", self.camera)
@@ -585,6 +602,7 @@ class Monitor(threading.Thread):
         last_face = last_pose = last_flush = time.time()
         last_away_write = 0.0
         last_beat = time.time()
+        last_rating_check = time.time()
         n_rows = 0
         fails = 0
         face_buf: deque[dict] = deque(maxlen=64)
@@ -658,6 +676,9 @@ class Monitor(threading.Thread):
                     last_beat = now
                     log.info("心跳：本次运行累计 %d 条样本，当前状态 %s",
                              n_rows, self.state)
+                if now - last_rating_check >= 300:
+                    last_rating_check = now
+                    self._prompt_rating(now)
                 present = len(face_buf) > 0
                 yaw = float(np.median([f["yaw"] for f in face_buf])) if face_buf else 0.0
                 pitch = float(np.median([f["pitch"] for f in face_buf])) if face_buf else 0.0
@@ -678,6 +699,15 @@ class Monitor(threading.Thread):
                      1 if present else 0, idle_seconds()))
                 conn.commit()
                 n_rows += 1
+
+                # 跟踪"当前这段连续投入持续了多久"，评分提醒靠它决定要不要闭嘴
+                if st in ENGAGED:
+                    if self._engaged_since is None:
+                        self._engaged_since = now
+                    self._engaged_run = now - self._engaged_since
+                else:
+                    self._engaged_since = None
+                    self._engaged_run = 0.0
 
                 # 离开期间降频落库；状态刚变成 away 的那一条永远要写
                 if st == "away" and self.state == "away" \
@@ -701,6 +731,31 @@ class Monitor(threading.Thread):
     def stop(self) -> None:
         self.running = False
 
+    def _prompt_rating(self, now: float) -> None:
+        """提醒打分 —— 但绝不在人正专注的时候打断。
+
+        两个条件同时满足才弹：① 最近有个数据够、还没评的块；② 人此刻已经
+        脱离连续投入。也就是说等到自然断点（走神 / 离开 / 疲劳）才问。
+        一直专注就一直不问 —— 那本来就是你想要的状态，没什么好打分的。
+
+        ratings / report 在这里才 import：focus 是底层模块，不该在顶层依赖
+        它们（而且 report 反过来 import focus，顶层引会成环）。
+        """
+        try:
+            import ratings
+            import report
+            prev = (int(now // ratings.BLOCK) - 1) * ratings.BLOCK
+            if prev <= self._last_prompted:
+                return
+            items = report._timed(report.load(since=prev))
+            ratable = ratings.is_ratable(items, prev, now)
+            if not should_prompt_rating(self._engaged_run, ratable):
+                return                      # 正在心流里，这一轮先不打扰
+            self._last_prompted = prev
+            self.on_block_end(prev)
+        except Exception:
+            log.exception("评分提醒检查失败")
+
 
 # ══════════════════════ 托盘 ══════════════════════
 
@@ -721,6 +776,17 @@ def run_tray(mon: Monitor) -> None:
         icon.title = f"专注监视 — {label}"
 
     mon.on_state = lambda _s: refresh(icon)
+
+    def on_block_end(block_start: float) -> None:
+        """提醒打分。通知本身不能阻断采集，所以整段都包起来。"""
+        try:
+            icon.notify("刚才那 30 分钟你觉得自己专注吗？"
+                        "打开面板 →「自述评分」打个分（1–5）",
+                        "专注监视 · 该打个分了")
+        except Exception:
+            log.exception("托盘通知失败")
+
+    mon.on_block_end = on_block_end
 
     def on_dash(icon, _item):
         import dashboard
@@ -1086,7 +1152,54 @@ def selftest() -> None:
     assert classify_app("code.exe", "focus.py") == "work"
     assert decide(**{**base, "pitch": 45.0}) == "deskwork"
 
-    print("自检通过 ✓  所有断言成立")
+    # ── 自述对照 ──
+    import ratings
+
+    def _blk(start, n, state, step=1.0):
+        return [(start + i * step, state, "code.exe", "t", 0.0, 0.0, 0.3, 1.0,
+                 1.0, 0 if state == "away" else 1, 0.0) for i in range(n)]
+
+    # 块聚合：900 秒专注 + 900 秒走神 → 有效 1800、投入 900
+    agg = ratings.blocks(report._timed(_blk(0, 900, "focused")
+                                       + _blk(900, 900, "distracted")))
+    assert agg[0.0] == (1800.0, 900.0), agg
+
+    # 相关系数
+    assert ratings.correlation([(0, s, s * 0.1) for s in (1, 2, 3, 4, 5)] * 2) > 0.99
+    assert ratings.correlation([(0, s, 1 - s * 0.1) for s in (1, 2, 3, 4, 5)] * 2) < -0.99
+    assert ratings.correlation([(0, 3, 0.5)] * 10) is None, "评分全一样时算不出相关"
+    assert ratings.correlation([(0, 1, 0.5)] * 3) is None, "样本太少不给结论"
+    assert "强相关" in ratings.verdict(0.8, 20)
+    assert "样本" in ratings.verdict(None, 3)
+
+    # 数据库往返。用临时库 —— 绝不能污染用户的真实 focus.db
+    real_db = globals()["DB_PATH"]
+    tmp_db = ROOT / "_selftest_ratings.db"
+    globals()["DB_PATH"] = tmp_db
+    try:
+        ratings.save(0.0, 4)
+        assert ratings.ratings_map()[0.0]["score"] == 4
+        ratings.save(0.0, 2)                      # 同一块重评 → 覆盖而不是新增
+        assert ratings.ratings_map()[0.0]["score"] == 2
+        assert len(ratings.ratings_map()) == 1
+        full = report._timed(_blk(0, 1800, "focused"))
+        assert ratings.paired(full) == [(0.0, 2, 1.0)], ratings.paired(full)
+        assert ratings.pending(full, now=1900.0) == [], "已评过的块不该再出现"
+        # 数据太少的块不该被要求评分
+        thin = report._timed(_blk(0, 300, "focused"))
+        assert [p for p in ratings.pending(thin, 1900.0)] == []
+    finally:
+        globals()["DB_PATH"] = real_db
+        tmp_db.unlink(missing_ok=True)
+
+    # 评分提醒的时机：正在连续投入时不准打扰（这是明确要求的行为）
+    assert not should_prompt_rating(FLOW_QUIET, True), "正在心流中不该弹提醒"
+    assert not should_prompt_rating(FLOW_QUIET + 3600, True), "专注越久越不该打扰"
+    assert should_prompt_rating(0.0, True), "刚断点、有可评的块 → 可以问"
+    assert should_prompt_rating(FLOW_QUIET - 1, True), "阈值内仍可问"
+    assert not should_prompt_rating(0.0, False), "没有可评的块就不弹"
+
+    print("自检通过 ✓ 所有断言成立")
 
 
 # ══════════════════════ 入口 ══════════════════════
