@@ -22,9 +22,22 @@ def get_token() -> str:
     raise SystemExit("no token")
 
 
+def resolve_id(token: str, tag_or_id: str) -> str:
+    """上传端点要数字 id；传 tag 名（v0.2.2）也能用，先查一次再传。"""
+    if tag_or_id.isdigit():
+        return tag_or_id
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{REPO}/releases/tags/{tag_or_id}",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))["id"]
+
+
 def main() -> None:
     release_id, exe_path, asset_name = sys.argv[1], sys.argv[2], sys.argv[3]
     token = get_token()
+    release_id = resolve_id(token, release_id)
 
     with open(exe_path, "rb") as f:
         data = f.read()
