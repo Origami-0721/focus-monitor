@@ -16,6 +16,7 @@ from __future__ import annotations
 import html
 import math
 import sqlite3
+import sys
 import time
 import webbrowser
 from collections import defaultdict
@@ -25,7 +26,12 @@ import focus
 import ratings
 from focus import DB_PATH, STATES
 
-ROOT = Path(__file__).resolve().parent
+# 打包成 exe 后 __file__ 指向临时解压目录，报告写进去等于没生成。
+# frozen 时以 exe 所在目录为根，报告和 CSV 落在用户看得见的地方。
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "report.html"
 
 MAX_GAP = 5.0           # 样本间隔超过这个秒数就不计入任何状态（程序没在跑）

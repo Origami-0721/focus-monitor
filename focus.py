@@ -57,7 +57,12 @@ import numpy as np
 # 这个别名让两边指向同一个模块对象（正常 import 时 sys.modules 里已有，无事发生）。
 sys.modules.setdefault("focus", sys.modules[__name__])
 
-ROOT = Path(__file__).resolve().parent
+# 打包成 exe 后 __file__ 指向临时解压目录，文件会写进 _MEI 缓存、一退出就没。
+# frozen 时以 exe 所在目录为根：focus.db / 日志 / 报告 / 模型都落在用户看得见的地方。
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
 DB_PATH = ROOT / "focus.db"
 LOG_PATH = ROOT / "focus.log"

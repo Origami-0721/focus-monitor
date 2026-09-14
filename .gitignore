@@ -19,6 +19,11 @@ models/
 __pycache__/
 *.py[cod]
 
+# ── PyInstaller 构建产物（exe 发布走 GitHub Release，不进仓库）──
+build/
+dist/
+*.spec
+
 # ── 编辑器 / 系统 ──
 .vscode/
 .idea/
