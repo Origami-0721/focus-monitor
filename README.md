@@ -102,4 +102,4 @@ uv run focus.py --selftest         # 跑自检
 
 ## License
 
-未指定。
+[MIT](LICENSE)
