@@ -968,6 +968,14 @@ def main() -> None:
     setup_log()
     log.info("专注监视启动 camera=%s", args.camera)
 
+    # 面板随监视一起起，这样桌面快捷方式随时点得开，不用先去托盘菜单。
+    # 只监听 127.0.0.1；起不来也不影响采集，所以异常只记日志。
+    try:
+        import dashboard
+        log.info("实时面板: %s", dashboard.serve_background(open_browser=False))
+    except Exception:
+        log.exception("实时面板启动失败，监视继续")
+
     mon = Monitor(camera=args.camera)
     mon.start()
     try:
