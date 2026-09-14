@@ -124,11 +124,20 @@ def _live_html() -> str:
     label, color = STATES.get(last[2], ("未知", "#64748b"))
 
     # 记录程序是否还活着 —— 这是这个面板最重要的一个数字
+    # 校准状态：复用 focus.ear_threshold 的同一套逻辑，只是数据源换成库里的 ear 列
+    ears = [x[7] for x in items if x[9]][-600:]
+    if len(ears) >= focus.EAR_MIN_SAMPLES:
+        cal = (f'睁眼基线 {focus.ear_threshold(ears) / focus.EAR_RATIO:.3f}'
+               f' · 已自适应')
+    else:
+        cal = f'校准中 {len(ears)}/{focus.EAR_MIN_SAMPLES}'
+
     if lag > STALE_AFTER:
         health = (f'<span class="warn">数据已停滞 {_dur(lag)} —— '
                   f'记录程序似乎没在运行</span>')
     else:
-        health = f'<span class="ok">记录中 · {lag:.0f} 秒前更新</span>'
+        health = (f'<span class="ok">记录中 · {lag:.0f} 秒前更新</span>'
+                  f' · <span class="muted">{cal}</span>')
 
     # 当前这次连续投入（往回数）
     run = 0.0

@@ -110,7 +110,12 @@ PITCH_TOL = 30.0
 # 再低就是脸快贴桌上了，多半是低头玩手机，判走神。这个界限是估的，
 # 实测你伏案时的 pitch 值，按实际分布调。
 DESK_PITCH_MAX = 65.0
-EAR_CLOSED = 0.19      # 眼睛纵横比低于此值算闭眼（戴眼镜可能要调到 0.16）
+# 闭眼阈值不再写死，改成"本人睁眼基线的比例" —— 见 ear_threshold()。
+# EAR_CLOSED 退化成校准样本不足时的出厂兜底值。
+EAR_CLOSED = 0.19      # 出厂兜底：基线还没建立起来时用这个
+EAR_BASELINE_PCT = 75  # 用近期 EAR 的这个百分位当"睁眼基线"
+EAR_RATIO = 0.67       # 闭眼阈值 = 睁眼基线 × 这个比例
+EAR_MIN_SAMPLES = 60   # 基线样本少于此数就退回出厂值
 EAR_SUSTAIN = 3.0      # 持续闭眼多少秒算疲劳
 AWAY_FACE = 20.0       # 人脸消失多少秒算离开
 AWAY_IDLE = 180.0      # 键鼠无操作多少秒算离开
@@ -379,6 +384,23 @@ def ear_from(pts: list[tuple[float, float]]) -> float:
     return float(vert / (2.0 * horiz)) if horiz > 1e-6 else 0.0
 
 
+def ear_threshold(history: list[float]) -> float:
+    """闭眼阈值 = 本人睁眼基线的比例。
+
+    固定阈值在不同人 / 不同光照下会系统性偏。实测：暗光下睁眼 EAR 从 0.285
+    抬到 0.329，而阈值钉死在 0.19 —— 等于要求"闭得更狠才算闭眼"，疲劳直接漏报。
+    换成相对基线后，暗光、眼型、戴不戴眼镜、换摄像头都能自动跟上，不需要手工校准。
+
+    取较高的百分位而不是中位数：万一用户真的困了十分钟，中位数会跟着塌下去，
+    阈值跟着塌就永远判不出疲劳。高百分位锚在"偶尔还是会把眼睛睁大"的那一侧。
+    """
+    if len(history) < EAR_MIN_SAMPLES:
+        return EAR_CLOSED                      # 样本不够，先拿出厂值
+    ordered = sorted(history)
+    idx = min(len(ordered) - 1, int(len(ordered) * EAR_BASELINE_PCT / 100))
+    return max(0.05, ordered[idx] * EAR_RATIO)
+
+
 def should_prompt_rating(engaged_run: float, ratable: bool) -> bool:
     """要不要弹评分提醒。
 
@@ -450,6 +472,13 @@ _PNP_3D = np.array([
 ], dtype=np.float64)
 _PNP_IDX = [1, 152, 33, 263, 61, 291]
 
+# 头姿求解方法。同一坐姿下的对照实测（各 20 秒）：
+#   ITERATIVE  退化 2.9%   yaw 抖动 2.12°   pitch 抖动 2.20°   pitch 范围 10.7~23.3
+#   EPNP       退化 0.0%   yaw 抖动 0.89°   pitch 抖动 0.25°   pitch 范围 14.3~15.9
+# ITERATIVE 只有 6 个对应点时容易收敛到"鼻子在相机背后"的退化解 —— 而退化时
+# 旧代码把角度留在 0，也就是"正在正视前方"这个自信的错误值。EPNP 全胜，用它。
+PNP_FLAGS = cv2.SOLVEPNP_EPNP
+
 
 def ensure_models() -> None:
     """首次运行下载 .task 模型（约 4MB + 6MB）。"""
@@ -487,6 +516,10 @@ class Vision:
                 num_poses=1,
             ))
         self._seq = 0
+        self._last_yaw = 0.0        # 上一次求解成功的角度，退化时兜底用
+        self._last_pitch = 0.0
+        self.pnp_fail = 0           # solvePnP 失败计数，供诊断
+        self.pnp_total = 0
 
     def _ts(self) -> int:
         self._seq += 1
@@ -515,13 +548,17 @@ class Vision:
         focal = float(w)
         cam = np.array([[focal, 0, w / 2], [0, focal, h / 2], [0, 0, 1]], np.float64)
         ok, _, tvec = cv2.solvePnP(_PNP_3D, img_pts, cam, np.zeros((4, 1)),
-                                   flags=cv2.SOLVEPNP_ITERATIVE)
-        yaw = pitch = 0.0
-        if ok:
-            tx, ty, tz = (float(v) for v in tvec.flatten())
-            if tz > 1e-6:
-                yaw = math.degrees(math.atan2(tx, tz))     # 左右转头
-                pitch = math.degrees(math.atan2(ty, tz))   # 抬头 / 低头
+                                   flags=PNP_FLAGS)
+        self.pnp_total += 1
+        tx, ty, tz = (float(v) for v in tvec.flatten()) if ok else (0.0, 0.0, 0.0)
+        if ok and tz > 1e-6:
+            self._last_yaw = yaw = math.degrees(math.atan2(tx, tz))    # 左右转头
+            self._last_pitch = pitch = math.degrees(math.atan2(ty, tz))  # 抬头/低头
+        else:
+            # 关键：不能留 0。0° 的含义是"正在正视前方"——那是一个自信的错误值，
+            # 会把失败帧全变成"专注看屏幕"。宁可沿用上一帧，至少是真实观测过的。
+            self.pnp_fail += 1
+            yaw, pitch = self._last_yaw, self._last_pitch
 
         ear = (ear_from([px(i) for i in L_EYE]) + ear_from([px(i) for i in R_EYE])) / 2.0
         scale = math.dist(px(33), px(263)) / w   # 两眼外角距 / 画面宽 → 离屏幕远近
@@ -582,6 +619,9 @@ class Monitor(threading.Thread):
         self._last_prompted = 0.0
         self._engaged_since: float | None = None   # 当前这段连续投入从何时开始
         self._engaged_run = 0.0
+        # 睁眼基线的滚动样本（10Hz × 600 秒 ≈ 10 分钟）
+        self._ear_hist: deque[float] = deque(maxlen=6000)
+        self._ear_thr = EAR_CLOSED                 # 当前生效的闭眼阈值
 
     def run(self) -> None:
         log.info("采集线程启动 camera=%s", self.camera)
@@ -654,9 +694,11 @@ class Monitor(threading.Thread):
                 if got:
                     face_buf.append(got)
                     scale_hist.append(got["scale"])
+                    self._ear_hist.append(got["ear"])
                     base = float(np.median(scale_hist)) if scale_hist else got["scale"]
                     lean = got["scale"] / base if base > 1e-6 else 1.0
-                    closed_since = None if got["ear"] >= EAR_CLOSED else (closed_since or now)
+                    closed_since = (None if got["ear"] >= self._ear_thr
+                                    else (closed_since or now))
                     away_since = None
                 else:
                     away_since = away_since or now
@@ -671,6 +713,7 @@ class Monitor(threading.Thread):
             if now - last_flush >= 1.0:
                 last_flush = now
                 maybe_reload_config()      # 设置页改完立即生效，不用重启
+                self._ear_thr = ear_threshold(self._ear_hist)
                 if now - last_beat >= 600:
                     # 心跳：进程要是被静默干掉，日志里至少能看出它活到几点
                     last_beat = now
@@ -730,6 +773,13 @@ class Monitor(threading.Thread):
 
     def stop(self) -> None:
         self.running = False
+
+    @property
+    def ear_baseline(self) -> float:
+        """当前估计的睁眼基线。返回 0 表示样本还不够、还在校准中。"""
+        if len(self._ear_hist) < EAR_MIN_SAMPLES or not EAR_RATIO:
+            return 0.0
+        return self._ear_thr / EAR_RATIO
 
     def _prompt_rating(self, now: float) -> None:
         """提醒打分 —— 但绝不在人正专注的时候打断。
@@ -1039,6 +1089,19 @@ def selftest() -> None:
     b = shoulder_tilt(200.0, 120.0, 0.0, 100.0)
     assert abs(a - b) < 1e-9 and 5 < a < 7, (a, b)               # 倾斜约 5.7°
     assert shoulder_tilt(0.0, 0.0, 0.0, 0.0) == 0.0              # 退化输入不炸
+
+    # 闭眼阈值随本人基线走 —— 暗光 / 眼型 / 眼镜 / 换摄像头都能自动跟上
+    assert ear_threshold([]) == EAR_CLOSED, "样本不足应退回出厂值"
+    assert ear_threshold([0.30] * 10) == EAR_CLOSED, "样本太少也退回出厂值"
+    light_smp = [0.27, 0.28, 0.29, 0.30, 0.31] * 40      # 亮光，基线约 0.30
+    dark_smp = [x + 0.044 for x in light_smp]            # 暗光实测整体上移 0.044
+    t_light, t_dark = ear_threshold(light_smp), ear_threshold(dark_smp)
+    assert t_dark > t_light, "暗光下阈值必须跟着抬高，否则疲劳漏报"
+    assert abs((t_dark - t_light) - 0.044 * EAR_RATIO) < 0.01, (t_light, t_dark)
+    assert t_light < min(light_smp), "阈值必须明显低于睁眼基线，否则睁着眼也算闭眼"
+    # 困了十分钟不能把基线拖塌 —— 否则阈值跟着塌，永远判不出疲劳
+    assert ear_threshold(light_smp + [0.10] * 300) > t_light * 0.9, \
+        "长时间低 EAR 不该把基线整体拉下去"
 
     # 应用分类
     assert classify_app("code.exe", "focus.py - Visual Studio Code") == "work"
