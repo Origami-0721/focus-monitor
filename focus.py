@@ -113,7 +113,7 @@ DESK_PITCH_MAX = 65.0
 # 闭眼阈值不再写死，改成"本人睁眼基线的比例" —— 见 ear_threshold()。
 # EAR_CLOSED 退化成校准样本不足时的出厂兜底值。
 EAR_CLOSED = 0.19      # 出厂兜底：基线还没建立起来时用这个
-EAR_BASELINE_PCT = 75  # 用近期 EAR 的这个百分位当"睁眼基线"
+EAR_BASELINE_PCT = 75  # 用近期 EAR 的这个百分位当"睁眼基线"（抗犯困拖塌）
 EAR_RATIO = 0.67       # 闭眼阈值 = 睁眼基线 × 这个比例
 EAR_MIN_SAMPLES = 60   # 基线样本少于此数就退回出厂值
 EAR_SUSTAIN = 3.0      # 持续闭眼多少秒算疲劳
@@ -619,8 +619,11 @@ class Monitor(threading.Thread):
         self._last_prompted = 0.0
         self._engaged_since: float | None = None   # 当前这段连续投入从何时开始
         self._engaged_run = 0.0
-        # 睁眼基线的滚动样本（10Hz × 600 秒 ≈ 10 分钟）
-        self._ear_hist: deque[float] = deque(maxlen=6000)
+        # 睁眼基线的滚动样本（10Hz × 180 秒 = 3 分钟）。
+        # 窗口不能太长：实测暗光基线 0.33、亮光 0.23，差 40%。窗口设 10 分钟的话，
+        # 开关灯之后基线要 10 分钟才跟上，这期间的疲劳判定整个是错的。
+        # 配合 75 百分位（而不是中位数），即使这 3 分钟里用户一直犯困也拖不塌基线。
+        self._ear_hist: deque[float] = deque(maxlen=1800)
         self._ear_thr = EAR_CLOSED                 # 当前生效的闭眼阈值
 
     def run(self) -> None:
