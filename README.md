@@ -45,8 +45,9 @@
 
 需要 Windows 和一个前置摄像头。
 
-**不想折腾环境**：直接去 [Releases 页面](https://github.com/Origami-0721/focus-monitor/releases) 下载 `focus-monitor.exe`，
-双击就能用喵 —— 不需要装 Python，也不需要命令行，数据（focus.db、日志、报告、CSV）都会存在 exe 旁边，怎么都不会丢喵。
+**不想折腾环境**：去 [Releases 页面](https://github.com/Origami-0721/focus-monitor/releases) 下载最新版 zip，
+解压后打开 `focus-monitor` 文件夹，双击里面的 `focus-monitor.exe` 就能用喵 —— 不需要装 Python，也不需要命令行，
+数据（focus.db、日志、报告、CSV）都会存在 exe 所在的文件夹里，怎么都不会丢喵。
 
 想从源码跑：
 
