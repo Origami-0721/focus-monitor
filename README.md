@@ -45,6 +45,11 @@
 
 需要 Windows 和一个前置摄像头。
 
+**不想折腾环境**：直接去 [Releases 页面](https://github.com/Origami-0721/focus-monitor/releases) 下载 `focus-monitor.exe`，
+双击就能用喵 —— 不需要装 Python，也不需要命令行，数据（focus.db、日志、报告、CSV）都会存在 exe 旁边，怎么都不会丢喵。
+
+想从源码跑：
+
 ```powershell
 uv run focus.py --selftest        # 自检，不开摄像头
 uv run focus.py                   # 开始监视（托盘图标）
