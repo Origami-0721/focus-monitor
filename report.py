@@ -18,7 +18,6 @@ import math
 import sqlite3
 import sys
 import time
-import webbrowser
 from collections import defaultdict
 from pathlib import Path
 
@@ -683,14 +682,19 @@ def _csv_cell(value) -> str:
     return s
 
 
-def main() -> None:
+def main() -> Path | None:
+    """生成报告文件（exe 旁的 report.html + CSV）。不自动开浏览器。
+
+    展示由应用窗口承担（窗口 /report 页直接渲染报告 HTML），
+    这里的产出是「可以带走/分享/打印的文档」。返回报告路径。
+    """
     rows = load()
     OUT.write_text(build_html(rows), encoding="utf-8")
     print(f"报告已生成: {OUT}")
     if rows:
         csv_out = export_csv(rows)
         print(f"数据已导出: {csv_out}")
-        webbrowser.open(OUT.as_uri())
+    return OUT
 
 
 if __name__ == "__main__":

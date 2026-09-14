@@ -31,13 +31,25 @@ NEW = ("try:\n"
 
 def patch_drawing_utils() -> None:
     """mediapipe 的绘图工具顶层 import matplotlib —— 我们从不调用它的绘图函数。
-    打成 try/except 后，打包时就能安全把 matplotlib 全家 exclude 掉。"""
+    打成 try/except 后，打包时就能安全把 matplotlib 全家 exclude 掉。
+
+    幂等：先把历史遗留的旧补丁痕迹（嵌套 try/except/plt=None 行）清掉，
+    再打一遍；重复执行多少次结果都一样，不会叠出 IndentationError。
+    """
+    import re
     path = SITE / "mediapipe" / "tasks" / "python" / "vision" / "drawing_utils.py"
     text = path.read_text(encoding="utf-8")
+    # 1) 清理旧补丁痕迹（可能多层嵌套），回到未补丁形态
+    text = re.sub(r"^\s*try:\s*$|^\s*except ImportError:\s*$|^\s*plt = None\s*$",
+                  "", text, flags=re.M)
+    text = re.sub(r"^ {4}(import matplotlib\.pyplot as plt)$", r"\1", text, flags=re.M)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 2) 打补丁
     if OLD not in text:
-        print(f"[patch] {path.name}: 已是补丁形态/格式变动, 跳过")
+        print(f"[patch] {path.name}: matplotlib import 未找到, 跳过")
         return
-    path.write_text(text.replace(OLD, NEW), encoding="utf-8")
+    text = text.replace(OLD, NEW)
+    path.write_text(text, encoding="utf-8")
     print(f"[patch] {path.name}: matplotlib 顶格 import 已降级为 try/except")
 
 def build() -> None:

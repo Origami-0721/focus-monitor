@@ -43,7 +43,6 @@ import sys
 import threading
 import time
 import urllib.request
-import webbrowser
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -839,7 +838,10 @@ def _icon_image(color: str):
 
 
 def _panel_url(path: str = "") -> str:
-    """面板地址。端口可能不是默认的，所以问 dashboard 要，别硬编码。"""
+    """面板地址。端口可能不是默认的，所以问 dashboard 要，别硬编码。
+
+    托盘打开页面已走 window.open_page；这里保留是给浏览器回退等场合用。
+    """
     import dashboard
     dashboard.serve_background(open_browser=False)
     return dashboard.base_url().rstrip("/") + path
@@ -876,7 +878,6 @@ def _today_engaged_seconds() -> int:
 
 def run_tray(mon: Monitor) -> None:
     import pystray
-    import webbrowser
 
     def refresh(icon) -> None:
         label, color = STATES.get(mon.state, STATES["away"])
@@ -893,19 +894,23 @@ def run_tray(mon: Monitor) -> None:
         别让用户去点那个气泡。
         """
         try:
-            icon.notify(f"刚才那 30 分钟你觉得自己专注吗？"
-                        f"点托盘图标即可打分（待评 {_pending_ratings()} 个时段）",
-                        "专注监视 · 该打个分了")
+            n = _pending_ratings()
+            tip = (f"刚才那 30 分钟你觉得自己专注吗？"
+                   f"点托盘图标可直接打（待评 {n} 个时段）" if n > 0
+                   else "刚才那 30 分钟你觉得自己专注吗？点托盘图标打分")
+            icon.notify(tip, "专注监视 · 该打个分了")
         except Exception:
             log.exception("托盘通知失败")
 
     mon.on_block_end = on_block_end
 
     def on_panel(icon, _item):
-        webbrowser.open(_panel_url())
+        import window                     # 延迟：开机自启时别拖 pythonnet 加载
+        window.open_page("panel")
 
     def on_rate(icon, _item):
-        webbrowser.open(_panel_url("/rate"))
+        import window                     # 延迟：开机自启时别拖 pythonnet 加载
+        window.open_page("rate")
 
     def on_default(icon, _item):
         """左键单击图标：有待评分就去评分页，否则打开面板。
@@ -916,8 +921,11 @@ def run_tray(mon: Monitor) -> None:
         (on_rate if _pending_ratings() > 0 else on_panel)(icon, _item)
 
     def on_report(icon, _item):
+        """生成报告文件，再到应用窗口里展示。"""
         import report
+        import window                   # 延迟 import，见 on_panel 注释
         report.main()
+        window.open_page("report")
 
     def on_quit(icon, _item):
         mon.stop()
@@ -945,16 +953,18 @@ def run_tray(mon: Monitor) -> None:
             pystray.MenuItem(_state_text, None, enabled=False),
             pystray.MenuItem(_today_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("打开面板 / 去评分（左键点我）", on_default,
+            pystray.MenuItem("打开主窗口（左键点我）", on_default,
                              default=True),
             pystray.MenuItem("自述评分", on_rate),
-            pystray.MenuItem("实时面板", on_panel),
-            pystray.MenuItem("生成报告", on_report),
+            pystray.MenuItem("完整报告", on_report),
             pystray.MenuItem("暂停/继续", on_pause),
             pystray.MenuItem("退出", on_quit),
         ))
     refresh(icon)
-    icon.run()          # 阻塞在主线程，采集跑在 daemon 线程
+    threading.Thread(target=icon.run, daemon=True).start()
+    # 主线程让给 pywebview：GUI 循环硬性要求主线程，托盘消息循环不受限。
+    import window
+    window.start_main()
 
 
 # ══════════════════════ 开 / 关 / 桌面开关 ══════════════════════
@@ -1040,7 +1050,7 @@ def stop_running() -> None:
 
 
 def wait_and_open(timeout: float = 120.0) -> None:
-    """等面板就绪再开浏览器。
+    """等面板就绪再打开应用窗口。
 
     模型加载要十几秒，启动后立刻打开只会看到「无法连接」。
     """
@@ -1053,7 +1063,8 @@ def wait_and_open(timeout: float = 120.0) -> None:
     while time.time() < deadline:
         try:
             urllib.request.urlopen(url, timeout=2).close()
-            webbrowser.open(url)
+            import window               # 延迟 import，见 on_panel 注释
+            window.open_page("panel")
             return
         except Exception:
             time.sleep(1.5)
@@ -1369,7 +1380,8 @@ def selftest() -> None:
     assert should_prompt_rating(FLOW_QUIET - 1, True), "阈值内仍可问"
     assert not should_prompt_rating(0.0, False), "没有可评的块就不弹"
 
-    print("自检通过 ✓ 所有断言成立")
+    # GBK 控制台打不出 ✓，用 ASCII 勾保证任何环境能跑完自检
+    print("selftest PASS - all assertions hold")
 
 
 # ══════════════════════ 入口 ══════════════════════

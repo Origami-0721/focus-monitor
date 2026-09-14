@@ -1,6 +1,6 @@
 [project]
 name = "focus-monitor"
-version = "0.2.1"
+version = "0.2.2"
 description = "摄像头 + 屏幕使用双路专注度监视器"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -9,4 +9,5 @@ dependencies = [
     "numpy",
     "pillow",
     "pystray",
+    "pywebview>=6.2.1",
 ]
