@@ -24,8 +24,8 @@ from collections import defaultdict
 
 import focus
 from focus import STATES
-from report import (FLOW_MIN, _dur, _hm, _mdhm, _sessions, _streaks, _timed,
-                    load)
+from report import (FLOW_MIN, SESSION_GAP, _dur, _hm, _mdhm, _sessions,
+                    _streaks, _timed, load)
 
 DEFAULT_PORT = 8787
 LIVE_WINDOW = 30 * 3600   # 实时面板只看最近 30 小时，够覆盖"今天"且不必全表扫
@@ -132,7 +132,11 @@ def _live_html() -> str:
     else:
         cal = f'校准中 {len(ears)}/{focus.EAR_MIN_SAMPLES}'
 
-    if lag > STALE_AFTER:
+    if focus.is_paused():
+        # 主动暂停和程序挂了是两回事：暂停时数据停滞是预期的，别报故障
+        health = '<span class="pause">已暂停 · 数据停在 ' \
+                 f'{_dur(lag)} 前</span>'
+    elif lag > STALE_AFTER:
         health = (f'<span class="warn">数据已停滞 {_dur(lag)} —— '
                   f'记录程序似乎没在运行</span>')
     else:
@@ -140,9 +144,13 @@ def _live_html() -> str:
                   f' · <span class="muted">{cal}</span>')
 
     # 当前这次连续投入（往回数）
+    # 时间空档必须断开：睡眠/关机期间没有样本，但 _timed 已经给每条样本
+    # 记了时长，不检查间隔会把睡眠前后的两段专注拼成一段"连续投入"。
     run = 0.0
     i = len(items) - 1
     while i >= 0 and items[i][2] in ENGAGED:
+        if i + 1 < len(items) and items[i + 1][0] - items[i][0] > SESSION_GAP:
+            break
         run += items[i][1]
         i -= 1
     if run <= 0:
@@ -381,6 +389,7 @@ _PAGE = """<!DOCTYPE html>
   .health a { color:#38bdf8; text-decoration:none; }
   .ok { color:#22c55e; }
   .warn { color:#f59e0b; font-weight:600; }
+  .pause { color:#a78bfa; font-weight:600; }
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
   .card { background:#1e293b; border:1px solid #334155; border-radius:12px; padding:16px 18px; }
   .card .k { color:#94a3b8; font-size:13px; margin-bottom:6px; }

@@ -47,6 +47,12 @@ def load(db_path: Path = DB_PATH, since: float | None = None) -> list[tuple]:
         args = (since,)
     conn = sqlite3.connect(db_path)
     try:
+        # 首次运行（还没建过表）时返回空，让面板显示"还没有任何数据"，
+        # 而不是 500 —— 空环境是最常见的新手场景
+        if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='samples'").fetchone():
+            return []
         return conn.execute(sql + " ORDER BY ts", args).fetchall()
     finally:
         conn.close()
@@ -258,6 +264,9 @@ def build_html(rows: list[tuple]) -> str:
     gaze_away = 0.0        # 走神里"人没看屏幕"的那部分，不归因给任何应用
     hour_active: dict[int, float] = defaultdict(float)
     hour_engaged: dict[int, float] = defaultdict(float)
+    hour_active_days: dict[int, set] = defaultdict(set)   # 每钟点活跃过的日期
+    day_active: dict[str, float] = defaultdict(float)     # 每天活跃时长
+    day_engaged: dict[str, float] = defaultdict(float)    # 每天投入时长
     hour_sessions: dict[int, int] = defaultdict(int)
     hour_entry: dict[int, list[float]] = defaultdict(list)
     tilt_bad = 0.0
@@ -269,10 +278,15 @@ def build_html(rows: list[tuple]) -> str:
 
     for (ts, dt, state, app, title, yaw, pitch, ear, tilt, present) in items:
         dur[state] += dt
+        lt = time.localtime(ts)
+        day = time.strftime("%Y-%m-%d", lt)
         if state != "away":
-            hour_active[time.localtime(ts).tm_hour] += dt
+            hour_active[lt.tm_hour] += dt
+            hour_active_days[lt.tm_hour].add(day)
+            day_active[day] += dt
         if state in ENGAGED:
-            hour_engaged[time.localtime(ts).tm_hour] += dt
+            hour_engaged[lt.tm_hour] += dt
+            day_engaged[day] += dt
         if present:
             yaws.append(yaw)
             pitches.append(pitch)
@@ -372,13 +386,32 @@ def build_html(rows: list[tuple]) -> str:
         cells.append(f'<span class="cell" style="background:{STATES[dom][1]}" '
                      f'title="{_mdhm(minute * 60)} {STATES[dom][0]}"></span>')
 
-    peak = max(hour_active.values()) if hour_active else 1.0
+    # 每小时归一成"平均每天"：只早上用电脑的人，上午柱不再被几天撑虚高。
+    # 原始累计 hour_active 仍留给黄金时段排序，柱状图只看平均强度。
+    hour_avg = {h: hour_active[h] / len(hour_active_days[h])
+                for h in hour_active}
+    peak = max(hour_avg.values()) if hour_avg else 1.0
     hours_bar = "".join(
-        f'<div class="hbar"><span class="hv">{_dur(hour_active[h])}</span>'
-        f'<div class="hbg"><i style="height:{max(3, round(hour_active[h] / peak * 110))}px"'
-        f' title="{_dur(hour_active[h])}"></i></div>'
+        f'<div class="hbar"><span class="hv">{_dur(hour_avg[h])}</span>'
+        f'<div class="hbg"><i style="height:{max(3, round(hour_avg[h] / peak * 110))}px"'
+        f' title="{h:02d} 点 · 平均每天 {_dur(hour_avg[h])}"></i></div>'
         f'<span class="hl">{h:02d}</span></div>'
-        for h in range(24) if hour_active.get(h))
+        for h in range(24) if h in hour_avg)
+
+    # 近 14 个有记录的自然日：每天投入时长柱，悬停看当天专注率
+    day_keys = sorted(day_active)[-14:]
+    if day_keys:
+        day_peak = max(day_engaged.get(d, 0) for d in day_keys) or 1.0
+        day_bars = "".join(
+            f'<div class="hbar"><span class="hv">{_dur(day_engaged.get(d, 0))}</span>'
+            f'<div class="hbg"><i style="height:'
+            f'{max(3, round(day_engaged.get(d, 0) / day_peak * 110))}px"'
+            f' title="{d} 投入 {_dur(day_engaged.get(d, 0))} · '
+            f'专注率 {day_engaged.get(d, 0) / day_active[d] * 100:.0f}%"></i></div>'
+            f'<span class="hl">{d[5:]}</span></div>'
+            for d in day_keys)
+    else:
+        day_bars = ""
 
     # ── 自述对照：自评分 vs 实测投入率 ──
     pairs = ratings.paired(items)
@@ -526,9 +559,15 @@ def build_html(rows: list[tuple]) -> str:
 伏案由头部俯仰角估算，前置摄像头分不清"低头看书"和"低头玩手机" —— 觉得虚高就把
 focus.py 里的 DESKWORK_IS_ENGAGED 改成 False。</p>
 
-<details><summary>全天活跃分布与时间轴</summary><div class="dbody">
+<details><summary>全天活跃分布与每日投入</summary><div class="dbody">
 <h3>全天活跃分布</h3>
 <div class="hbars">{hours_bar}</div>
+<p class="note">每根柱 = 该钟点<em>平均每天</em>的活跃时长。分母是"该钟点有记录的天数"
+（只部分天用电脑的钟点，不会被少有的几天撑虚高），所以这是你的作息节律，不是总量。</p>
+<h3>近 14 天每日投入</h3>
+<div class="hbars">{day_bars}</div>
+<p class="note">每日投入 = 计入投入的状态（{'+'.join(sorted(ENGAGED))}）时长。
+悬停看当天专注率。{"仅显示最近 14 个有记录的自然日。" if day_keys else ""}</p>
 <h3>时间轴</h3>
 <div class="tl">{"".join(cells)}</div>
 <p class="note">每格 1 分钟，颜色对应主导状态。共 {len(cells)} 分钟。</p>
@@ -560,11 +599,39 @@ focus.py 里的 DESKWORK_IS_ENGAGED 改成 False。</p>
 </div></body></html>"""
 
 
+def export_csv(rows: list[tuple]) -> Path:
+    """把样本导出成 Excel 能直接打开的 CSV（UTF-8 BOM + 表头）。
+
+    ts 记成本地时间可读串；标题字段可能带逗号/引号/换行，按 CSV 规则转义。
+    """
+    out = ROOT / f"focus-{time.strftime('%Y%m%d')}.csv"
+    lines = ["时间,状态,应用,窗口标题,偏航,俯仰,EAR,肩倾,置信度,在画面,空闲秒"]
+    for ts, state, app, title, yaw, pitch, ear, tilt, scale, present, idle in rows:
+        lines.append(",".join([
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+            _csv_cell(state), _csv_cell(app), _csv_cell(title),
+            f"{yaw:.1f}", f"{pitch:.1f}", f"{ear:.3f}", f"{tilt:.1f}",
+            f"{scale:.3f}", "1" if present else "0", f"{idle:.0f}",
+        ]))
+    out.write_text("\n".join(lines), encoding="utf-8-sig")
+    return out
+
+
+def _csv_cell(value) -> str:
+    """窗口标题可能带着逗号、引号、换行，包起来才不会把一列拆成好几列。"""
+    s = str(value)
+    if any(c in s for c in ',"\n'):
+        s = '"' + s.replace('"', '""') + '"'
+    return s
+
+
 def main() -> None:
     rows = load()
     OUT.write_text(build_html(rows), encoding="utf-8")
     print(f"报告已生成: {OUT}")
     if rows:
+        csv_out = export_csv(rows)
+        print(f"数据已导出: {csv_out}")
         webbrowser.open(OUT.as_uri())
 
 

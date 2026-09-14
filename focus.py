@@ -579,6 +579,19 @@ class Vision:
 
 # ══════════════════════ 采集线程 ══════════════════════
 
+# 运行时共享状态放模块级而不是 Monitor 实例上：dashboard 可能独立运行
+# （uv run dashboard.py）或作为托盘子进程被 import，不能依赖拿到 Monitor 对象。
+_runtime = {"paused": False}
+
+
+def set_paused(paused: bool) -> None:
+    _runtime["paused"] = paused
+
+
+def is_paused() -> bool:
+    return _runtime["paused"]
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples(
     ts REAL, state TEXT, app TEXT, title TEXT,
@@ -838,6 +851,24 @@ def _pending_ratings() -> int:
         return 0
 
 
+def _today_engaged_seconds() -> int:
+    """今天累计投入秒数（ENGAGED 状态），只读连接，不碰主进程的写连接。"""
+    _today = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        try:
+            marks = ",".join("?" * len(ENGAGED))
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM samples WHERE ts >= ? "
+                f"AND state IN ({marks})",
+                (_today, *ENGAGED)).fetchone()
+            return int(row[0])
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
 def run_tray(mon: Monitor) -> None:
     import pystray
     import webbrowser
@@ -889,14 +920,26 @@ def run_tray(mon: Monitor) -> None:
 
     def on_pause(icon, _item):
         mon.paused = not mon.paused
+        set_paused(mon.paused)         # dashboard 独立运行时靠它区分"暂停"和"记录程序挂了"
         icon.title = "专注监视 — 已暂停" if mon.paused else "专注监视"
         return True
+
+    def _state_text(_i) -> str:
+        label = STATES.get(mon.state, ("未知", "#64748b"))[0]
+        return f"当前状态：{label}"
+
+    def _today_text(_i) -> str:
+        import report                       # 只在函数里取 _dur，避免顶层 import 成环
+        return f"今日投入：{report._dur(_today_engaged_seconds())}"
 
     icon = pystray.Icon(
         "focus-monitor",
         _icon_image(STATES["away"][1]),
         "专注监视",
         menu=pystray.Menu(
+            pystray.MenuItem(_state_text, None, enabled=False),
+            pystray.MenuItem(_today_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("打开面板 / 去评分（左键点我）", on_default,
                              default=True),
             pystray.MenuItem("自述评分", on_rate),
