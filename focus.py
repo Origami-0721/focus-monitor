@@ -1168,13 +1168,15 @@ def selftest() -> None:
     assert decide(**{**base, "pitch": 45.0}) == "deskwork"
     dk = [_row(3000 + i, "deskwork", "code.exe", "focus.py", 0.0, 45.0)
           for i in range(60)]
+    # 那个数字在报告里是加粗高亮的，所以匹配带标记的片段而不是纯文本
+    MARK = 'font-size:16px">'          # 有效投入率那一个 <b> 的专属样式
     apply_config({"DESKWORK_IS_ENGAGED": True})
     assert "deskwork" in ENGAGED
-    assert "有效投入占 100%" in report.build_html(dk)
+    assert MARK + "100%</b>" in report.build_html(dk), "开关打开时有效投入应为 100%"
     apply_config({"DESKWORK_IS_ENGAGED": False})
     assert "deskwork" not in ENGAGED, "关掉开关后伏案不该算投入"
     assert decide(**{**base, "pitch": 45.0}) == "deskwork", "状态判定不受开关影响"
-    assert "有效投入占 0%" in report.build_html(dk), "报告的有效投入要跟着开关走"
+    assert MARK + "0%</b>" in report.build_html(dk), "报告的有效投入要跟着开关走"
 
     # 关键词表是整体替换，不是往默认值里追加
     apply_config({"YAW_TOL": 40.0, "WORK_APPS": ["myapp.exe"]})

@@ -103,6 +103,11 @@ def _rate_page(msg: str = "") -> str:
 </div>"""
 
 
+def rate_color(pct: float) -> str:
+    """投入率配色：高绿、中蓝、低橙。只写一处，免得每张卡各配一套。"""
+    return "#22c55e" if pct >= 70 else "#38bdf8" if pct >= 45 else "#f59e0b"
+
+
 def _live_html() -> str:
     focus.maybe_reload_config()      # 设置页改完，面板下一个 3 秒周期就反映出来
     ENGAGED = focus.ENGAGED
@@ -132,13 +137,20 @@ def _live_html() -> str:
         run += items[i][1]
         i -= 1
     if run <= 0:
-        flow = '<div class="big muted">当前没有在投入</div>'
+        flow = ('<div class="big muted">—</div>'
+                '<div class="sub">当前没有在投入</div>')
     elif run >= FLOW_MIN:
-        flow = (f'<div class="big" style="color:{color}">{_dur(run)}</div>'
-                f'<div class="sub">已达心流（连续投入 ≥{_dur(FLOW_MIN)}）</div>')
+        flow = (f'<div class="big" style="color:#22c55e">{_dur(run)}</div>'
+                f'<div class="pbar"><i style="width:100%;background:#22c55e"></i></div>'
+                f'<div class="sub"><b style="color:#22c55e">已进入心流</b>'
+                f'（阈值 {_dur(FLOW_MIN)}）</div>')
     else:
-        flow = (f'<div class="big" style="color:{color}">{_dur(run)}</div>'
-                f'<div class="sub">还差 {_dur(FLOW_MIN - run)} 进入心流</div>')
+        pct = run / FLOW_MIN * 100
+        # 越接近阈值越亮，让人一眼看出"还差多少"
+        c = "#22c55e" if pct >= 70 else "#38bdf8" if pct >= 35 else "#64748b"
+        flow = (f'<div class="big" style="color:{c}">{_dur(run)}</div>'
+                f'<div class="pbar"><i style="width:{pct:.0f}%;background:{c}"></i></div>'
+                f'<div class="sub">还差 <b>{_dur(FLOW_MIN - run)}</b> 进入心流</div>')
 
     # 当前会话
     sess = _sessions(items)
@@ -162,12 +174,21 @@ def _live_html() -> str:
     t_streak = len(_streaks(today))
     t_rate = t_eng / t_act * 100 if t_act else 0.0
 
-    # 最近 60 分钟色带
-    recent = [x for x in items if x[0] >= time.time() - 3600]
-    tape = "".join(
-        f'<span class="seg" style="background:{STATES.get(x[2], ("", "#334155"))[1]}" '
-        f'title="{_hm(x[0])} {STATES.get(x[2], ("?", ""))[0]}"></span>'
-        for x in recent) or '<span class="muted">最近一小时没有记录</span>'
+    # 最近 60 分钟色带：按分钟聚合。
+    # 直接逐条渲染的话一小时是 3600 个色块 —— 糊成一团，DOM 还重。
+    buckets60: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    cutoff = time.time() - 3600
+    for x in items:
+        if x[0] >= cutoff:
+            buckets60[int(x[0] // 60)][x[2]] += x[1]
+    cells60 = []
+    for minute, group in sorted(buckets60.items()):
+        dom = max(group, key=group.get)
+        cells60.append(
+            f'<span class="seg" '
+            f'style="background:{STATES.get(dom, ("", "#334155"))[1]}" '
+            f'title="{_hm(minute * 60)} {STATES.get(dom, ("?",))[0]}"></span>')
+    tape = "".join(cells60) or '<span class="muted">最近一小时没有记录</span>'
 
     # 今天按小时
     hour_act: dict[int, float] = defaultdict(float)
@@ -199,9 +220,11 @@ def _live_html() -> str:
 <div class="cards">
   <div class="card"><div class="k">当前连续投入</div>{flow}</div>
   <div class="card"><div class="k">本次会话</div>{sess_html}</div>
-  <div class="card"><div class="k">今天累计</div>
-    <div class="big">{_dur(t_eng)}</div>
-    <div class="sub">活跃 {_dur(t_act)} · 投入率 {t_rate:.0f}% · 心流 {t_streak} 段</div>
+  <div class="card"><div class="k">今天累计投入</div>
+    <div class="big" style="color:{rate_color(t_rate)}">{_dur(t_eng)}</div>
+    <div class="sub">活跃 {_dur(t_act)} ·
+      <b style="color:{rate_color(t_rate)}">{t_rate:.0f}%</b> ·
+      心流 {t_streak} 段</div>
   </div>
 </div>
 
@@ -354,9 +377,12 @@ _PAGE = """<!DOCTYPE html>
   .card .k { color:#94a3b8; font-size:13px; margin-bottom:6px; }
   .big { font-size:26px; font-weight:700; }
   .sub { font-size:12px; color:#64748b; margin-top:4px; }
+  .pbar { background:#0f172a; height:6px; border-radius:3px; overflow:hidden;
+          margin:8px 0 4px; }
+  .pbar i { display:block; height:100%; border-radius:3px; }
   .tape { display:flex; flex-wrap:wrap; gap:1px; background:#1e293b;
           border-radius:10px; padding:10px; min-height:34px; align-items:center; }
-  .seg { width:4px; height:14px; border-radius:1px; }
+  .seg { width:9px; height:22px; border-radius:2px; }
   .hbars { display:flex; gap:6px; align-items:flex-end; background:#1e293b;
            border-radius:10px; padding:12px; min-height:100px; }
   .hbar { flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; }

@@ -339,12 +339,18 @@ def build_html(rows: list[tuple]) -> str:
     ranked = [(h, hour_active[h]) for h in hour_active if hour_active[h] >= MIN_HOUR_DATA]
     ranked.sort(key=lambda kv: -hour_engaged[kv[0]] / kv[1])
     skipped = [h for h in hour_active if hour_active[h] < MIN_HOUR_DATA]
-    hour_html = "".join(
-        f'<tr><td>{h:02d}:00</td><td class="num">{_dur(hour_active[h])}</td>'
-        f'<td>{_rate_cell(hour_engaged[h] / hour_active[h] * 100)}</td>'
-        f'<td class="num">{hour_sessions.get(h, 0)}</td>'
-        f'<td class="num">{_dur(sum(hour_entry[h]) / len(hour_entry[h])) if hour_entry.get(h) else "—"}</td></tr>'
-        for h, _ in ranked[:10]) or \
+    hour_rows = []
+    for i, (h, _) in enumerate(ranked[:10]):
+        entry = hour_entry.get(h)
+        cls = ' class="best"' if i == 0 else ""     # 反斜杠不能出现在 f-string 表达式里
+        hour_rows.append(
+            f'<tr{cls}>'
+            f'<td>{h:02d}:00</td><td class="num">{_dur(hour_active[h])}</td>'
+            f'<td>{_rate_cell(hour_engaged[h] / hour_active[h] * 100)}</td>'
+            f'<td class="num">{hour_sessions.get(h, 0)}</td>'
+            f'<td class="num">{_dur(sum(entry) / len(entry)) if entry else "—"}</td>'
+            f'</tr>')
+    hour_html = "".join(hour_rows) or \
         (f'<tr><td colspan="5" class="muted">还没有任何钟点累积到 '
          f'{_dur(MIN_HOUR_DATA)} 的数据</td></tr>')
 
@@ -453,15 +459,35 @@ def build_html(rows: list[tuple]) -> str:
   .hv {{ font-size:11px; color:#94a3b8; font-variant-numeric:tabular-nums; }}
   .muted {{ color:#64748b; }}
   .note {{ color:#64748b; font-size:13px; margin-top:12px; }}
+  /* 次要板块折叠。用原生 details，不需要 JS，也不影响首屏加载。 */
+  details {{ border:1px solid #334155; border-radius:12px; margin:14px 0; }}
+  details > summary {{ cursor:pointer; padding:13px 20px; font-size:15px;
+        font-weight:600; color:#94a3b8; list-style:none; user-select:none; }}
+  details > summary::-webkit-details-marker {{ display:none; }}
+  details > summary::before {{ content:"▸ "; color:#64748b; }}
+  details[open] > summary {{ color:#e2e8f0; }}
+  details[open] > summary::before {{ content:"▾ "; color:#38bdf8; }}
+  details .dbody {{ padding:2px 20px 16px; }}
+  details .dbody h3 {{ font-size:14px; margin:20px 0 10px; color:#94a3b8;
+        font-weight:600; }}
+  /* 黄金时段第一名：整行打绿底，往上一眼就能看到 */
+  tr.best td {{ background:#052e16; }}
+  tr.best td:first-child {{ color:#22c55e; font-weight:700; }}
+  .pbar {{ background:#0f172a; height:6px; border-radius:3px; overflow:hidden;
+           margin:7px 0 4px; }}
+  .pbar i {{ display:block; height:100%; border-radius:3px; }}
 </style></head><body><div class="wrap">
 <h1>专注度报告</h1>
 <p class="sub">{_mdhm(rows[0][0])} – {_mdhm(rows[-1][0])} · {days} 天 · {len(rows)} 条样本</p>
 
 <div class="cards">
-  <div class="card hl-card"><div class="k">最佳时段</div><div class="v" style="color:#22c55e;font-size:22px">{best}</div></div>
-  <div class="card"><div class="k">会话数（≥1 分钟）</div><div class="v">{len(sess_rows)}</div></div>
-  <div class="card"><div class="k">心流片段数（≥15 分钟）</div><div class="v">{len(all_streaks)}</div></div>
-  <div class="card"><div class="k">总体专注率</div><div class="v">{focus_rate:.0f}%</div></div>
+  <div class="card hl-card"><div class="k">最佳时段</div>
+    <div class="v" style="color:#22c55e;font-size:23px">{best}</div></div>
+  <div class="card"><div class="k">有效投入率</div>
+    <div class="v" style="color:#38bdf8">{engaged_rate:.0f}%</div></div>
+  <div class="card"><div class="k">心流片段（≥15 分钟）</div>
+    <div class="v">{len(all_streaks)}</div></div>
+  <div class="card"><div class="k">会话数</div><div class="v">{len(sess_rows)}</div></div>
 </div>
 
 <h2>黄金时段</h2>
@@ -475,47 +501,52 @@ def build_html(rows: list[tuple]) -> str:
 <h2>自述对照（数据准不准）</h2>
 {self_html}
 
-<h2>会话明细</h2>
+<details><summary>会话明细与心流片段</summary><div class="dbody">
+<h3>会话明细</h3>
 <table><thead><tr><th>开始时间</th><th class="num">跨度</th><th class="num">活跃</th>
 <th class="num">专注率</th><th class="num">心流片段</th><th class="num">进入心流耗时</th></tr></thead>
 <tbody>{sess_html}</tbody></table>
 <p class="note">会话 = 一次"坐下来用电脑"的连续时段。样本空档 &gt;{_dur(SESSION_GAP)}（待机/关机）
 或连续离开 &gt;{_dur(SESSION_AWAY)}，都判定为会话结束。{"仅显示最近 40 次。" if len(sess_rows) > 40 else ""}</p>
 
-<h2>心流片段</h2>
+<h3>心流片段</h3>
 <table><thead><tr><th>开始时间</th><th class="num">持续</th>
 <th class="num">有效专注占比</th><th class="num">距会话开始</th></tr></thead>
 <tbody>{streak_html}</tbody></table>
 <p class="note">心流 = 连续专注 ≥{_dur(FLOW_MIN)}，允许中间有 ≤{_dur(FLOW_GAP)} 的短暂中断。
 {"仅显示最近 25 段。" if len(all_streaks) > 25 else ""}</p>
-
-<h2>全天活跃分布</h2>
-<div class="hbars">{hours_bar}</div>
+</div></details>
 
 <h2>状态分布</h2>
 <div class="grid">{_donut([(STATES[s][0], dur[s], STATES[s][1]) for s in order])}
 <div>{legend}</div></div>
-<p class="note">看着屏幕（专注 + 中性）占活跃时长的 {looking_rate:.0f}%；
-加上伏案（低头看书/写作业），有效投入占 {engaged_rate:.0f}%。
+<p class="note">看着屏幕（专注 + 中性）占活跃时长的 <b>{looking_rate:.0f}%</b>；
+加上伏案（低头看书/写作业），有效投入占
+<b style="color:#22c55e;font-size:16px">{engaged_rate:.0f}%</b>。
 伏案由头部俯仰角估算，前置摄像头分不清"低头看书"和"低头玩手机" —— 觉得虚高就把
 focus.py 里的 DESKWORK_IS_ENGAGED 改成 False。</p>
 
-<h2>时间轴</h2>
+<details><summary>全天活跃分布与时间轴</summary><div class="dbody">
+<h3>全天活跃分布</h3>
+<div class="hbars">{hours_bar}</div>
+<h3>时间轴</h3>
 <div class="tl">{"".join(cells)}</div>
 <p class="note">每格 1 分钟，颜色对应主导状态。共 {len(cells)} 分钟。</p>
+</div></details>
 
-<h2>专注应用排行</h2>
+<details><summary>应用排行</summary><div class="dbody">
+<h3>专注应用排行</h3>
 {_app_table(work_dur, dur["focused"], "没有专注记录")}
-
-<h2>分心应用排行</h2>
+<h3>分心应用排行</h3>
 {_app_table(app_dur, app_distract, "没有应用导致的分心")}
 <p class="note">走神共 {_dur(dur["distracted"])}，拆成两块：
 <b>应用导致的 {_dur(app_distract)}</b>（上表，你确实看着屏幕时被它拉走），
 以及 <b>人没看屏幕的 {_dur(gaze_away)}</b>（转头或人离开画面 —— 此时前台开着什么
 跟走神没有因果关系，所以不归因给任何应用）。
 两者解法相反：前者靠屏蔽应用，后者靠休息或换任务。</p>
+</div></details>
 
-<h2>身体信号</h2>
+<details><summary>身体信号与坐姿</summary><div class="dbody">
 <div class="cards">
   <div class="card"><div class="k">平均头部偏航</div><div class="v">{avg(yaws):.1f}°</div></div>
   <div class="card"><div class="k">平均头部俯仰</div><div class="v">{avg(pitches):.1f}°</div></div>
@@ -524,6 +555,7 @@ focus.py 里的 DESKWORK_IS_ENGAGED 改成 False。</p>
 </div>
 <p class="note">坐姿由前置摄像头肩线倾角估算（&gt;{TILT_WARN:.0f}° 记为不良）。
 正面视角看不到驼背，这不是脊柱检测。状态切换 {switches} 次。</p>
+</div></details>
 
 </div></body></html>"""
 
