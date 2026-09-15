@@ -11,6 +11,16 @@ focus.pid
 report.html
 demo-report.html
 
+# CSV 导出：逐秒含状态 / 应用名 / 原始窗口标题，和 focus.db 同级敏感。
+# 每次生成报告都会自动写出，不排除的话一次 git add -A 就全进仓库了。
+focus-*.csv
+focus-????????.csv
+
+# 自检用的临时库。正常路径会删掉，中途崩了会残留。
+# 用通配前缀而不是逐个列 —— 后面加新的自检库时最容易忘记补这一行。
+_selftest*.db
+_selftest*.db-*
+
 # ── 模型文件：首次运行自动下载（约 11MB）──
 models/
 

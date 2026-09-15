@@ -1,8 +1,24 @@
 [project]
 name = "focus-monitor"
 version = "0.2.2"
-description = "摄像头 + 屏幕使用双路专注度监视器"
+description = "摄像头 + 屏幕使用双路专注度监视器（Windows 本地运行，数据不出本机）"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11,<3.13"
+# 关键词和 classifiers 保持英文：这是 PyPI 的索引字段，
+# 中文写进去搜不到，也不符合 PyPI 的取值规范。
+keywords = ["focus", "productivity", "webcam", "mediapipe", "windows", "quantified-self"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
 dependencies = [
     "mediapipe>=1.0",
     "opencv-python>=4.10",
@@ -11,3 +27,17 @@ dependencies = [
     "pystray",
     "pywebview>=6.2.1",
 ]
+
+[project.optional-dependencies]
+# 打包 exe 用。不进主依赖 —— 日常跑监视器不需要 PyInstaller（它很大）。
+build = ["pyinstaller>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/Origami-0721/focus-monitor"
+Issues = "https://github.com/Origami-0721/focus-monitor/issues"
+
+[project.scripts]
+focus-monitor = "focus:main"
+
+[tool.pyinstaller]
+# 见 scripts/build_release.py：onedir 明显快于 onefile，只是分发时多打一个 zip。

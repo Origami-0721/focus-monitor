@@ -1,0 +1,52 @@
+name: 自检
+
+# 每次 push / PR 都跑一遍自检。
+# 为什么值得有：这个项目没有单元测试，只有一个 `--selftest` 入口，
+# 而它覆盖了状态机、阈值、时间分带这些最容易改坏的东西。没有 CI 的话，
+# 只有维护者本机手动跑 —— 而"改完忘了跑"正是回归漏出去的唯一原因。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    # 必须 windows：window.py 直接调 Win32 API，模块都 import 不了。
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install mediapipe opencv-python numpy pillow pystray pywebview
+
+      - name: 语法检查（全部模块）
+        run: python -m py_compile focus.py report.py dashboard.py ratings.py window.py
+
+      - name: 自检
+        run: python focus.py --selftest
+
+      # 自检只覆盖纯逻辑。下面这一步确认所有页面都能真的渲染出来 ——
+      # 模板里的 f-string 少个括号，selftest 是看不出来的，
+      # 但用户点开面板第一眼就崩。
+      - name: 冒烟测试（各页面都能渲染）
+        run: python -c "
+          import focus, report, dashboard;
+          html = report.build_html([]);
+          assert '<html' in html, '报告渲染失败';
+          assert 'focus.db' not in html, '报告里不该出现数据库路径';
+          dashboard._rate_page(); dashboard._settings_page();
+          print('冒烟测试通过')
+          "

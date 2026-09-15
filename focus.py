@@ -125,9 +125,17 @@ AWAY_FACE = 20.0       # 人脸消失多少秒算离开
 AWAY_IDLE = 180.0      # 键鼠无操作多少秒算离开
 TILT_WARN = 12.0       # 肩线倾斜超过多少度算坐姿不良
 AWAY_WRITE_EVERY = 30.0  # 离开期间每 30 秒才落一条，否则整夜待机能把数据库撑爆
+# 攒多少条样本才 commit 一次。每条单独 commit 在 journal_mode=delete 下
+# 等于每条一次 fsync 级写盘 + 一次持写锁，读数进程（面板每 3 秒轮询）
+# 撞锁的概率被放大了十几倍。攒批后写入次数降两个量级，
+# 代价是崩溃时最多丢这么多条样本（每条约 2 秒，即最多丢几十秒）。
+SAMPLE_COMMIT_EVERY = 15
 # 连续投入超过这么久就别弹评分提醒 —— 在人正专注的时候打断是本末倒置，
 # 等自然断点（走神 / 离开 / 疲劳）再问。
 FLOW_QUIET = 300.0
+# 连续投入时最长闭嘴多久。到点即使仍在心流里也放行一次提醒，
+# 否则"一整天不间断专注"的人永远收不到评分样本（见 should_prompt_rating）。
+PROMPT_CEILING = 2 * 3600.0
 
 WORK_APPS = {
     "code.exe", "code - insiders.exe", "cursor.exe", "devenv.exe", "idea64.exe",
@@ -181,6 +189,10 @@ ENGAGED = frozenset({"focused", "neutral", "deskwork"} if DESKWORK_IS_ENGAGED
 # 改完不需要重启进程：监视循环、报告、实时面板都会定期调用
 # maybe_reload_config()，靠文件 mtime 判断有没有变。
 CONFIG_PATH = ROOT / "config.json"
+
+# 版本号。这里和 pyproject.toml 的 version 必须一致（发布清单里有一步专门核对）。
+# 冻结成 exe 后，bug 报告唯一能问到的版本信息就是它。
+__version__ = "0.2.2"
 
 _SCALARS: dict[str, type] = {
     "FACE_FPS": int, "POSE_FPS": int, "PROC_WIDTH": int,
@@ -254,42 +266,67 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
+    """写 config.json 并立即生效。
+
+    先写临时文件再 os.replace()：直接 write_text 是 truncate + write，
+    不是原子的 —— 并发的 load_config 可能读到半个 JSON，那时 load_config
+    返回 {}，于是 maybe_reload_config 会把「默认值」当成新配置应用一遍，
+    还打印一句"已重新加载（0 项）"。配置就这么无声地丢了。
+    """
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, CONFIG_PATH)         # 同盘替换是原子的
     apply_config(cfg)
 
 
 _config_mtime = 0.0
+# apply_config / maybe_reload_config 会被采集线程和 HTTP 线程同时调用，
+# 而 apply_config 要逐个写十几个全局量 —— 中途被读到就是一条用新阈值
+# 配旧容差的样本。用锁把「改」和「读-改-mtime」都串起来。
+_config_lock = threading.RLock()
+
+
+def _config_stamp() -> tuple[float, int]:
+    """配置文件的版本戳：mtime + 大小。
+
+    只看 st_mtime 不够 —— 同一秒内的两次保存可能拿到相同的 st_mtime
+    （秒级分辨率），第二次编辑就被静默丢弃。
+    """
+    try:
+        st = CONFIG_PATH.stat()
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return (0.0, 0)
 
 
 def maybe_reload_config() -> bool:
     """config.json 变动了就重新应用；没变就立刻返回（只做一次 stat）。"""
     global _config_mtime
-    try:
-        mtime = CONFIG_PATH.stat().st_mtime
-    except OSError:
-        mtime = 0.0
-    if mtime == _config_mtime:
-        return False
-    _config_mtime = mtime
-    if not CONFIG_PATH.exists():
-        apply_config(_DEFAULTS)          # 文件被删掉 = 恢复默认，不能什么都不做
-        log.info("config.json 不存在，已恢复默认配置")
+    with _config_lock:
+        stamp = _config_stamp()
+        if stamp == _config_mtime:
+            return False
+        _config_mtime = stamp
+        if not CONFIG_PATH.exists():
+            apply_config(_DEFAULTS)      # 文件被删掉 = 恢复默认，不能什么都不做
+            log.info("config.json 不存在，已恢复默认配置")
+            return True
+        cfg = load_config()
+        errs = validate_config(cfg) if cfg else []
+        if errs:
+            log.warning("config.json 有 %d 处问题，仍按原样应用：%s",
+                        len(errs), "；".join(errs))
+        apply_config(cfg)
+        log.info("配置已重新加载（%d 项）", len(cfg))
         return True
-    cfg = load_config()
-    errs = validate_config(cfg) if cfg else []
-    if errs:
-        log.warning("config.json 有 %d 处问题，仍按原样应用：%s",
-                    len(errs), "；".join(errs))
-    apply_config(cfg)
-    log.info("配置已重新加载（%d 项）", len(cfg))
-    return True
 
 
 def reset_config() -> None:
-    if CONFIG_PATH.exists():
-        CONFIG_PATH.unlink()
-    apply_config(_DEFAULTS)
+    with _config_lock:
+        if CONFIG_PATH.exists():
+            CONFIG_PATH.unlink()
+        apply_config(_DEFAULTS)
 
 
 maybe_reload_config()      # 导入时立即生效一次
@@ -405,14 +442,25 @@ def ear_threshold(history: list[float]) -> float:
     return max(0.05, ordered[idx] * EAR_RATIO)
 
 
-def should_prompt_rating(engaged_run: float, ratable: bool) -> bool:
+def should_prompt_rating(engaged_run: float, ratable: bool,
+                         since_last: float = 0.0) -> bool:
     """要不要弹评分提醒。
 
     抽成独立函数是为了能断言 —— 这条规则是明确要求的行为：
-    **正在连续投入时不准打扰**，等断点再问。一直专注就一直不问，
-    因为那本来就是想要的状态，没什么好打分的。
+    **正在连续投入时不准打扰**，等断点再问。
+
+    但"不打扰"必须有个上限（since_last ≥ PROMPT_CEILING 时强行放行）。
+    纯靠 engaged_run < FLOW_QUIET 有个反直觉的后果：一个上午都在连续投入、
+    只在 alt-tab 那几十秒里断一下的人，_engaged_run 几乎从不归零，
+    于是**最专注的那些时段一个评分都收不到**。样本被系统性偏向前半天
+    被打断的时段 —— 而相关性验证的正是"专注"，这个偏差方向刚好最坏。
+
+    到点还是没断点就放行一次：托盘气泡不抢焦点、不阻塞输入，
+    比"永远收不到训练数据"划算得多。
     """
-    return bool(ratable) and engaged_run < FLOW_QUIET
+    if not ratable:
+        return False
+    return engaged_run < FLOW_QUIET or since_last >= PROMPT_CEILING
 
 
 def shoulder_tilt(lx: float, ly: float, rx: float, ry: float) -> float:
@@ -484,14 +532,21 @@ _PNP_IDX = [1, 152, 33, 263, 61, 291]
 PNP_FLAGS = cv2.SOLVEPNP_EPNP
 
 
-def ensure_models() -> None:
-    """首次运行下载 .task 模型（约 4MB + 6MB）。"""
+def ensure_models(on_progress=None) -> None:
+    """首次运行下载 .task 模型（约 4MB + 6MB）。
+
+    on_progress(text): 可选回调。打包成 --windowed 后 print 全进黑洞，
+    首次运行会看起来像"双击了但什么都没发生" —— 启动时给个托盘气泡，
+    用户才知道程序在工作而不是坏了。
+    """
     MODELS.mkdir(exist_ok=True)
     for name, url in MODEL_URLS.items():
         dst = MODELS / name
         if dst.exists():
             continue
         print(f"下载模型 {name} ...")
+        if on_progress:
+            on_progress(f"正在下载模型 {name}（首次运行需要，约 11MB，请稍候）")
         tmp = dst.with_suffix(".part")
         urllib.request.urlretrieve(url, tmp)
         tmp.replace(dst)
@@ -585,7 +640,7 @@ class Vision:
 
 # 运行时共享状态放模块级而不是 Monitor 实例上：dashboard 可能独立运行
 # （uv run dashboard.py）或作为托盘子进程被 import，不能依赖拿到 Monitor 对象。
-_runtime = {"paused": False}
+_runtime = {"paused": False, "heartbeat": 0.0}
 
 
 def set_paused(paused: bool) -> None:
@@ -594,6 +649,26 @@ def set_paused(paused: bool) -> None:
 
 def is_paused() -> bool:
     return _runtime["paused"]
+
+
+def beat() -> None:
+    """采集线程每转一圈调一次。
+
+    托盘图标靠它区分"正常记录"和"线程已经死了"：以前 Monitor.run() 抛异常
+    只是 log 一下就 return，托盘照常刷着最后一次的状态色 —— 看起来完全健康。
+    """
+    _runtime["heartbeat"] = time.time()
+
+
+def heartbeat_age() -> float:
+    """距离上次采集还有多久（秒）。从未采集过返回一个很大的数。"""
+    hb = _runtime.get("heartbeat", 0.0)
+    return float("inf") if not hb else max(0.0, time.time() - hb)
+
+
+def is_stale(after: float = 90.0) -> bool:
+    """采集是否已经停摆（且不是主动暂停 —— 暂停是预期行为，不算故障）。"""
+    return not is_paused() and heartbeat_age() > after
 
 
 SCHEMA = """
@@ -622,6 +697,46 @@ def open_camera(preferred: int | None = None) -> cv2.VideoCapture:
     raise RuntimeError("没找到可用摄像头，用 --camera N 手动指定序号")
 
 
+# ─────────────────── 数据库连接 ───────────────────
+# 这个库同时被四个地方碰：采集线程（写）、托盘今日统计（读）、
+# dashboard /live 每 3 秒（读）、/report 全表扫（读）。
+# 全部走这一个入口，PRAGMA 才有一处可改，不会漏掉某个连接点。
+
+def open_db(path: Path | None = None, readonly: bool = False,
+            timeout: float = 15.0) -> sqlite3.Connection:
+    """打开 focus.db，统一设好并发相关的 PRAGMA。
+
+    为什么必须集中：不设 PRAGMA 时 SQLite 默认 journal_mode=delete，
+    **读写互斥** —— 读事务持锁期间写操作会阻塞满 timeout 然后抛
+    `database is locked`。采集循环里的这一抛会让采集永久停止，
+    所以这不是性能调优，是正确性问题。
+
+    - `journal_mode=WAL`：读不再阻塞写、写不再阻塞读。这是本场景最关键的一条，
+      因为读数进程很多而写只有一路。
+    - `busy_timeout`：撞锁时先等而不是立刻失败。15 秒足够覆盖
+      普通写入；真正的长事务问题要靠 WAL + 攒批提交解决。
+    - `synchronous=NORMAL`：WAL 下这个档位是安全的（断电最多丢最近若干事务，
+      而我们的样本本来就是"丢了也没关系"的传感器数据），换来显著更少的 fsync。
+    """
+    path = DB_PATH if path is None else path
+    if readonly:
+        # 只读连接不设 journal_mode —— 那是写操作，只读库上会被拒。
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        return conn
+
+    conn = sqlite3.connect(path, timeout=timeout)
+    conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError as exc:
+        # 网络盘 / 只读挂载上 WAL 可能建不起来。降级继续跑，
+        # 但记一笔 —— 否则"为什么还是经常撞锁"会查不出来。
+        log.warning("无法启用 WAL（降级为默认日志模式）：%s", exc)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
 class Monitor(threading.Thread):
     """后台采集：读摄像头 → 算指标 → 每秒落一条样本。"""
 
@@ -633,6 +748,8 @@ class Monitor(threading.Thread):
         self.state = "away"
         self.on_state = lambda s: None      # 托盘在这里挂回调更新图标
         self.on_block_end = lambda bs: None  # 一个 30 分钟块结束且值得评时触发
+        self.on_progress = lambda msg: None  # 首次下载模型等长任务，给用户一个提示
+        self.on_fatal = lambda msg: None     # 启动致命失败：托盘弹气泡 + 打开面板
         self._last_prompted = 0.0
         self._engaged_since: float | None = None   # 当前这段连续投入从何时开始
         self._engaged_run = 0.0
@@ -646,14 +763,21 @@ class Monitor(threading.Thread):
     def run(self) -> None:
         log.info("采集线程启动 camera=%s", self.camera)
         try:
-            ensure_models()
+            ensure_models(on_progress=self.on_progress)
             vision = Vision()
             cap = open_camera(self.camera)
-        except Exception:
+        except Exception as exc:
             log.exception("初始化失败，采集没有开始")
+            # 只写日志等于没报错：--windowed 下没人看得到，而托盘图标照旧躺着，
+            # 用户只会觉得"开着但没数据"。必须显式告诉用户。
+            if self.on_fatal:
+                try:
+                    self.on_fatal(f"启动失败：{exc}")
+                except Exception:
+                    log.exception("上报启动失败时又出错")
             return
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = open_db()
         conn.executescript(SCHEMA)
         conn.commit()
 
@@ -665,6 +789,7 @@ class Monitor(threading.Thread):
         last_rating_check = time.time()
         n_rows = 0
         fails = 0
+        db_fails = 0          # 连续撞锁次数，用于退避；成功一次即清零
         face_buf: deque[dict] = deque(maxlen=64)
         tilt_buf: deque[float] = deque(maxlen=8)
         scale_hist: deque[float] = deque(maxlen=600)
@@ -680,6 +805,7 @@ class Monitor(threading.Thread):
                     cap.release()
                     cap = None
                     log.info("已暂停，摄像头已释放")
+                beat()                # 暂停时也不刷"停摆"告警：这是预期状态
                 time.sleep(0.5)
                 continue
             if cap is None:
@@ -705,89 +831,114 @@ class Monitor(threading.Thread):
             fails = 0
 
             now = time.time()
+            beat()                    # 心跳：告诉托盘"我还活着"，见 is_stale()
             h, w = frame.shape[:2]
             proc = cv2.resize(frame, (PROC_WIDTH, int(h * PROC_WIDTH / w)))
 
-            if now - last_face >= 1.0 / FACE_FPS:
-                last_face = now
-                got = vision.read_face(proc)
-                if got:
-                    face_buf.append(got)
-                    scale_hist.append(got["scale"])
-                    self._ear_hist.append(got["ear"])
-                    base = float(np.median(scale_hist)) if scale_hist else got["scale"]
-                    lean = got["scale"] / base if base > 1e-6 else 1.0
-                    closed_since = (None if got["ear"] >= self._ear_thr
-                                    else (closed_since or now))
-                    away_since = None
-                else:
-                    away_since = away_since or now
+            # 一次帧处理出错绝不能带走整个采集线程。
+            # 以前循环体整段裸露在外，一次 sqlite3 "database is locked" 就会
+            # 沿 run() 抛出、被 excepthook 记一行日志、线程结束 —— 用户只看到
+            # 图标慢慢变黄，唯一线索是 focus.log 里一行栈。
+            # 现在把每帧的处理包起来：撞锁退避重试，其他异常跳过这一帧。
+            #
+            # 只在"快要落库"那一段（每秒结算）里包，不包整个循环体：
+            # 摄像头 read / 重开 那些分支有自己的 continue 语义，
+            # 混进 try 里会改变它们的退出路径，得不偿失。
+            try:
+                # 每秒结算一次
+                if now - last_flush >= 1.0:
+                    last_flush = now
+                    maybe_reload_config()      # 设置页改完立即生效，不用重启
+                    self._ear_thr = ear_threshold(self._ear_hist)
+                    if now - last_beat >= 600:
+                        # 心跳：进程要是被静默干掉，日志里至少能看出它活到几点
+                        last_beat = now
+                        log.info("心跳：本次运行累计 %d 条样本，当前状态 %s",
+                                 n_rows, self.state)
+                    if now - last_rating_check >= 300:
+                        last_rating_check = now
+                        self._prompt_rating(now)
+                    present = len(face_buf) > 0
+                    yaw = float(np.median([f["yaw"] for f in face_buf])) if face_buf else 0.0
+                    pitch = float(np.median([f["pitch"] for f in face_buf])) if face_buf else 0.0
+                    ear = float(np.median([f["ear"] for f in face_buf])) if face_buf else 0.0
+                    tilt = float(np.median(tilt_buf)) if tilt_buf else 0.0
+                    closed_for = (now - closed_since) if closed_since else 0.0
+                    away_for = (now - away_since) if away_since else 0.0
+                    exe, title = active_window()
+                    kind = classify_app(exe, title)
 
-            if now - last_pose >= 1.0 / POSE_FPS:
-                last_pose = now
-                tilt = vision.read_posture(proc)
-                if tilt is not None:
-                    tilt_buf.append(tilt)
+                    st = decide(face_present=present, yaw=yaw, pitch=pitch,
+                                closed_for=closed_for, idle_sec=idle_seconds(),
+                                app_kind=kind, away_for=away_for)
 
-            # 每秒结算一次
-            if now - last_flush >= 1.0:
-                last_flush = now
-                maybe_reload_config()      # 设置页改完立即生效，不用重启
-                self._ear_thr = ear_threshold(self._ear_hist)
-                if now - last_beat >= 600:
-                    # 心跳：进程要是被静默干掉，日志里至少能看出它活到几点
-                    last_beat = now
-                    log.info("心跳：本次运行累计 %d 条样本，当前状态 %s",
-                             n_rows, self.state)
-                if now - last_rating_check >= 300:
-                    last_rating_check = now
-                    self._prompt_rating(now)
-                present = len(face_buf) > 0
-                yaw = float(np.median([f["yaw"] for f in face_buf])) if face_buf else 0.0
-                pitch = float(np.median([f["pitch"] for f in face_buf])) if face_buf else 0.0
-                ear = float(np.median([f["ear"] for f in face_buf])) if face_buf else 0.0
-                tilt = float(np.median(tilt_buf)) if tilt_buf else 0.0
-                closed_for = (now - closed_since) if closed_since else 0.0
-                away_for = (now - away_since) if away_since else 0.0
-                exe, title = active_window()
-                kind = classify_app(exe, title)
+                    # 离开期间降频落库。**判断必须在 INSERT 之前** ——
+                    # 原来这段写在 commit() 之后，样本早就落库了，continue
+                    # 只能跳过状态更新，等于降频从未生效（整夜待机照样每 2 秒
+                    # 一条，一晚一万四千行）。降频要真的省下写入，就必须
+                    # 在写库之前决定写不写。
+                    #
+                    # 例外：状态**刚**变成 away 的那一条永远要写，否则"离开"
+                    # 这个事件本身就不落库了，报告里会看到"专注 → 直接没有"。
+                    away_throttled = (st == "away" and self.state == "away"
+                                      and now - last_away_write < AWAY_WRITE_EVERY)
+                    if away_throttled:
+                        # 样本不写库，但缓冲清理照旧 —— 内存操作，跟落库无关。
+                        face_buf.clear()
+                    else:
+                        conn.execute(
+                            "INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (now, st, exe, title[:200], yaw, pitch, ear, tilt,
+                             lean, 1 if present else 0, idle_seconds()))
+                        n_rows += 1
+                        last_away_write = now
+                        # 攒批提交：每 SAMPLE_COMMIT_EVERY 条才 commit 一次。
+                        # 每条单独 commit 在 journal_mode=delete 下等于每条一次
+                        # fsync + 一次持写锁，把撞锁概率放大十几倍。
+                        if n_rows % SAMPLE_COMMIT_EVERY == 0:
+                            conn.commit()
 
-                st = decide(face_present=present, yaw=yaw, pitch=pitch,
-                            closed_for=closed_for, idle_sec=idle_seconds(),
-                            app_kind=kind, away_for=away_for)
+                        # 跟踪"这段连续投入持续了多久"，评分提醒靠它决定要不要闭嘴
+                        if st in ENGAGED:
+                            if self._engaged_since is None:
+                                self._engaged_since = now
+                            self._engaged_run = now - self._engaged_since
+                        else:
+                            self._engaged_since = None
+                            self._engaged_run = 0.0
 
-                conn.execute(
-                    "INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (now, st, exe, title[:200], yaw, pitch, ear, tilt, lean,
-                     1 if present else 0, idle_seconds()))
-                conn.commit()
-                n_rows += 1
+                        if st != self.state:
+                            self.state = st
+                            self.on_state(st)
 
-                # 跟踪"当前这段连续投入持续了多久"，评分提醒靠它决定要不要闭嘴
-                if st in ENGAGED:
-                    if self._engaged_since is None:
-                        self._engaged_since = now
-                    self._engaged_run = now - self._engaged_since
-                else:
-                    self._engaged_since = None
-                    self._engaged_run = 0.0
-
-                # 离开期间降频落库；状态刚变成 away 的那一条永远要写
-                if st == "away" and self.state == "away" \
-                        and now - last_away_write < AWAY_WRITE_EVERY:
-                    face_buf.clear()
-                    continue
-                last_away_write = now
-
-                if st != self.state:
-                    self.state = st
-                    self.on_state(st)
-
-                face_buf.clear()
-                # tilt_buf 不清空：留成 4 秒的滚动窗口，中位数才压得住单帧跳变
+                        face_buf.clear()
+                        # tilt_buf 不清空：留成 4 秒滚动窗口，中位数才压得住单帧跳变
+                db_fails = 0
+            except sqlite3.OperationalError as exc:
+                # 撞锁是预期内的（读数进程很多），退避后继续，不致命。
+                # 退避上限 5 秒：长时间锁定通常意味着别的进程开了长事务，
+                # 无限指数退避会让采集"看起来"死掉，反而更难查。
+                db_fails += 1
+                if db_fails in (1, 10, 100) or db_fails % 500 == 0:
+                    log.warning("写库失败第 %d 次（已退避重试）：%s",
+                                db_fails, exc)
+                time.sleep(min(0.5 * db_fails, 5.0))
+                continue
+            except Exception:
+                # 非数据库异常（模型、解码、算法）几乎总是瞬时或单帧的，
+                # 记日志后继续 —— 让一个坏帧杀掉采集是明显的错误取舍。
+                log.exception("本帧处理出错，已跳过")
+                time.sleep(0.05)
+                continue
 
         if cap is not None:        # 暂停状态下退出时它已经是 None 了
             cap.release()
+        # finally 里关连接：上面 try 里 continue 不会走到这儿，
+        # 但真要是有没接住的异常穿出去，至少别把写连接和 WAL 文件晾着。
+        try:
+            conn.commit()          # 把不足一批的尾巴补上，否则最后十几条白采
+        except sqlite3.Error:
+            log.exception("退出前补提交失败")
         conn.close()
         log.info("采集线程已停止")
 
@@ -819,7 +970,8 @@ class Monitor(threading.Thread):
                 return
             items = report._timed(report.load(since=prev))
             ratable = ratings.is_ratable(items, prev, now)
-            if not should_prompt_rating(self._engaged_run, ratable):
+            since_last = now - self._last_prompted if self._last_prompted else 0.0
+            if not should_prompt_rating(self._engaged_run, ratable, since_last):
                 return                      # 正在心流里，这一轮先不打扰
             self._last_prompted = prev
             self.on_block_end(prev)
@@ -829,11 +981,42 @@ class Monitor(threading.Thread):
 
 # ══════════════════════ 托盘 ══════════════════════
 
-def _icon_image(color: str):
+# 图标形状表：只靠颜色不行 —— 16×16 的点上 #14b8a6 / #22c55e / #38bdf8 几乎分不出，
+# 色盲用户更是丢掉绿/琥珀的全部区别。形状是颜色之外的第二条通道。
+_ICON_SHAPE = {
+    "focused":    "solid",    # 实心圆 = 专注
+    "neutral":    "half",     # 半环   = 中性
+    "deskwork":   "bar",      # 横杠   = 伏案
+    "distracted": "tri",      # 三角   = 走神
+    "drowsy":     "ring",     # 空心环 = 疲劳
+    "away":       "dash",     # 短横   = 离开
+    "stale":      "alert",    # 感叹号 = 记录停了（在记录却收不到样本）
+}
+
+
+def _icon_image(color: str, shape: str = "solid"):
+    """画托盘图标。shape 见 _ICON_SHAPE —— 颜色 + 形状两条通道。"""
     from PIL import Image, ImageDraw
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.ellipse((8, 8, 56, 56), fill=color)
+    box = (8, 8, 56, 56)
+    if shape == "solid":
+        d.ellipse(box, fill=color)
+    elif shape == "ring":
+        d.ellipse(box, outline=color, width=9)
+    elif shape == "half":
+        # 左半实心、右半只留边框：和实心圆区分得开
+        d.ellipse(box, outline=color, width=5)
+        d.pieslice(box, 90, 270, fill=color)
+    elif shape == "bar":
+        d.rounded_rectangle((8, 24, 56, 40), radius=6, fill=color)
+    elif shape == "dash":
+        d.rounded_rectangle((14, 29, 50, 35), radius=3, fill=color)
+    elif shape == "tri":
+        d.polygon([(32, 8), (58, 54), (6, 54)], fill=color)
+    else:  # alert
+        d.rounded_rectangle((26, 10, 38, 40), radius=5, fill=color)
+        d.ellipse((26, 46, 38, 58), fill=color)
     return img
 
 
@@ -862,7 +1045,7 @@ def _today_engaged_seconds() -> int:
     """今天累计投入秒数（ENGAGED 状态），只读连接，不碰主进程的写连接。"""
     _today = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
     try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        conn = open_db(readonly=True)
         try:
             marks = ",".join("?" * len(ENGAGED))
             row = conn.execute(
@@ -880,8 +1063,16 @@ def run_tray(mon: Monitor) -> None:
     import pystray
 
     def refresh(icon) -> None:
+        # 采集停摆时覆盖成"警告"图标。
+        # 只靠状态色有个致命盲区：线程死了以后状态就冻在最后一次的值上，
+        # 若那时恰好是"中性"，用户看到的是一个和健康状态一模一样的蓝点。
+        # 这正是当初"绿点为什么没了"排查不出来的原因。
+        if is_stale():
+            icon.icon = _icon_image("#f59e0b", "alert")
+            icon.title = "专注监视 — 无数据（可能已停止记录）"
+            return
         label, color = STATES.get(mon.state, STATES["away"])
-        icon.icon = _icon_image(color)
+        icon.icon = _icon_image(color, _ICON_SHAPE.get(mon.state, "solid"))
         icon.title = f"专注监视 — {label}"
 
     mon.on_state = lambda _s: refresh(icon)
@@ -904,6 +1095,29 @@ def run_tray(mon: Monitor) -> None:
 
     mon.on_block_end = on_block_end
 
+    def on_progress(msg: str) -> None:
+        """首次运行下载模型之类的事，冒个泡，别让程序看起来像没反应。"""
+        try:
+            icon.notify(msg, "专注监视 · 正在准备")
+        except Exception:
+            log.exception("进度提示失败")
+
+    def on_fatal(msg: str) -> None:
+        """启动就失败：气泡说清楚，再把面板打开 —— 否则用户只看到图标躺着。"""
+        try:
+            icon.notify(f"{msg}\n点托盘图标看面板，或右键「打开日志」看详情",
+                        "专注监视 · 启动失败")
+        except Exception:
+            log.exception("失败提示失败")
+        try:
+            import window
+            window.open_page("panel")
+        except Exception:
+            log.exception("打开面板失败")
+
+    mon.on_progress = on_progress
+    mon.on_fatal = on_fatal
+
     def on_panel(icon, _item):
         import window                     # 延迟：开机自启时别拖 pythonnet 加载
         window.open_page("panel")
@@ -922,10 +1136,23 @@ def run_tray(mon: Monitor) -> None:
 
     def on_report(icon, _item):
         """生成报告文件，再到应用窗口里展示。"""
-        import report
-        import window                   # 延迟 import，见 on_panel 注释
+        import report                   # 延迟 import，见 on_panel 注释
         report.main()
         window.open_page("report")
+
+    def on_log(icon, _item):
+        """用系统默认程序打开 focus.log。
+
+        没这个入口的话，日志只能靠用户知道路径、手动翻文件夹 ——
+        等于不存在。采集出错时该看的第一个文件必须一步可达。
+        """
+        try:
+            if LOG_PATH.exists():
+                os.startfile(LOG_PATH)          # noqa: S606 (Windows 专属)
+            else:
+                icon.notify(f"还没有日志文件：{LOG_PATH}", "专注监视")
+        except Exception:
+            log.exception("打开日志失败")
 
     def on_quit(icon, _item):
         mon.stop()
@@ -938,16 +1165,31 @@ def run_tray(mon: Monitor) -> None:
         return True
 
     def _state_text(_i) -> str:
+        if is_stale():
+            return f"当前状态：无数据（{int(heartbeat_age())} 秒前）— 记录可能已停止"
+        if is_paused():
+            return "当前状态：已暂停"
         label = STATES.get(mon.state, ("未知", "#64748b"))[0]
         return f"当前状态：{label}"
 
     def _today_text(_i) -> str:
         import report                       # 只在函数里取 _dur，避免顶层 import 成环
-        return f"今日投入：{report._dur(_today_engaged_seconds())}"
+        txt = f"今日投入：{report._dur(_today_engaged_seconds())}"
+        n = _pending_ratings()
+        return f"{txt}　·　待评分 {n}" if n > 0 else txt
+
+    def _pause_text(_i) -> str:
+        """说明这次点下去会发生什么，并且点明摄像头会被释放。
+
+        暂停时真的释放摄像头是隐私上的加分项，但以前只在代码注释里写过，
+        用户看不到 —— 写进菜单文案它才开始起作用。
+        """
+        return ("继续记录（重新打开摄像头）" if mon.paused
+                else "暂停记录（关闭摄像头）")
 
     icon = pystray.Icon(
         "focus-monitor",
-        _icon_image(STATES["away"][1]),
+        _icon_image(STATES["away"][1], _ICON_SHAPE["away"]),
         "专注监视",
         menu=pystray.Menu(
             pystray.MenuItem(_state_text, None, enabled=False),
@@ -957,11 +1199,25 @@ def run_tray(mon: Monitor) -> None:
                              default=True),
             pystray.MenuItem("自述评分", on_rate),
             pystray.MenuItem("完整报告", on_report),
-            pystray.MenuItem("暂停/继续", on_pause),
+            pystray.MenuItem(_pause_text, on_pause),
+            pystray.MenuItem("打开日志", on_log),
             pystray.MenuItem("退出", on_quit),
         ))
     refresh(icon)
     threading.Thread(target=icon.run, daemon=True).start()
+
+    # 看门狗：状态没变时 on_state 不会被调用，光靠它发现不了"线程悄悄死了"——
+    # 必须有个独立的心跳，定期重新评估图标。30 秒一次，开销可以忽略。
+    def _watchdog() -> None:
+        while True:
+            time.sleep(30)
+            try:
+                refresh(icon)
+            except Exception:
+                log.exception("托盘看门狗刷新失败")
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     # 主线程让给 pywebview：GUI 循环硬性要求主线程，托盘消息循环不受限。
     import window
     window.start_main()
@@ -1227,7 +1483,8 @@ def selftest() -> None:
              for t in range(1789000090, 1789000120)]
     html = report.build_html(rows)
     for needle in ("专注", "走神", "离开", "哔哩哔哩", "focus.py",
-                   "<svg", "时间轴", "专注应用排行", "分心应用排行"):
+                   "<svg", "时间轴", "专注应用排行", "分心应用排行",
+                   "应用使用记录", "占活跃", "时段"):
         assert needle in html, f"报告缺少 {needle}"
     assert html.count("<html") == 1
 
@@ -1247,7 +1504,15 @@ def selftest() -> None:
                 for i in range(30)])
     mh = report.build_html(mixed)
     assert "哔哩哔哩" in mh, "看着屏幕时的分心应用应出现在排行里"
-    assert "快速设置" not in mh, "转头时前台是什么应用，与走神无关，不该进排行"
+
+    # "快速设置"现在会出现在「应用使用记录」里（那份记录的口径是"我用过什么"，
+    # 转头时前台确实开着它），但**绝不能进「分心应用排行」** —— 排行回答的是
+    # "什么在拉走我"，把转头时段算进去就会得出"快速设置是你最大分心源"。
+    # 所以这里改成按板块断言，而不是断言整个 HTML 里没有这个名字。
+    assert "应用使用记录" in mh, "报告缺少全量应用使用记录"
+    rank_sec = mh.split("分心应用排行")[1] if "分心应用排行" in mh else ""
+    assert "快速设置" not in rank_sec, \
+        "转头时前台是什么应用，与走神无关，不该进分心排行"
 
     # ── 会话切分与心流片段 ──
     def _mk(start, n, state, step=1.0):
@@ -1345,13 +1610,22 @@ def selftest() -> None:
                                        + _blk(900, 900, "distracted")))
     assert agg[0.0] == (1800.0, 900.0), agg
 
-    # 相关系数
-    assert ratings.correlation([(0, s, s * 0.1) for s in (1, 2, 3, 4, 5)] * 2) > 0.99
-    assert ratings.correlation([(0, s, 1 - s * 0.1) for s in (1, 2, 3, 4, 5)] * 2) < -0.99
-    assert ratings.correlation([(0, 3, 0.5)] * 10) is None, "评分全一样时算不出相关"
+    # 相关系数。样本数必须过 MIN_PAIRS（现为 30），否则 correlation()
+    # 直接返回 None —— 那正是它该做的事，不是 bug。
+    _n = ratings.MIN_PAIRS
+    _perfect = [(i, (i % 5) + 1, ((i % 5) + 1) * 0.1) for i in range(_n)]
+    assert ratings.correlation(_perfect) > 0.99
+    _inverse = [(i, (i % 5) + 1, 1 - ((i % 5) + 1) * 0.1) for i in range(_n)]
+    assert ratings.correlation(_inverse) < -0.99
+    assert ratings.correlation([(0, 3, 0.5)] * _n) is None, "评分全一样时算不出相关"
     assert ratings.correlation([(0, 1, 0.5)] * 3) is None, "样本太少不给结论"
+    assert ratings.correlation(_perfect[:_n - 1]) is None, \
+        f"差一条就该拒绝（门槛 {_n}）"
     assert "强相关" in ratings.verdict(0.8, 20)
     assert "样本" in ratings.verdict(None, 3)
+    # 样本量偏少时，结论后面必须挂置信度提示
+    assert "还可能变" in ratings.verdict(0.8, ratings.MIN_PAIRS + 1), \
+        "刚过门槛的高相关必须带样本量提醒"
 
     # 数据库往返。用临时库 —— 绝不能污染用户的真实 focus.db
     real_db = globals()["DB_PATH"]
@@ -1375,13 +1649,19 @@ def selftest() -> None:
 
     # 评分提醒的时机：正在连续投入时不准打扰（这是明确要求的行为）
     assert not should_prompt_rating(FLOW_QUIET, True), "正在心流中不该弹提醒"
-    assert not should_prompt_rating(FLOW_QUIET + 3600, True), "专注越久越不该打扰"
+    assert not should_prompt_rating(FLOW_QUIET + 3600, True), \
+        "心流中且未到上限 → 仍不打扰"
+    assert should_prompt_rating(FLOW_QUIET + 3600, True, PROMPT_CEILING), \
+        "心流中但已超过上限 → 放行一次，否则永远收不到这段的评分"
     assert should_prompt_rating(0.0, True), "刚断点、有可评的块 → 可以问"
     assert should_prompt_rating(FLOW_QUIET - 1, True), "阈值内仍可问"
     assert not should_prompt_rating(0.0, False), "没有可评的块就不弹"
+    assert not should_prompt_rating(FLOW_QUIET + 3600, False, 999999), \
+        "没有可评的块时，上限也不能把它放行"
 
-    # GBK 控制台打不出 ✓，用 ASCII 勾保证任何环境能跑完自检
-    print("selftest PASS - all assertions hold")
+    # 刻意只用 ASCII：GBK 控制台打不出 ✓ 之类的符号，会直接抛 UnicodeEncodeError，
+    # 自检本身反而崩了。全 ASCII 保证任何代码页下都能跑完并报出结果。
+    print("自检通过 - 全部断言成立")
 
 
 # ══════════════════════ 入口 ══════════════════════
@@ -1399,6 +1679,8 @@ def main() -> None:
     ap.add_argument("--selftest", action="store_true", help="跑自检，不开摄像头")
     ap.add_argument("--install-startup", action="store_true", help="装开机自启")
     ap.add_argument("--uninstall-startup", action="store_true", help="卸载开机自启")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1441,6 +1723,12 @@ def main() -> None:
     setup_log()
     log.info("专注监视启动 camera=%s", args.camera)
 
+    # 首次运行（还没有数据库）：把面板显示出来。
+    # 窗口默认是隐藏的，托盘图标又常常藏在 ^ 折叠区里 —— 于是"双击了但
+    # 什么都没发生"。开一次面板就把"在记录、状态是什么、摄像头通不通"
+    # 一次全回答了，成本只是一个 if。
+    first_run = not DB_PATH.exists()
+
     # 面板随监视一起起，这样桌面快捷方式随时点得开，不用先去托盘菜单。
     # 只监听 127.0.0.1；起不来也不影响采集，所以异常只记日志。
     try:
@@ -1451,6 +1739,20 @@ def main() -> None:
 
     mon = Monitor(camera=args.camera)
     mon.start()
+
+    if first_run:
+        # 模型要下十几秒且窗口层要等主线程 GUI 循环起来，所以丢到子线程，
+        # 让它等面板就绪再导航，别卡住托盘启动。
+        def _show_first_run() -> None:
+            time.sleep(3.0)
+            try:
+                import window
+                window.open_page("panel")
+            except Exception:
+                log.exception("首次运行打开面板失败")
+
+        threading.Thread(target=_show_first_run, daemon=True).start()
+
     try:
         run_tray(mon)
     except KeyboardInterrupt:

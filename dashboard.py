@@ -16,6 +16,7 @@ from __future__ import annotations
 import html
 import http.server
 import re
+import secrets
 import threading
 import time
 import urllib.parse
@@ -45,6 +46,17 @@ def _today_bounds(now: float) -> tuple[float, float]:
 _NAV = ('<div class="nav"><a href="/">实时面板</a>'
         '<a href="/rate">自述评分</a>'
         '<a href="/settings">设置</a><a href="/report">完整报告</a></div>')
+
+# 1–5 分的锚点。没有锚点的话，每个人脑子里的刻度都不一样，
+# 汇总出来的相关系数就是拿不同单位在算。
+_ANCHOR = {
+    1: "1 = 完全没在状态，人在心不在",
+    2: "2 = 大半时间在走神",
+    3: "3 = 一般，能干活但不投入",
+    4: "4 = 比较投入，偶尔飘",
+    5: "5 = 非常投入，进入心流",
+}
+_ANCHOR_SHORT = {1: "走神", 2: "散", 3: "一般", 4: "投入", 5: "心流"}
 
 
 def _rate_page(msg: str = "") -> str:
@@ -77,18 +89,31 @@ def _rate_page(msg: str = "") -> str:
     # 单趟分桶，不按块重复遍历全部样本（长期跑下来样本量很大）。
     app_by_block: dict[float, dict[str, float]] = defaultdict(
         lambda: defaultdict(float))
+    # 块内前台切换次数。这是纯事实，但对"那半小时我在干嘛"是最强的回忆钩子 ——
+    # "切了 40 次"基本等于"一直在飘"，比列几个应用名管用得多。
+    switch_by_block: dict[float, int] = defaultdict(int)
+    prev_app: dict[float, str] = {}
     for x in items:
         if x[2] == "away":          # 人不在时前台是什么，跟那半小时无关
             continue
         b = int(x[0] // ratings.BLOCK) * ratings.BLOCK
         app_by_block[b][_label(x[3], x[4])] += x[1]
+        cur = x[3] or ""
+        if b in prev_app and cur and cur != prev_app[b]:
+            switch_by_block[b] += 1
+        if cur:
+            prev_app[b] = cur
 
     def _apps_line(start: float) -> str:
         top = sorted(app_by_block.get(start, {}).items(), key=lambda kv: -kv[1])[:5]
         if not top:
             return ""
+        sw = switch_by_block.get(start, 0)
+        # 切换次数只作为中性事实给出，不说"你分心了"—— 那是判断，会锚定评分。
+        tail = (f' <span class="rsw">· 前台切换 {sw} 次</span>'
+                if sw else "")
         return ('<span class="rapps">'
-                + " · ".join(html.escape(a) for a, _ in top) + '</span>')
+                + " · ".join(html.escape(a) for a, _ in top) + tail + '</span>')
 
     if not todo:
         todo_html = (
@@ -97,13 +122,21 @@ def _rate_page(msg: str = "") -> str:
     else:
         rows = "".join(
             f'<form method="post" action="/rate" class="rrow">'
+            f'<input type="hidden" name="csrf" value="{CSRF_TOKEN}">'
             f'<input type="hidden" name="block_start" value="{p["start"]:.0f}">'
             f'<span class="rleft">'
             f'<span class="rt">{_hm(p["start"])} – {_hm(p["end"])}</span>'
             f'{_apps_line(p["start"])}</span>'
             f'<span class="rb">'
-            + "".join(f'<button name="score" value="{s}">{s}</button>'
+            # 按钮上带锚点文字：光看 "1 2 3 4 5" 每个人脑补的刻度都不一样，
+            # 同一个数字在不同人那里含义不同，相关性就没法跨人比较了。
+            + "".join(f'<button name="score" value="{s}" title="{_ANCHOR[s]}">'
+                      f'{s}<i>{_ANCHOR_SHORT[s]}</i></button>'
                       for s in (1, 2, 3, 4, 5))
+            # 没有这个出口的话，用户要么瞎填一个分（污染相关系数），
+            # 要么看着待评列表永远消不下去（干脆不看这页了）。
+            + f'<button name="skip" value="1" formaction="/rate/skip" '
+              f'class="skip" title="这段跟专注无关，不算数">跳过</button>'
             + '</span></form>'
             for p in todo[:14])
         todo_html = (
@@ -124,6 +157,8 @@ def _rate_page(msg: str = "") -> str:
 <table class="hist"><thead><tr><th>时段</th><th>自评</th><th>备注</th></tr></thead>
 <tbody>{hist}</tbody></table>
 <p class="note">1 = 完全没在状态，3 = 一般，5 = 非常投入、进入心流。
+想不起当时的感觉、或那半小时本来就跟专注无关，直接点「跳过」——
+<b>别为了消掉提示随便填一个分</b>，那会直接污染相关系数。
 评分可在报告页和实测投入率做相关性对照 —— 那才是「数据和你感受对不对得上」的答案。</p>
 </div>"""
 
@@ -382,6 +417,7 @@ def _settings_page(cfg: dict | None = None, errors: list[str] | None = None,
 <h1>设置</h1>
 <p class="sub">保存后写入 <code>config.json</code>，各进程自动重新加载。</p>
 <form method="post" action="/settings">
+<input type="hidden" name="csrf" value="{CSRF_TOKEN}">
 {"".join(blocks)}
 <div class="acts">
   <button type="submit">保存</button>
@@ -505,17 +541,25 @@ _PAGE = """<!DOCTYPE html>
   .rt { font-size:15px; color:var(--fg); font-variant-numeric:tabular-nums; }
   .rapps { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden;
            text-overflow:ellipsis; }
-  .rb { display:flex; gap:6px; }
+  .rsw { color:var(--faint); }
+  .rb { display:flex; gap:6px; align-items:stretch; }
   .rb button { background:var(--card); color:var(--fg); border:1px solid var(--input-line);
-        border-radius:4px; width:40px; padding:6px 0; font-size:14px;
-        font-weight:600; cursor:pointer; min-height:32px; }
+        border-radius:4px; min-width:52px; padding:4px 6px; font-size:14px;
+        font-weight:600; cursor:pointer; min-height:32px;
+        display:flex; flex-direction:column; align-items:center; gap:1px; }
+  .rb button i { font-style:normal; font-size:10px; font-weight:500;
+        color:var(--muted); letter-spacing:0; }
   .rb button:hover { background:var(--accent-soft); color:var(--accent); border-color:var(--accent); }
+  .rb button:hover i { color:var(--accent); }
+  .rb button.skip { min-width:56px; justify-content:center; font-weight:500;
+        color:var(--muted); }
+  .rb button.skip:hover { color:var(--fg); }
   /* 不固定列宽的话三列会塌在一起：<th> 浏览器默认居中，加上列宽自动分配，
      表头会挤成一坨（"自评备注" 连成一个词）。 */
   .hist th, .hist td { text-align:left; }
   .hist th:nth-child(1), .hist td:nth-child(1) { width:230px; }
   .hist th:nth-child(2), .hist td:nth-child(2) { width:80px; text-align:right; }
-</style></style></head><body>
+</style></head><body>
 <div id="live">__LIVE__</div>
 __JS__
 </body></html>"""
@@ -547,6 +591,50 @@ def _shell(body: str, poll: bool = False) -> str:
     return _PAGE.replace("__LIVE__", body).replace("__JS__", _POLL_JS if poll else "")
 
 
+# ─────────────────── 本地服务的信任边界 ───────────────────
+# 只绑 127.0.0.1 挡得住远程主机，挡不住"用户自己浏览器里打开的恶意页面"：
+#   1. 跨源表单 POST 是"简单请求"，不发预检，浏览器直接送 —— 任意网页都能
+#      悄悄改你的设置（AWAY_IDLE=1 等于停止记录）或覆盖你的自述评分。
+#   2. DNS rebinding 之后同源检查通过，那个页面能 fetch 回 /live、/report，
+#      读走你数月的窗口标题。
+# 两道防线：每次启动生成的一次性 token（POST 必须带），以及 Host 头白名单。
+CSRF_TOKEN = secrets.token_urlsafe(32)
+
+
+def _host_ok(host: str, port: int) -> bool:
+    """Host 必须就是本机回环，否则一律拒绝。
+
+    DNS rebinding 的攻击页面 Host 头是它自己的域名 —— 挡掉它，
+    即使同源检查被绕过，它也读不到任何东西。
+    """
+    if not host:
+        return False
+    name = host.rsplit(":", 1)[0].strip("[]").lower()
+    if name not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    return True
+
+
+def _origin_ok(origin: str, port: int) -> bool:
+    """带 Origin/Referer 的请求，必须来自本机面板自己。
+
+    浏览器对跨源 POST 会带上 Origin，对同源表单不一定带 —— 所以
+    "没有 Origin" 不算错（放行），"有 Origin 但不是自己" 才拒绝。
+    """
+    if not origin:
+        return True
+    try:
+        parts = urllib.parse.urlsplit(origin)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = (parts.hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    return parts.port in (None, port)
+
+
 # ─────────────────── HTTP ───────────────────
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -557,8 +645,29 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        # 面板是纯本地页面，不需要被任何外部页面嵌入
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(raw)
+
+    def _port(self) -> int:
+        return self.server.server_port if self.server else DEFAULT_PORT
+
+    def _guard(self) -> bool:
+        """请求是否来自本机面板。不是就回 403 并返回 False。
+
+        GET 和 POST 都要过 —— /report 是无参数纯 GET，但输出的是
+        数月的窗口标题排行，不能让它被任意页面读走。
+        """
+        if not _host_ok(self.headers.get("Host", ""), self._port()):
+            self._send("<h1>403</h1><p>Host 不是本机回环地址，已拒绝。</p>", 403)
+            return False
+        ref = self.headers.get("Origin") or self.headers.get("Referer") or ""
+        if not _origin_ok(ref, self._port()):
+            self._send("<h1>403</h1><p>请求来源不是本机面板，已拒绝。</p>", 403)
+            return False
+        return True
 
     def _redirect(self, to: str) -> None:
         """303 让浏览器把 POST 换成 GET，刷新页面不会重复提交。"""
@@ -568,6 +677,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802  (stdlib 命名)
+        if not self._guard():
+            return
         raw_path, _, qs = self.path.partition("?")
         query = urllib.parse.parse_qs(qs)
         try:
@@ -590,14 +701,37 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send(f"<h1>500</h1><pre>{html.escape(str(exc))}</pre>", 500)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._guard():
+            return
         path = self.path.split("?")[0]
         n = int(self.headers.get("Content-Length") or 0)
         form = urllib.parse.parse_qs(
             self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
+        # CSRF token：表单里必须带上本次进程生成的那个。
+        # 恶意页面构造得出同样的字段名，但猜不到 token 值 ——
+        # 它读不到我们页面的内容（跨源），所以拿不到。
+        got = (form.get("csrf") or [""])[0]
+        if not secrets.compare_digest(got, CSRF_TOKEN):
+            self._send("<h1>403</h1><p>缺少或错误的安全令牌。"
+                       "请从面板页面正常提交。</p>", 403)
+            return
         try:
             if path == "/settings/reset":
                 focus.reset_config()
                 self._redirect("/settings?reset=1")
+                return
+            if path == "/rate/skip":
+                import ratings
+                try:
+                    bs = float((form.get("block_start") or [""])[0])
+                except ValueError:
+                    self._send(_shell(_rate_page("提交的数据不合法，请重新点一次。")), 400)
+                    return
+                if bs <= 0:
+                    self._send(_shell(_rate_page("时段不合法。")), 400)
+                    return
+                ratings.skip(bs)
+                self._redirect("/rate?done=1")
                 return
             if path == "/rate":
                 import ratings
