@@ -52,20 +52,13 @@ jobs:
       - name: 自检
         run: python focus.py --selftest
 
-      # 自检只覆盖纯逻辑。下面这一步确认所有页面都能真的渲染出来 ——
+      # 自检只覆盖纯逻辑。这一步确认所有页面都能真的渲染出来 ——
       # 模板里的 f-string 少个括号，selftest 是看不出来的，
       # 但用户点开面板第一眼就崩。
       #
-      # 这里必须自己调 use_safe_console()：`python -c` 不经过 focus.main()，
-      # 没人替它兜住代码页 —— 最后那句中文 print 会在西文控制台上抛异常，
-      # 把一次成功的冒烟测试变成失败。
+      # 逻辑放在 smoke.py 里而不是内联 `python -c "..."`：内联写法会被 YAML
+      # 折叠成一行且**保留行首缩进**，python -c 收到以空格开头的程序直接
+      # IndentationError —— 这一步加进去之后一直是坏的，只是每次都因为前面的
+      # 步骤先失败被 skip，从没暴露过。放进文件里还能本地直接跑。
       - name: 冒烟测试（各页面都能渲染）
-        run: python -c "
-          import focus, report, dashboard;
-          focus.use_safe_console();
-          html = report.build_html([]);
-          assert '<html' in html, '报告渲染失败';
-          assert 'focus.db' not in html, '报告里不该出现数据库路径';
-          dashboard._rate_page(); dashboard._settings_page();
-          print('冒烟测试通过')
-          "
+        run: python smoke.py
