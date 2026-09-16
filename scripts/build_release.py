@@ -104,6 +104,14 @@ def build() -> None:
         "--add-data", f"{ROOT / 'icons'};icons",
         # mediapipe 官方没有 hook, collect-all 补足 (剔除前先打过补丁)
         "--collect-all", "mediapipe",
+        # pywebview 同理: 它要靠包内的 js/ 资源把 Python 侧的桥接注入页面,
+        # 那些 .js 不是 import 进来的, 光靠静态分析收不到 —— 漏了的话
+        # 窗口能创建但页面里的 pywebview.api 是空的, 表现为"窗口一片空白"。
+        # pywebview 是主依赖(pyproject dependencies), 一定装得到, 不会因此报错。
+        # 注意: 这解决的是"窗口内容不对"; 窗口**根本打不开**(漏了 webview 模块
+        # 本身)是另一回事 —— 那条路径的兜底在 focus.wait_and_open() 里,
+        # 它会退到系统浏览器并把原因写进 focus.log。
+        "--collect-all", "pywebview",
         # matplotlib 全家: 无人使用, 纯打包负担 (mediapipe 绘图工具只会在被调用时才需要)
         "--exclude-module", "matplotlib",
         "--exclude-module", "mpl_toolkits",

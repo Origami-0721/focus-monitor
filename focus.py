@@ -44,6 +44,7 @@ import threading
 import time
 import tomllib
 import urllib.request
+import webbrowser
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -1380,6 +1381,25 @@ def run_tray(mon: Monitor) -> None:
         except Exception:
             log.exception("打开日志失败")
 
+    def on_shortcut(icon, _item):
+        """在桌面建「专注监视」开关。
+
+        为什么要做成托盘菜单项：发布包是 `--windowed` 的，**没有控制台**，
+        所以 exe 用户根本敲不了 `--install-shortcut`。而教程把桌面开关
+        写成日常入口 —— 没有这个菜单项，那条路对 exe 用户就是不存在的。
+
+        也**不要**让用户"右键 exe → 发送到桌面"：那样建出来的快捷方式
+        没有 `--toggle` 参数，双击只会去起第二个实例、被单例拦住。
+        开关必须由 _write_lnk() 生成（它走 relaunch_cmd()，冻结态才指得对）。
+        """
+        try:
+            install_shortcut()
+            icon.notify("已在桌面建好「专注监视」开关，双击即切换开/关",
+                        "专注监视")
+        except Exception as exc:
+            log.exception("建桌面开关失败")
+            icon.notify(f"建桌面开关失败：{exc}", "专注监视")
+
     def on_quit(icon, _item):
         mon.stop()
         # 给采集线程一个收尾的机会：不 join 的话，下面 quit_app 一销毁窗口、
@@ -1445,6 +1465,7 @@ def run_tray(mon: Monitor) -> None:
             pystray.MenuItem("完整报告", on_report),
             pystray.MenuItem(_pause_text, on_pause),
             pystray.MenuItem("打开日志", on_log),
+            pystray.MenuItem("在桌面建开关快捷方式", on_shortcut),
             pystray.MenuItem("退出", on_quit),
         ))
     refresh(icon)
@@ -1472,6 +1493,29 @@ def run_tray(mon: Monitor) -> None:
 ICON_DIR = ROOT / "icons"
 LNK_NAME = "专注监视.lnk"
 PYW = ROOT / ".venv" / "Scripts" / "pythonw.exe"
+
+
+def relaunch_cmd(frozen: bool | None = None) -> list[str]:
+    """「重新启动自己」的命令行 —— 桌面开关和 --wait-open 都靠它。
+
+    两种形态，差别是**入口在哪**：
+
+    - 源码运行：`<ROOT>/.venv/Scripts/pythonw.exe <ROOT>/focus.py`
+      用 pythonw 而不是 python，是为了不弹控制台窗口。
+    - 冻结成 exe：**exe 自己就是入口，不能再传 focus.py**。
+      发布包里既没有 `.venv` 也没有 `focus.py` —— 照搬源码那套，
+      `subprocess.Popen` 会抛 FileNotFoundError，而 exe 是 `--windowed`、
+      没有控制台，用户看到的只是"双击了但什么都没发生"。
+      更糟的是桌面快捷方式的 TargetPath 也是这个值，等于**开关直接是死的**。
+
+    frozen 写成可注入的参数（而不是只读 `sys.frozen`）是为了让它能被测到：
+    开发机上 `sys.frozen` 永远是 False，那条分支不抽成纯函数就永远没人验证过。
+    """
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        return [str(sys.executable)]
+    return [str(PYW), str(ROOT / "focus.py")]
 
 # 子进程一律不要弹控制台 —— 这些函数可能跑在 pythonw 下
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1502,18 +1546,30 @@ def ensure_icons() -> tuple[Path, Path]:
     return on, off
 
 
-def _write_lnk(icon: Path) -> None:
-    """重写桌面快捷方式。.lnk 只能走 COM，交给 PowerShell，并隐藏它的窗口。"""
+def _write_lnk(icon: Path, cmd: list[str] | None = None) -> None:
+    """重写桌面快捷方式。.lnk 只能走 COM，交给 PowerShell，并隐藏它的窗口。
+
+    目标必须走 relaunch_cmd()：冻结成 exe 之后入口是 exe 本身，
+    写死 `.venv/Scripts/pythonw.exe` 的话这个快捷方式在发布包里是**死的**
+    （TargetPath 指向一个不存在的文件，双击毫无反应、也没有任何报错）。
+
+    `cmd` 可注入是为了让自检能证明"目标不是写死的"：只断言"命令里出现了
+    pythonw.exe"是测不出来的 —— 写死路径的旧写法同样含 pythonw.exe。
+    只有"换一个哨兵命令进去、它必须被原样采纳"才能把这两种写法区分开。
+    """
     lnk = _desktop() / LNK_NAME
+    if cmd is None:
+        cmd = relaunch_cmd()
+    args = " ".join([f'"{a}"' for a in cmd[1:]] + ["--toggle"])
     ps = (
         "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
         "$s.TargetPath='%s';"
-        "$s.Arguments='\"%s\" --toggle';"
+        "$s.Arguments='%s';"
         "$s.WorkingDirectory='%s';"
         "$s.IconLocation='%s,0';"
         "$s.Description='专注度监视（双击切换开/关）';"
         "$s.Save()"
-    ) % (lnk, PYW, ROOT / "focus.py", ROOT, icon)
+    ) % (lnk, cmd[0], args, ROOT, icon)
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                     "-Command", ps],
                    creationflags=_NO_WINDOW, capture_output=True)
@@ -1553,21 +1609,47 @@ def wait_and_open(timeout: float = 120.0) -> None:
     """等面板就绪再打开应用窗口。
 
     模型加载要十几秒，启动后立刻打开只会看到「无法连接」。
+
+    这个函数跑在一个**独立子进程**里（桌面开关 fork 出来的），走的不是
+    托盘那条路，所以它必须自己 setup_log()：不然它出的任何问题都进不了
+    focus.log，而 exe 是 --windowed、连 stderr 都没有 ——
+    用户看到的只是"双击了，什么都没打开"，没有任何线索可查。
     """
+    setup_log()
     try:
         from dashboard import DEFAULT_PORT as port
     except Exception:
         port = 8787
     url = f"http://127.0.0.1:{port}/"
+
+    # 第一段：只负责"等服务就绪"。**不要**把开窗口塞进同一个 try ——
+    # 塞在一起的话，`import window` 失败（发布包漏了 pywebview）会被当成
+    # "服务还没起来"，于是一路重试到超时、最后一声不吭地退出。
+    # 这两个失败的原因完全不同，必须分开处理。
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             urllib.request.urlopen(url, timeout=2).close()
-            import window               # 延迟 import，见 on_panel 注释
-            window.open_page("panel")
-            return
+            break
         except Exception:
             time.sleep(1.5)
+    else:
+        log.warning("等面板就绪超时（%.0f 秒），放弃自动打开窗口", timeout)
+        return
+
+    # 第二段：开窗口。开不了就退到系统浏览器 —— window.open_page() 自己也
+    # 承诺了这个兜底，但它在 `import window` 这一步就失败时根本走不到。
+    try:
+        import window                   # 延迟 import，见 on_panel 注释
+        window.open_page("panel")
+        log.info("应用窗口已打开：%s", url)
+    except Exception:
+        log.exception("应用窗口打不开，改用系统浏览器")
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            log.exception("系统浏览器也打不开：%s", url)
 
 
 def toggle() -> None:
@@ -1579,10 +1661,10 @@ def toggle() -> None:
         print("已关闭专注监视。")
         return
     # DETACHED_PROCESS 是必须的：不脱离的话，开关一退出监视进程会被一起带走
-    subprocess.Popen([str(PYW), str(ROOT / "focus.py")], cwd=str(ROOT),
+    subprocess.Popen(relaunch_cmd(), cwd=str(ROOT),
                      creationflags=_DETACHED, close_fds=True)
     _write_lnk(on_icon)
-    subprocess.Popen([str(PYW), str(ROOT / "focus.py"), "--wait-open"],
+    subprocess.Popen(relaunch_cmd() + ["--wait-open"],
                      cwd=str(ROOT), creationflags=_DETACHED, close_fds=True)
     print("已启动专注监视，面板就绪后会自动打开。")
 
@@ -1992,6 +2074,111 @@ def selftest() -> None:
     assert not should_prompt_rating(0.0, False), "没有可评的块就不弹"
     assert not should_prompt_rating(FLOW_QUIET + 3600, False, 999999), \
         "没有可评的块时，上限也不能把它放行"
+
+    # ── 「重新启动自己」的命令行必须区分源码运行和冻结成 exe ──
+    #
+    # 这一条是实机才能暴露的那种：`getattr(sys, "frozen", False)` 在开发机上
+    # 永远是 False，所以"发布包里入口变成 exe 自己"那条分支根本没人跑过。
+    # 写死 .venv/Scripts/pythonw.exe 的后果是：发布包里既没有 .venv 也没有
+    # focus.py，subprocess.Popen 抛 FileNotFoundError，而 exe 是 --windowed、
+    # 没有控制台 —— 用户双击桌面开关，**什么都没发生，也没有任何报错**。
+    _frozen = relaunch_cmd(frozen=True)
+    assert _frozen == [sys.executable], \
+        f"冻结态的启动命令应该是 exe 自己，实际是 {_frozen}"
+    # 断言"不指向 PYW / focus.py"，而不是"不含 .venv" —— 开发机上
+    # sys.executable 本来就在 .venv 里，那样写会在自检里自己误报。
+    assert str(PYW) not in _frozen, \
+        f"冻结态不该再指向 {PYW.name}（发布包里没有 .venv）：{_frozen}"
+    assert not any(p.endswith("focus.py") for p in _frozen), \
+        f"冻结态不该再传 focus.py（发布包里没有它）：{_frozen}"
+    _dev = relaunch_cmd(frozen=False)
+    assert _dev[0].endswith("pythonw.exe"), \
+        f"源码运行要用 pythonw（不弹控制台），实际是 {_dev[0]}"
+    assert _dev[-1].endswith("focus.py"), \
+        f"源码运行的入口是 focus.py，实际是 {_dev[-1]}"
+    # 源码形态下 PYW 必须真的存在，否则开发机上双击开关就是坏的
+    # （冻结态没有 .venv，所以只在非冻结时检查）。
+    if not getattr(sys, "frozen", False):
+        assert PYW.exists(), f"找不到 {PYW} —— 开发机上桌面开关会失效"
+
+    # ── wait_and_open：服务等不到要退出、窗口开不了要退到浏览器 ──
+    #
+    # 原来这两件事挤在同一个 try 里：`import window` 失败会被当成"服务还没起来"，
+    # 于是一路重试到 120 秒超时、最后一声不吭地退出。发布包漏了 pywebview 时
+    # 就是这个表现。下面两条分别把这两条路径钉住。
+    _t0 = time.time()
+    wait_and_open(timeout=0.1)          # 服务起不来 → 必须很快返回，不能卡住
+    assert time.time() - _t0 < 10.0, "服务等不到时必须及时返回，不能一直转"
+
+    _real_urlopen = urllib.request.urlopen
+    _win_mod = sys.modules.get("window", "__absent__")
+    _real_open = webbrowser.open
+    _opened: list[str] = []
+
+    class _FakeResponse:
+        """只要能被 .close() 就行 —— wait_and_open 只用它判断"服务活了没"。"""
+
+        def close(self):
+            pass
+
+    try:
+        # 让"服务已就绪"成立
+        urllib.request.urlopen = lambda *a, **k: _FakeResponse()
+        # 让 `import window` 失败（等价于发布包里漏了 pywebview）：
+        # sys.modules 里放 None 会让 import 直接抛 ImportError。
+        sys.modules["window"] = None
+        webbrowser.open = lambda u, *a, **k: _opened.append(u)
+        wait_and_open(timeout=5.0)
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        webbrowser.open = _real_open
+        if _win_mod == "__absent__":
+            sys.modules.pop("window", None)
+        else:
+            sys.modules["window"] = _win_mod
+    assert _opened, \
+        "窗口层 import 失败时没有退到系统浏览器 —— 用户会看到「双击了没反应」"
+
+    # ── 桌面快捷方式的目标必须来自 relaunch_cmd() ──
+    #
+    # 桌面开关是不是死的，全看这一条：写死 .venv/Scripts/pythonw.exe 的话，
+    # 发布包里 TargetPath 指向一个不存在的文件，双击毫无反应、也没有报错。
+    # _write_lnk() 本身只是拼一个 PowerShell 字符串，所以可以拦下 subprocess
+    # 把那段命令抓出来验，不用真的建快捷方式、也不碰用户的桌面。
+    _ps_seen: list[str] = []
+    _real_run = subprocess.run
+
+    def _fake_run(cmd, *a, **k):
+        if cmd and cmd[0] == "powershell":
+            _ps_seen.append(" ".join(map(str, cmd)))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return _real_run(cmd, *a, **k)
+
+    try:
+        subprocess.run = _fake_run
+        _write_lnk(Path("dummy.ico"))                      # 默认 = relaunch_cmd()
+        _write_lnk(Path("dummy.ico"),
+                   cmd=[r"C:\sentinel\focus-monitor.exe", "--sentinel-arg"])
+    finally:
+        subprocess.run = _real_run
+    assert len(_ps_seen) == 2, f"_write_lnk 没有调用 powershell（{len(_ps_seen)} 次）"
+
+    # ① 默认那条：目标必须就是 relaunch_cmd() 的入口，且带 --toggle
+    _default_ps = _ps_seen[0]
+    assert "--toggle" in _default_ps, \
+        "快捷方式没带 --toggle —— 双击只会去起第二个实例，被单例挡住"
+    assert relaunch_cmd()[0] in _default_ps, \
+        "快捷方式的目标不是 relaunch_cmd() 的入口"
+
+    # ② 哨兵那条：传进来的命令必须被**原样采纳**。
+    #    这才是"目标不是写死的"的证明 —— 写死 .venv/Scripts/pythonw.exe 的
+    #    旧写法同样含 pythonw.exe，光看①根本区分不出来。
+    _sentinel_ps = _ps_seen[1]
+    assert r"C:\sentinel\focus-monitor.exe" in _sentinel_ps, \
+        "快捷方式的目标是写死的，没有采用传入的命令 —— " \
+        "发布包里 TargetPath 会指向不存在的文件，桌面开关直接是死的"
+    assert "--sentinel-arg" in _sentinel_ps, \
+        "传入命令的额外参数没被写进快捷方式"
 
     # ── 结构性断言：采集循环里的「视觉链路」必须还连着 ──
     #
