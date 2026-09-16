@@ -42,6 +42,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.request
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -1901,6 +1902,30 @@ def selftest() -> None:
     assert not should_prompt_rating(0.0, False), "没有可评的块就不弹"
     assert not should_prompt_rating(FLOW_QUIET + 3600, False, 999999), \
         "没有可评的块时，上限也不能把它放行"
+
+    # 版本号有两处副本，必须一致 —— __version__ 正上方那行注释就是这么写的。
+    # 但注释看得见、没人会去看：上游 aaa2c0a「v0.2.3: 版本号跟进」就只改了
+    # pyproject.toml，漏掉 __version__，于是 `focus.py --version` 报 0.2.2、
+    # 而元数据是 0.2.3 —— 打包成 exe 后 bug 报告唯一能问到的版本信息就是这一行，
+    # 用户报的版本和实际跑的代码对不上，排查从错误前提开始。
+    # 所以这里加一条断言，把"必须一致"从注释变成会失败的检查。
+    # 冻结成 exe 后 pyproject.toml 不会跟着打包，找不到就跳过（避免误报）。
+    pyproject = ROOT / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            with pyproject.open("rb") as f:
+                meta_version = tomllib.load(f)["project"]["version"]
+        except tomllib.TOMLDecodeError as exc:
+            # 上游真出过这个：aaa2c0a 把没解决的冲突标记一起提交了，
+            # pyproject.toml 根本不是合法 TOML（pip install . 直接失败）。
+            # 而发布脚本当时用正则读版本号，恰好还能读到数字，
+            # 于是"打包能出包"的假象让这个问题一直活了下来。
+            raise AssertionError(
+                f"pyproject.toml 不是合法 TOML：{exc}"
+                "（先看有没有未解决的冲突标记 <<<<<<< / ======= / >>>>>>>）"
+            ) from None
+        assert meta_version == __version__, \
+            f"版本号不一致：pyproject.toml={meta_version}，focus.py={__version__}"
 
     # 这行以前是"踩着自己写的规矩"崩的：上面注释声称刻意只用 ASCII，消息本身
     # 却是中文。中文 Windows 的 GBK 控制台打得出来，所以本机一直没暴露；到了

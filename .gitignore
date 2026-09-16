@@ -32,6 +32,8 @@ models/
 .venv/
 __pycache__/
 *.py[cod]
+# pip install . / -e . 会在仓库根生成，属于构建产物
+*.egg-info/
 
 # ── PyInstaller 构建产物（exe 发布走 GitHub Release，不进仓库）──
 build/

@@ -1,11 +1,9 @@
 [project]
 name = "focus-monitor"
-<<<<<<< HEAD
 version = "0.2.3"
 description = "摄像头 + 屏幕使用双路专注度监视器（Windows 本地运行，数据不出本机）"
 readme = "README.md"
 license = { file = "LICENSE" }
->>>>>>> a276bc0 (v0.2.3: 版本号跟进)
 requires-python = ">=3.11,<3.13"
 # 关键词和 classifiers 保持英文：这是 PyPI 的索引字段，
 # 中文写进去搜不到，也不符合 PyPI 的取值规范。

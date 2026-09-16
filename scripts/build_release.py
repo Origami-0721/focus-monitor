@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -41,12 +42,24 @@ def version() -> str:
 
     不额外维护一份版本常量：手写两处迟早会不一致，
     发出来的包名和 exe 里报的版本对不上，排查问题时会很痛苦。
+
+    用 tomllib 而不是正则：正则只关心"有没有 `version = "` 这一行"，
+    文件里混进未解决的冲突标记（`<<<<<<<` / `>>>>>>>`）它照样能读出数字 ——
+    实测上游真发生过一次，pyproject.toml 根本不是合法 TOML，
+    而发布脚本一声不吭地出了包，直到 `pip install .` 才炸。
+    解析器会直接报错，正则不会。
     """
-    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    m = re.search(r'^version\s*=\s*"([^"]+)"', text, flags=re.M)
-    if not m:
-        sys.exit("pyproject.toml 里找不到 version")
-    return m.group(1)
+    path = ROOT / "pyproject.toml"
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)["project"]["version"]
+    except FileNotFoundError:
+        sys.exit(f"找不到 {path}")
+    except tomllib.TOMLDecodeError as exc:
+        sys.exit(f"{path.name} 不是合法 TOML：{exc}\n"
+                 "（先看有没有未解决的冲突标记 <<<<<<< / ======= / >>>>>>>）")
+    except KeyError:
+        sys.exit(f"{path.name} 里找不到 project.version")
 
 
 OLD = "import matplotlib.pyplot as plt\n"
