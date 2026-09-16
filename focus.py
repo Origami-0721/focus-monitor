@@ -227,7 +227,7 @@ CONFIG_PATH = ROOT / "config.json"
 
 # 版本号。这里和 pyproject.toml 的 version 必须一致（发布清单里有一步专门核对）。
 # 冻结成 exe 后，bug 报告唯一能问到的版本信息就是它。
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 _SCALARS: dict[str, type] = {
     "FACE_FPS": int, "POSE_FPS": int, "PROC_WIDTH": int,
