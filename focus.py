@@ -157,6 +157,11 @@ EAR_BASELINE_PCT = 75  # 用近期 EAR 的这个百分位当"睁眼基线"（抗
 EAR_RATIO = 0.67       # 闭眼阈值 = 睁眼基线 × 这个比例
 EAR_MIN_SAMPLES = 60   # 基线样本少于此数就退回出厂值
 EAR_SUSTAIN = 3.0      # 持续闭眼多少秒算疲劳
+# 人脸丢了多久就把"连续闭眼"的计时作废。见采集循环里的注释：
+# 不作废的话，闭眼计时会跨过"转头出画"这段盲区继续累加。
+# 留一点宽限（0.5 秒 = FACE_FPS 下的 5 帧）是为了容忍检测的单帧抖动 ——
+# 丢一两帧就把计时清零，真犯困时反而永远攒不满 EAR_SUSTAIN。
+FACE_LOSS_GRACE = 0.5
 AWAY_FACE = 20.0       # 人脸消失多少秒算离开
 AWAY_IDLE = 180.0      # 键鼠无操作多少秒算离开
 TILT_WARN = 12.0       # 肩线倾斜超过多少度算坐姿不良
@@ -950,6 +955,10 @@ class Monitor(threading.Thread):
         scale_hist: deque[float] = deque(maxlen=600)
         closed_since: float | None = None
         away_since: float | None = None
+        # 上一次真的看到脸的时刻。只用来判断"这次闭眼计时是不是跨过了盲区"。
+        # 初值 0.0 而不是 now：脸一次都没见过时 now - 0.0 是个巨大的数，
+        # 正好落进"丢脸超时"那一支，不会留下一个假的计时起点。
+        last_face_seen = 0.0
         lean = 0.0
 
         while self.running:
@@ -1027,8 +1036,23 @@ class Monitor(threading.Thread):
                         closed_since = (None if got["ear"] >= self._ear_thr
                                         else (closed_since or now))
                         away_since = None
+                        last_face_seen = now
                     else:
                         away_since = away_since or now
+                        # 丢脸丢久了就把"连续闭眼"的计时作废。
+                        #
+                        # closed_since 只由"看到脸且 EAR 低"推进，丢脸时原本不动它，
+                        # 于是"闭眼 2 秒 → 转头出画 3 秒 → 回来还闭着眼"会被算成
+                        # 连续闭眼 5 秒，人刚回来 1 秒就记一条「疲劳」（实测复现，
+                        # 见 smoke_pipeline.py 里那段脚本化的时间线）。
+                        # 判据是"盲区超过了宽限期"，不是"有没有掉帧"：单帧抖动
+                        # （now - last_face_seen 只有 0.1 秒）不清零，真断了才清零。
+                        #
+                        # 为什么不怕把真疲劳一起清掉：脸不在画面里的时候 decide()
+                        # 本来就返回 distracted，closed_for 再大也轮不到它说话。
+                        if (closed_since is not None
+                                and now - last_face_seen > FACE_LOSS_GRACE):
+                            closed_since = None
 
                 if now - last_pose >= 1.0 / POSE_FPS:
                     last_pose = now
@@ -1981,6 +2005,10 @@ def selftest() -> None:
             "face_buf.append(got)", "tilt_buf.append(tilt)",
             'scale_hist.append(got["scale"])', 'self._ear_hist.append(got["ear"])',
             'closed_since = (None if got["ear"] >= self._ear_thr',
+            # 丢脸超时作废闭眼计时。少了这一条不会报错，只会让人"闭眼 2 秒、
+            # 转头出画 3 秒、回来还闭着眼"时一回来就被记一条「疲劳」。
+            "now - last_face_seen > FACE_LOSS_GRACE",
+            "last_face_seen = now",
         ):
             assert _needle in _loop_src, \
                 f"采集循环的视觉链路断了：找不到 {_needle!r}" \

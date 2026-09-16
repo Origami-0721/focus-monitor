@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""管线冒烟：采集循环的视觉链路有没有真的接上。
+"""管线冒烟：采集循环的接线有没有真的接上。
 
 `--selftest` 测的是纯逻辑（`decide()`、`ear_threshold()` 这些函数本身），
 `smoke.py` 测的是渲染。两者都**测不出"没人喂数据给逻辑"**这一类故障。
@@ -12,6 +12,17 @@ distracted / away —— 专注、中性、伏案、疲劳四种状态一个都�
 
 所以这里用**假摄像头 + 假 Vision** 真跑一遍 `Monitor.run()`，然后查库里
 到底出现了哪些状态。不需要摄像头、不需要下载模型、不联网。
+
+两个场景：
+
+  ① 恒定输入 —— 永远"看到一张正对屏幕的脸"，状态必须判成「专注」。
+     盯的是"数据到底有没有流进 decide()"。
+
+  ② 脚本化时间线 —— 睁眼 → 闭眼 → 转头出画 → 回来还闭着眼。
+     盯的是"闭眼计时会不会跨过丢脸那段盲区接着累加"。会的话，人只是
+     转了下头，回来 1 秒就被记一条「疲劳」（改之前实测能复现）。
+     这一段同时验反面：一直闭着眼不丢脸时「疲劳」**必须**照样判得出来 ——
+     修 bug 不能顺手把功能一起修没了。
 
 用法:
     python smoke_pipeline.py
@@ -30,7 +41,7 @@ import numpy as np
 
 import focus
 
-# 跑够 2 次结算（每秒一次）就行；留点余量给慢机器
+# 场景①跑够 2 次结算（每秒一次）就行；留点余量给慢机器
 DURATION = 4.0
 
 
@@ -69,31 +80,92 @@ class _FakeVision:
         return 3.0
 
 
-def main() -> int:
-    focus.use_safe_console()
+# ────────────────────── 场景②：脚本化时间线 ──────────────────────
+#
+# 时间轴（相对本段开始，单位秒）：
+#
+#   0.0 – 1.2   睁眼 ear=0.32   攒够基线样本，自适应阈值定在 0.32×0.67 ≈ 0.214
+#   1.2 – 2.0   闭眼 ear=0.10   closed_since ≈ 1.2；最长只累计 0.8 秒，
+#                               够不到 EAR_SUSTAIN，所以这段本身不该出「疲劳」
+#   2.0 – 3.8   丢脸（返回 None）1.8 秒的盲区。长度 ≥ 一个结算窗口，
+#                               所以**必定**盖住至少一个 present=False 的结算
+#   3.8 – 8.0   回来，仍然闭眼   计时应该从 3.8 秒**重新开始**
+#
+# 判据：第一条「疲劳」必须落在"脸回来之后 ≥ 1.5 秒"。
+#   有 bug（计时跨盲区累加）：closed_for 从 1.2 起算，回来的第一个结算窗口
+#       就已经 ≥ 2.0 → 疲劳出现在回来之后 0 ~ 1.0 秒 → 断言失败。
+#   修好后：closed_for 从 3.8 起算，最早 3.8+2.0 = 5.8 → 落在 2.0 秒之后。
+#
+# 为了让这一段别跑太久，把"攒够基线"和"闭眼多久算疲劳"都调小：
+# 两个常量都是在函数里现读的模块级全局，所以改 focus 上的值就生效。
+_OPEN_UNTIL = 1.2
+_CLOSED_UNTIL = 2.0
+_RETURN_AT = 3.8
+_TIMELINE_DURATION = 8.0
+_EAR_OPEN = 0.32
+_EAR_CLOSED = 0.10
 
-    db = Path(tempfile.mkdtemp()) / "pipeline-smoke.db"
-    # 把外部依赖全部换掉：摄像头、模型、前台窗口、键鼠空闲
+_T0 = 0.0          # 本段起点，main() 里在起线程之前赋值
+
+
+class _ScriptedVision:
+    """按 elapsed 演出"睁眼 → 闭眼 → 转头出画 → 回来还闭着眼"。"""
+
+    return_ts: float | None = None    # 丢脸之后第一次重新看到脸的时刻
+
+    def __init__(self):
+        pass
+
+    def read_face(self, frame):
+        t = time.time() - _T0
+        if t < _OPEN_UNTIL:
+            ear = _EAR_OPEN
+        elif t < _CLOSED_UNTIL:
+            ear = _EAR_CLOSED
+        elif t < _RETURN_AT:
+            return None               # 转头出画：脸不在了
+        else:
+            if _ScriptedVision.return_ts is None:
+                _ScriptedVision.return_ts = time.time()
+            ear = _EAR_CLOSED         # 回来了，眼睛还是闭着
+        return {"yaw": 0.0, "pitch": 5.0, "ear": ear, "scale": 1.0}
+
+    def read_posture(self, frame):
+        return 3.0
+
+
+def _run(vision_cls, db: Path, duration: float) -> None:
+    """把外部依赖全部换掉（摄像头、模型、前台窗口、键鼠空闲）后真跑一遍采集循环。"""
     focus.DB_PATH = db
     focus.ensure_models = lambda on_progress=None: None
-    focus.Vision = _FakeVision
+    focus.Vision = vision_cls
     focus.open_camera = lambda preferred=None: _FakeCap()
     focus.active_window = lambda: ("code.exe", "focus.py - Visual Studio Code")
     focus.idle_seconds = lambda: 0.0
 
     mon = focus.Monitor()
-    threading.Timer(DURATION, mon.stop).start()
+    threading.Timer(duration, mon.stop).start()
     mon.run()
 
+
+def _rows(db: Path) -> list[tuple]:
     conn = sqlite3.connect(db)
     try:
-        rows = conn.execute(
-            "SELECT state, COUNT(*), SUM(ear) FROM samples GROUP BY state").fetchall()
-        total = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        return conn.execute(
+            "SELECT ts, state, ear FROM samples ORDER BY ts").fetchall()
     finally:
         conn.close()
 
-    dist = {st: n for st, n, _ in rows}
+
+def _check_constant_input() -> str:
+    """场景①：恒定喂"正对屏幕的脸"，必须产出「专注」。"""
+    db = Path(tempfile.mkdtemp()) / "pipeline-smoke.db"
+    _run(_FakeVision, db, DURATION)
+    rows = _rows(db)
+
+    dist: dict[str, int] = {}
+    for _, st, _e in rows:
+        dist[st] = dist.get(st, 0) + 1
     ears = sum(e or 0.0 for _, _, e in rows)
 
     # ① 视觉函数必须真的被调用过
@@ -101,7 +173,7 @@ def main() -> int:
         "采集循环从没调用过 read_face —— 视觉链路断了（生产端被删了、消费端还在）")
     assert _FakeVision.pose_calls > 0, "采集循环从没调用过 read_posture"
     # ② 必须真的落了样本
-    assert total >= 2, f"只落了 {total} 条样本，采集循环没正常跑起来"
+    assert len(rows) >= 2, f"只落了 {len(rows)} 条样本，采集循环没正常跑起来"
     # ③ 关键：正对屏幕 + 工作应用，必须产出「专注」，不能只有走神/离开
     assert "focused" in dist, (
         f"喂了正对屏幕的人脸却判不出「专注」，实际状态分布：{dist}"
@@ -109,9 +181,50 @@ def main() -> int:
     # ④ EAR 必须真的写进库了，否则是"读到了但没存"
     assert ears > 0, f"落库的 ear 合计为 {ears}，说明视觉结果没传到写库那一步"
 
-    print(f"管线冒烟通过 - read_face {_FakeVision.face_calls} 次 / "
-          f"read_posture {_FakeVision.pose_calls} 次，"
-          f"{total} 条样本，状态 {dist}")
+    return (f"read_face {_FakeVision.face_calls} 次 / "
+            f"read_posture {_FakeVision.pose_calls} 次，"
+            f"{len(rows)} 条样本，状态 {dist}")
+
+
+def _check_face_loss_timeline() -> str:
+    """场景②：丢脸那段盲区不该让闭眼计时接着累加，但真疲劳仍要判得出来。"""
+    global _T0
+    _ScriptedVision.return_ts = None
+
+    saved = focus.EAR_MIN_SAMPLES, focus.EAR_SUSTAIN
+    focus.EAR_MIN_SAMPLES = 8     # 0.8 秒就能把基线攒出来
+    focus.EAR_SUSTAIN = 2.0
+    try:
+        db = Path(tempfile.mkdtemp()) / "pipeline-timeline.db"
+        _T0 = time.time()         # 必须在起线程之前，时间轴是相对它算的
+        _run(_ScriptedVision, db, _TIMELINE_DURATION)
+        rows = _rows(db)
+    finally:
+        focus.EAR_MIN_SAMPLES, focus.EAR_SUSTAIN = saved
+
+    drowsy = [ts for ts, st, _e in rows if st == "drowsy"]
+    assert _ScriptedVision.return_ts is not None, (
+        "脚本化的时间线没跑到「回来」那一段 —— 采集循环可能提前停了")
+    assert drowsy, (
+        f"一直闭着眼（3.8 秒起）却始终判不出「疲劳」，实际状态分布 "
+        f"{sorted({st for _t, st, _e in rows})} —— 丢脸作废的逻辑把真疲劳也清掉了")
+
+    offset = drowsy[0] - _ScriptedVision.return_ts
+    assert offset >= 1.5, (
+        f"脸回来之后 {offset:.1f} 秒就记了「疲劳」：闭眼计时跨过了丢脸那段盲区"
+        f"接着累加（人只是转了下头，眼睛只被观察到闭了 0.8 秒）")
+
+    return (f"{len(rows)} 条样本，{len(drowsy)} 条疲劳，"
+            f"第一条在脸回来之后 {offset:.1f} 秒")
+
+
+def main() -> int:
+    focus.use_safe_console()
+
+    summary1 = _check_constant_input()
+    summary2 = _check_face_loss_timeline()
+
+    print(f"管线冒烟通过\n  ① 恒定输入：{summary1}\n  ② 丢脸时间线：{summary2}")
     return 0
 
 
