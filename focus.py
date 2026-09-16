@@ -2687,6 +2687,13 @@ def selftest() -> None:
     # 原来这两件事挤在同一个 try 里：`import window` 失败会被当成"服务还没起来"，
     # 于是一路重试到 120 秒超时、最后一声不吭地退出。发布包漏了 pywebview 时
     # 就是这个表现。下面两条分别把这两条路径钉住。
+    #
+    # 这一段必须**压住日志**：wait_and_open 第一件事就是 setup_log()，于是下面
+    # 两条"故意制造失败"的调用会把假的 ModuleNotFoundError / 「应用窗口打不开」
+    # 写进用户真正的 focus.log。实测踩到过：用户日志里躺着几条这样的 ERROR，
+    # 看起来像"窗口层真的坏了"，其实是自检自己造的 —— 排查时会被带偏。
+    _keep_lvl_wa = log.level
+    log.setLevel(logging.CRITICAL)
     _t0 = time.time()
     wait_and_open(timeout=0.1)          # 服务起不来 → 必须很快返回，不能卡住
     assert time.time() - _t0 < 10.0, "服务等不到时必须及时返回，不能一直转"
@@ -2713,6 +2720,7 @@ def selftest() -> None:
     finally:
         urllib.request.urlopen = _real_urlopen
         webbrowser.open = _real_open
+        log.setLevel(_keep_lvl_wa)      # 见上：这一段故意制造的失败不该进日志
         if _win_mod == "__absent__":
             sys.modules.pop("window", None)
         else:
