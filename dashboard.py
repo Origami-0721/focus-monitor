@@ -77,10 +77,14 @@ def _rate_page(msg: str = "") -> str:
     done = sorted(ratings.ratings_map().items(), reverse=True)[:12]
 
     banner = f'<div class="alert good">{html.escape(msg)}</div>' if msg else ""
+    # 这个 fallback 必须提到 f-string 外面：Python 3.11 的 f-string 表达式里
+    # 不允许出现反斜杠（PEP 701 放宽是 3.12 的事），写 `\"muted\"` 会让
+    # 3.11 直接 SyntaxError —— 而 pyproject 声明支持 3.11。
+    empty_note = '<span class="muted">—</span>'
     hist = "".join(
         f'<tr><td>{_mdhm(bs)} – {_hm(bs + ratings.BLOCK)}</td>'
         f'<td class="num">{r["score"]} / 5</td>'
-        f'<td>{html.escape(r["note"]) or "<span class=\"muted\">—</span>"}</td></tr>'
+        f'<td>{html.escape(r["note"]) or empty_note}</td></tr>'
         for bs, r in done) or \
         '<tr><td colspan="3" class="muted">还没有评分记录</td></tr>'
 
@@ -797,6 +801,7 @@ def base_url() -> str:
 
 
 def main() -> None:
+    focus.use_safe_console()      # 面板地址那行提示在西文代码页上会抛异常
     url = serve_background()
     print(f"实时面板: {url}\nCtrl+C 停止")
     try:

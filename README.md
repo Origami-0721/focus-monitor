@@ -60,6 +60,11 @@ uv run focus.py                   # 开始监视（托盘图标）
 
 > 依赖要求在 `pyproject.toml` 里锁了 `>=3.11,<3.13`。MediaPipe 目前没有 3.13+ 的 wheel，
 > 用 uv 会自动拉一个兼容的解释器。
+>
+> 这两个版本不是写着好看的：`.github/workflows/selftest.yml` 每次 push 都会在 Windows 上
+> 分别用 3.11 和 3.12 各跑一遍「全部模块语法检查 + 自检 + 冒烟测试」，任何一个红都说明
+> 声明的支持范围是假的。CI 还故意把控制台编码钉在西文代码页上跑 —— 中文提示在 GBK 控制台
+> 下看不出问题，只有换到西文代码页才会暴露（详见 `focus.use_safe_console`）。
 
 ## 使用
 

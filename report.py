@@ -1046,6 +1046,7 @@ def main() -> Path | None:
     展示由应用窗口承担（窗口 /report 页直接渲染报告 HTML），
     这里的产出是「可以带走/分享/打印的文档」。返回报告路径。
     """
+    focus.use_safe_console()      # 报告里的中文提示在西文代码页上会抛异常
     rows = load()
     OUT.write_text(build_html(rows), encoding="utf-8")
     print(f"报告已生成: {OUT}")

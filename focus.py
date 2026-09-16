@@ -91,6 +91,41 @@ def setup_log(verbose: bool = False) -> None:
 
     threading.excepthook = _hook
 
+
+def use_safe_console() -> None:
+    """让控制台输出在任何代码页下都能显示，且永不抛 UnicodeEncodeError。
+
+    中文提示在中文 Windows（GBK 控制台）上一直没问题，所以这个坑藏了很久。
+    它是在 GitHub Actions 的 Windows runner 上才暴露的：那里是西文代码页，
+    `print("自检通过")` 直接抛 UnicodeEncodeError —— 一次断言全过的自检被判
+    成红色失败。更麻烦的是它崩在**最后一行**，前面输出看着一切正常，光看日志
+    根本猜不到是编码问题。
+
+    做法分两步，都是为了"本地照旧、CI 可读"：
+      1. 当前代码页表示得了中文 → 原样不动，本地 GBK 控制台的显示不受影响；
+         表示不了（cp1252/cp437 这类西文页）→ 切到 UTF-8。CI 的日志查看器
+         按 UTF-8 渲染，于是断言失败时那句中文提示才真的能看懂。
+      2. 一律加上 errors="replace" 兜底：编不出来的字符退化成 '?'，
+         但绝不再把一次成功的运行变成异常退出。
+    """
+    probe = "自检"
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:              # pythonw 启动时没有控制台
+            continue
+        enc = getattr(stream, "encoding", None)
+        if enc:
+            try:
+                probe.encode(enc)
+            except (UnicodeEncodeError, LookupError):
+                enc = "utf-8"           # 西文代码页 → 换成 UTF-8
+        else:
+            enc = "utf-8"
+        try:
+            stream.reconfigure(encoding=enc, errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # 流被替换成不支持重配置的对象（测试替身、某些重定向），忽略即可。
+            pass
+
 MODEL_URLS = {
     "face_landmarker.task":
         "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
@@ -1659,14 +1694,20 @@ def selftest() -> None:
     assert not should_prompt_rating(FLOW_QUIET + 3600, False, 999999), \
         "没有可评的块时，上限也不能把它放行"
 
-    # 刻意只用 ASCII：GBK 控制台打不出 ✓ 之类的符号，会直接抛 UnicodeEncodeError，
-    # 自检本身反而崩了。全 ASCII 保证任何代码页下都能跑完并报出结果。
+    # 这行以前是"踩着自己写的规矩"崩的：上面注释声称刻意只用 ASCII，消息本身
+    # 却是中文。中文 Windows 的 GBK 控制台打得出来，所以本机一直没暴露；到了
+    # GitHub Actions 的西文代码页就抛 UnicodeEncodeError，把一次断言全过的自检
+    # 判成红色失败，而且崩在最后一行，光看日志看不出是编码问题。
+    # 现在不再靠"只写 ASCII"来规避，改由 use_safe_console() 兜住任何代码页。
     print("自检通过 - 全部断言成立")
 
 
 # ══════════════════════ 入口 ══════════════════════
 
 def main() -> None:
+    # 必须最先做：argparse 的 --help、以及下面所有中文提示都走 stdout，
+    # 在西文代码页上会直接抛 UnicodeEncodeError（详见 use_safe_console）。
+    use_safe_console()
     ap = argparse.ArgumentParser(description="摄像头 + 屏幕使用双路专注度监视器")
     ap.add_argument("--camera", type=int, default=None, help="摄像头序号，默认自动挑")
     ap.add_argument("--report", action="store_true", help="生成 HTML 报告并打开")

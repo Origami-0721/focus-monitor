@@ -14,6 +14,16 @@ jobs:
   selftest:
     # 必须 windows：window.py 直接调 Win32 API，模块都 import 不了。
     runs-on: windows-latest
+
+    # 故意把控制台钉在西文代码页上。
+    #
+    # 这一条是踩坑换来的：CI 第一次跑就红了，两个 job 各挂一处，而根因之一是
+    # 中文提示在西文代码页下会抛 UnicodeEncodeError —— 中文 Windows 的 GBK
+    # 控制台打得出来，所以本机永远复现不了。runner 默认用什么代码页是没写进
+    # 文档的实现细节，靠它来"顺带发现"太不牢靠：显式钉死，才每次都在测。
+    env:
+      PYTHONIOENCODING: cp1252
+
     strategy:
       fail-fast: false
       matrix:
@@ -32,8 +42,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install mediapipe opencv-python numpy pillow pystray pywebview
 
+      # 不写死文件清单：写死的话，新加一个模块就会悄悄漏检 ——
+      # 而 pyproject 声明支持 3.11，任何新模块用了 3.12 才有的语法都该在这里拦住。
+      # （dashboard.py 就曾在 3.11 上编译不过：f-string 表达式里带了反斜杠，
+      #   PEP 701 放宽是 3.12 的事。）
       - name: 语法检查（全部模块）
-        run: python -m py_compile focus.py report.py dashboard.py ratings.py window.py
+        run: python -m compileall -q -x "\.venv|__pycache__|\.git|node_modules" .
 
       - name: 自检
         run: python focus.py --selftest
@@ -41,9 +55,14 @@ jobs:
       # 自检只覆盖纯逻辑。下面这一步确认所有页面都能真的渲染出来 ——
       # 模板里的 f-string 少个括号，selftest 是看不出来的，
       # 但用户点开面板第一眼就崩。
+      #
+      # 这里必须自己调 use_safe_console()：`python -c` 不经过 focus.main()，
+      # 没人替它兜住代码页 —— 最后那句中文 print 会在西文控制台上抛异常，
+      # 把一次成功的冒烟测试变成失败。
       - name: 冒烟测试（各页面都能渲染）
         run: python -c "
           import focus, report, dashboard;
+          focus.use_safe_console();
           html = report.build_html([]);
           assert '<html' in html, '报告渲染失败';
           assert 'focus.db' not in html, '报告里不该出现数据库路径';
