@@ -40,6 +40,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -1290,6 +1291,14 @@ def run_tray(mon: Monitor) -> None:
     import pystray
 
     def refresh(icon) -> None:
+        # 桌面开关的图标也在这里一起刷。托盘图标能自己反映"在跑但没数据"，
+        # 而 .lnk 的图标是个静态文件 —— 只有我们主动重写它才会变。
+        # 放在最前面：下面那条 is_stale 分支会 return，跟在后面就漏了
+        # —— "采集线程死了"恰恰是桌面图标最该从绿变黄的时刻。
+        # running=True 是确定的：托盘线程活着就说明本进程在跑。
+        # 状态没变时它只 stat 一下，不会真的写文件。
+        sync_shortcut_icon(running=True)
+
         # 采集停摆时覆盖成"警告"图标。
         # 只靠状态色有个致命盲区：线程死了以后状态就冻在最后一次的值上，
         # 若那时恰好是"中性"，用户看到的是一个和健康状态一模一样的蓝点。
@@ -1527,23 +1536,140 @@ def _desktop() -> Path:
     return Path(os.environ.get("USERPROFILE", "")) / "Desktop"
 
 
-def ensure_icons() -> tuple[Path, Path]:
-    """生成「开」「关」两个图标。
+# 桌面开关的三种图标。快捷方式是个独立的应用图标（圆底 + 一个记号），
+# 不是托盘那种小圆点，所以形状得能一眼分辨：
+#   绿圆       = 在记录
+#   黄底感叹号 = 在跑，但没在记录（模型没下来、摄像头坏了、采集线程死了）
+#   灰底横杠   = 没在跑
+#
+# 三个**不同的文件**是必须的：.lnk 的 IconLocation 存的是路径，Windows 按路径
+# 缓存图标 —— 同一个路径只换内容，桌面往往不刷新。
+_ICON_STATES: dict[str, tuple[str, str | None]] = {
+    "on":    ("#22c55e", None),      # 绿点
+    "alert": ("#f59e0b", "bang"),    # 黄底感叹号
+    "off":   ("#64748b", "bar"),     # 灰底横杠
+}
 
-    快捷方式的图标是静态的，没法自己反映运行状态 —— 只能在每次切换时
+
+def ensure_icons() -> dict[str, Path]:
+    """生成桌面开关的三个图标，返回 {状态: 路径}。
+
+    快捷方式的图标是静态的，没法自己反映运行状态 —— 只能在状态变化时
     连图标一起重写 .lnk，Explorer 会立刻刷新。
     """
     from PIL import Image, ImageDraw
     ICON_DIR.mkdir(exist_ok=True)
-    on, off = ICON_DIR / "on.ico", ICON_DIR / "off.ico"
-    for p, color, bar in ((on, "#22c55e", False), (off, "#64748b", True)):
+    out: dict[str, Path] = {}
+    for state, (color, mark) in _ICON_STATES.items():
+        p = ICON_DIR / f"{state}.ico"
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         d.ellipse((5, 5, 59, 59), fill=color)
-        if bar:                      # 关：中间一道横杠，和「开」一眼区分
+        if mark == "bar":            # 关：中间一道横杠，和「开」一眼区分
             d.rectangle((15, 27, 49, 37), fill="#0f172a")
+        elif mark == "bang":         # 在跑但没记录：和托盘一样用感叹号
+            d.rounded_rectangle((28, 14, 36, 40), radius=4, fill="#0f172a")
+            d.ellipse((28, 45, 36, 53), fill="#0f172a")
         img.save(p, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
-    return on, off
+        out[state] = p
+    return out
+
+
+def shortcut_state(*, running: bool, stale: bool) -> str:
+    """桌面开关此刻该显示哪个图标。
+
+    抽成纯函数是为了能断言 —— 这条规则正是用户报的那个 bug：
+    **图标要反映"程序在不在跑"，不是"用户按过开关"。**
+
+    注意 `running=False` 时 stale 不再有意义：进程都没了，一律 off。
+    """
+    if not running:
+        return "off"
+    return "alert" if stale else "on"
+
+
+_lnk_state: str | None = None       # 上一次写进快捷方式的图标状态
+
+
+def should_sync_shortcut(lnk_exists: bool, state: str,
+                         last_state: str | None, force: bool) -> bool:
+    """要不要现在去重写那个 .lnk。两条规则，都很容易写反：
+
+    - **快捷方式不存在就别去建。** 不是每个用户都要桌面开关（教程里是可选
+      步骤）。程序启动时也会刷一次图标 —— 少了这条判断，等于**替所有用户
+      在桌面上凭空放一个快捷方式**，还是删了下次启动又长出来的那种。
+    - **状态没变就别重写。** 看门狗每 30 秒调一次，_write_lnk 要起一次
+      PowerShell（几百毫秒）并重写桌面文件，没必要。force 留给"快捷方式
+      可能被用户删掉又重建了"的场合。
+
+    抽成纯函数是为了能断言 —— 这两条都是"条件写反了也照样跑得通、
+    只有用户看得见"的那类。
+    """
+    return lnk_exists and (force or state != last_state)
+
+
+def sync_shortcut_icon(force: bool = False, running: bool | None = None) -> None:
+    """把桌面开关的图标刷成程序**此刻真实的状态**。
+
+    为什么必须由程序自己来刷：.lnk 的图标是个静态文件，只在写的那一刻成立。
+    原来只有 toggle() 在按下开关时写一次绿点，而且**在确认程序起来之前**就写了；
+    之后无论程序变成什么样都不再更新 —— 于是"网络出错导致模型下不下来、
+    采集根本没起来"的时候，桌面图标依然是绿的，用户以为在记录，其实一条样本
+    都没有。（用户报的"待机/断网后再开启，图标是绿的但没在运行"就是这个。）
+
+    所以调用方要么传**观测到的** running（toggle 里是 _start_engine 的返回值），
+    要么干脆别传、让它自己去查 —— 永远不要传"我以为它在跑"。
+    程序内部（托盘看门狗、退出兜底）直接传 True/False，省掉一次 tasklist。
+    """
+    global _lnk_state
+    try:
+        if running is None:
+            running = running_pid() is not None
+        state = shortcut_state(running=running, stale=is_stale())
+        lnk = _desktop() / LNK_NAME
+        if not should_sync_shortcut(lnk.exists(), state, _lnk_state, force):
+            return
+        _write_lnk(ensure_icons()[state])
+        _lnk_state = state
+        log.info("桌面开关图标 -> %s", state)
+    except Exception:
+        # 图标刷不上不该影响监视本身
+        log.exception("刷新桌面开关图标失败")
+
+
+def _wait_until_running(timeout: float = 15.0, probe=None) -> bool:
+    """等刚启动的实例真的把 PID 文件写出来；超时算失败。
+
+    PID 文件是在 acquire_singleton() 之后**立刻**写的，早于加载模型，
+    所以正常情况下一两秒就返回。会走到超时的只有"进程压根没起来"：
+    入口路径不对、单例被一个残留进程占着、exe 启动即崩。
+
+    `probe` 可注入是为了让自检能覆盖"起没起来"两支：开发机上真开着监视时
+    running_pid() 恒为真，"失败"那一支永远没人跑过。
+    """
+    if probe is None:
+        probe = running_pid
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if probe() is not None:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _complain(title: str, text: str) -> None:
+    """把"操作失败了"真的告诉用户。
+
+    双击开关的是个脱离终端的进程，而发布包是 `--windowed` ——
+    `sys.stdout` 是 None，`print` 等于什么都没做。所以这里必须弹窗，
+    否则用户面对的就是"双击了，没反应，也没人告诉他为什么"。
+    """
+    log.error("%s：%s", title, text.replace("\n", " "))
+    try:
+        # MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST
+        ctypes.windll.user32.MessageBoxW(None, text, title, 0x00050030)
+    except Exception:
+        log.exception("弹窗失败（非 Windows 或没有桌面会话）")
 
 
 def _write_lnk(icon: Path, cmd: list[str] | None = None) -> None:
@@ -1556,11 +1682,22 @@ def _write_lnk(icon: Path, cmd: list[str] | None = None) -> None:
     `cmd` 可注入是为了让自检能证明"目标不是写死的"：只断言"命令里出现了
     pythonw.exe"是测不出来的 —— 写死路径的旧写法同样含 pythonw.exe。
     只有"换一个哨兵命令进去、它必须被原样采纳"才能把这两种写法区分开。
+
+    先写临时文件再 os.replace：这个函数现在会被**程序运行时**反复调用
+    （启动、看门狗、退出兜底），而桌面上那个 .lnk 很可能正被 Explorer
+    或用户的操作占用 —— 直接 Save() 覆盖，中途失败就会留下一个 0 字节的
+    快捷方式，双击没反应、右键删也删不干净。临时文件必须放在**同一个
+    目录**（同一个卷），os.replace 才能是原子改名；放 %TEMP% 的话，
+    桌面被重定向到别的盘时会直接 OSError 跨卷失败。
+    临时名保留 .lnk 后缀：CreateShortcut 的路径参数按 .lnk 处理，
+    换成 .tmp 后缀是没验证过的写法。
     """
     lnk = _desktop() / LNK_NAME
     if cmd is None:
         cmd = relaunch_cmd()
     args = " ".join([f'"{a}"' for a in cmd[1:]] + ["--toggle"])
+    tmp = lnk.with_name(f"{LNK_NAME}.new.lnk")
+    tmp.unlink(missing_ok=True)
     ps = (
         "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
         "$s.TargetPath='%s';"
@@ -1569,10 +1706,24 @@ def _write_lnk(icon: Path, cmd: list[str] | None = None) -> None:
         "$s.IconLocation='%s,0';"
         "$s.Description='专注度监视（双击切换开/关）';"
         "$s.Save()"
-    ) % (lnk, cmd[0], args, ROOT, icon)
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
-                    "-Command", ps],
-                   creationflags=_NO_WINDOW, capture_output=True)
+    ) % (tmp, cmd[0], args, ROOT, icon)
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-Command", ps],
+                       creationflags=_NO_WINDOW, capture_output=True,
+                       # 这个函数现在也会被采集线程调到（状态一变就刷图标），
+                       # PowerShell 万一卡住不能把采集一起拖死。
+                       timeout=20)
+    except subprocess.TimeoutExpired:
+        tmp.unlink(missing_ok=True)
+        raise OSError("PowerShell 超时，快捷方式没更新") from None
+    if tmp.exists():
+        os.replace(tmp, lnk)
+    else:
+        # PowerShell 那边没写出东西来（COM 被策略挡了、执行失败）。
+        # 报错比留一个"看起来刷新了其实没刷"的假象好。
+        tmp.unlink(missing_ok=True)
+        raise OSError(f"PowerShell 没能写出快捷方式：{tmp}")
 
 
 def running_pid() -> int | None:
@@ -1652,35 +1803,88 @@ def wait_and_open(timeout: float = 120.0) -> None:
             log.exception("系统浏览器也打不开：%s", url)
 
 
+def _start_engine(timeout: float = 15.0) -> bool:
+    """拉起监视本体，并**确认它真的起来了**；起来了才返回 True。
+
+    两个进程各司其职：本体负责采集和托盘（DETACHED，不随开关退出），
+    `--wait-open` 那个只负责等面板就绪再开窗口（模型要下十几秒，
+    它得阻塞着等）。
+
+    **先确认本体活了，再起第二个。** 顺序反过来的话，本体压根没起来时，
+    第二个进程会照旧去等 120 秒面板、最后放弃 —— 用户多等两分钟，
+    而且日志里会多一条误导性的"等面板超时"。
+
+    OSError 要自己接住：入口文件不存在时 Popen 抛 FileNotFoundError，
+    而开关跑在 `--windowed` 的进程里、连 stderr 都没有，异常直接消失，
+    用户看到的还是"双击了但什么都没发生" —— 正是这个 bug 的原始症状。
+    接住它，才能走到"置灰 + 弹窗告诉他为什么"。
+    """
+    try:
+        # DETACHED_PROCESS 是必须的：不脱离的话，开关一退出监视进程会被一起带走
+        subprocess.Popen(relaunch_cmd(), cwd=str(ROOT),
+                         creationflags=_DETACHED, close_fds=True)
+        if not _wait_until_running(timeout):
+            return False
+        subprocess.Popen(relaunch_cmd() + ["--wait-open"], cwd=str(ROOT),
+                         creationflags=_DETACHED, close_fds=True)
+    except OSError:
+        log.exception("启动失败：入口不存在或不可执行（%s）", relaunch_cmd())
+        return False
+    return True
+
+
 def toggle() -> None:
-    """桌面快捷方式的入口：切换开/关，并把图标改成当前状态。"""
-    on_icon, off_icon = ensure_icons()
+    """桌面快捷方式的入口：切换开/关，并把图标改成**实际**状态。
+
+    用户报的 bug 就在这个函数里：原来是先写绿点、再起进程，之后不管
+    起没起来都不再看一眼。断网/待机后模型下不下来、采集线程根本没起来，
+    桌面图标却一直是绿的 —— 图标反映的是"用户按了开关"，
+    不是"程序在跑"。现在绿点只在确认进程真的起来之后才写。
+    """
     if running_pid() is not None:
         stop_running()
-        _write_lnk(off_icon)
+        sync_shortcut_icon(force=True, running=False)
         print("已关闭专注监视。")
         return
-    # DETACHED_PROCESS 是必须的：不脱离的话，开关一退出监视进程会被一起带走
-    subprocess.Popen(relaunch_cmd(), cwd=str(ROOT),
-                     creationflags=_DETACHED, close_fds=True)
-    _write_lnk(on_icon)
-    subprocess.Popen(relaunch_cmd() + ["--wait-open"],
-                     cwd=str(ROOT), creationflags=_DETACHED, close_fds=True)
-    print("已启动专注监视，面板就绪后会自动打开。")
+
+    if _start_engine():
+        sync_shortcut_icon(force=True, running=True)
+        print("已启动专注监视，面板就绪后会自动打开。")
+        return
+
+    # 没起来。把开关置灰，并且**必须**告诉用户为什么 —— 双击开关的是个
+    # 没有终端的进程，print 到不了任何地方。
+    sync_shortcut_icon(force=True, running=False)
+    _complain(
+        "专注监视没能启动",
+        "程序没有真正跑起来，桌面开关已置灰。\n\n"
+        "常见原因：\n"
+        "· 网络不通，首次运行要下载的人脸模型没下完\n"
+        "· 摄像头被别的程序占用\n"
+        "· 上次的进程还卡着（先双击一次关掉，再双击开启）\n\n"
+        "托盘图标右键 →「打开日志」，focus.log 里有具体原因。",
+    )
 
 
 def install_shortcut() -> None:
     """建桌面开关，并清掉早期的三个快捷方式。"""
-    on_icon, off_icon = ensure_icons()
+    global _lnk_state
+    icons = ensure_icons()
     d = _desktop()
     for old in ("专注监视面板.url", "启动专注监视.lnk", "停止专注监视.lnk"):
         p = d / old
         if p.exists():
             p.unlink()
             print(f"  已删除旧快捷方式: {old}")
-    _write_lnk(on_icon if running_pid() is not None else off_icon)
+    # 建的时候图标直接写成真实状态：程序正在跑（多半是托盘菜单里点的）
+    # 就是绿点，否则灰杠。_lnk_state 也要跟着对，不然随后的看门狗会白写一次。
+    running = running_pid() is not None
+    state = shortcut_state(running=running, stale=is_stale())
+    _write_lnk(icons[state])
+    _lnk_state = state
     print(f"  已创建桌面开关: {d / LNK_NAME}")
-    print("  双击 = 开/关切换；图标绿点=运行中，灰底横杠=已停止")
+    print("  双击 = 开/关切换；图标 绿点=在记录，黄叹号=在跑但没在记录，"
+          "灰杠=已停止")
 
 
 # ══════════════════════ 开机自启 ══════════════════════
@@ -2149,40 +2353,104 @@ def selftest() -> None:
     # 发布包里 TargetPath 指向一个不存在的文件，双击毫无反应、也没有报错。
     # _write_lnk() 本身只是拼一个 PowerShell 字符串，所以可以拦下 subprocess
     # 把那段命令抓出来验，不用真的建快捷方式、也不碰用户的桌面。
-    _ps_seen: list[str] = []
+    #
+    # 但**必须把 _desktop() 指到临时目录**：改成"先写临时文件再 os.replace"
+    # 之后，这个函数会真的落盘 —— 不指走的话，自检会往用户桌面上写一个
+    # 临时 .lnk 并把它改名成「专注监视.lnk」，等于悄悄覆盖/创建他的快捷方式。
+    # 上一版只拼字符串不落盘，所以没有这个副作用，改完就有了。
+    global _desktop
+    _real_desktop = _desktop
     _real_run = subprocess.run
+    _td = tempfile.TemporaryDirectory()
+    _desk = Path(_td.name)
+    _tmp_lnk = _desk / f"{LNK_NAME}.new.lnk"
+    _ps_seen: list[str] = []
 
     def _fake_run(cmd, *a, **k):
         if cmd and cmd[0] == "powershell":
             _ps_seen.append(" ".join(map(str, cmd)))
+            # 假装 PowerShell 真的把临时文件写出来了 —— _write_lnk 靠它
+            # 判断成功，然后 os.replace 到正式路径。
+            _tmp_lnk.write_bytes(b"lnk")
             return subprocess.CompletedProcess(cmd, 0, "", "")
         return _real_run(cmd, *a, **k)
 
     try:
         subprocess.run = _fake_run
+        _desktop = lambda: _desk
         _write_lnk(Path("dummy.ico"))                      # 默认 = relaunch_cmd()
         _write_lnk(Path("dummy.ico"),
                    cmd=[r"C:\sentinel\focus-monitor.exe", "--sentinel-arg"])
+
+        assert len(_ps_seen) == 2, \
+            f"_write_lnk 没有调用 powershell（{len(_ps_seen)} 次）"
+
+        # ① 默认那条：目标必须就是 relaunch_cmd() 的入口，且带 --toggle
+        _default_ps = _ps_seen[0]
+        assert "--toggle" in _default_ps, \
+            "快捷方式没带 --toggle —— 双击只会去起第二个实例，被单例挡住"
+        assert relaunch_cmd()[0] in _default_ps, \
+            "快捷方式的目标不是 relaunch_cmd() 的入口"
+
+        # ② 哨兵那条：传进来的命令必须被**原样采纳**。
+        #    这才是"目标不是写死的"的证明 —— 写死 .venv/Scripts/pythonw.exe 的
+        #    旧写法同样含 pythonw.exe，光看①根本区分不出来。
+        _sentinel_ps = _ps_seen[1]
+        assert r"C:\sentinel\focus-monitor.exe" in _sentinel_ps, \
+            "快捷方式的目标是写死的，没有采用传入的命令 —— " \
+            "发布包里 TargetPath 会指向不存在的文件，桌面开关直接是死的"
+        assert "--sentinel-arg" in _sentinel_ps, \
+            "传入命令的额外参数没被写进快捷方式"
+
+        # ③ 落盘走的是"临时文件 + 原子改名"：写的是临时路径，最终只留下正式文件。
+        #    这个函数现在会被程序运行时反复调用（启动/看门狗/退出兜底），
+        #    直接覆盖 Save() 中途失败会留下 0 字节的 .lnk，双击没反应也删不掉。
+        assert str(_tmp_lnk) in _ps_seen[1], \
+            "PowerShell 写的不是临时文件 —— 覆盖写不是原子的"
+        assert (_desk / LNK_NAME).exists(), "快捷方式没真的落到目标路径上"
+        assert not _tmp_lnk.exists(), \
+            "临时 .lnk 没被 os.replace 收走，桌面上会留下一个残留文件"
     finally:
         subprocess.run = _real_run
-    assert len(_ps_seen) == 2, f"_write_lnk 没有调用 powershell（{len(_ps_seen)} 次）"
+        _desktop = _real_desktop
+        _td.cleanup()
 
-    # ① 默认那条：目标必须就是 relaunch_cmd() 的入口，且带 --toggle
-    _default_ps = _ps_seen[0]
-    assert "--toggle" in _default_ps, \
-        "快捷方式没带 --toggle —— 双击只会去起第二个实例，被单例挡住"
-    assert relaunch_cmd()[0] in _default_ps, \
-        "快捷方式的目标不是 relaunch_cmd() 的入口"
+    # ── 桌面开关的图标必须反映「程序在不在跑」 ──
+    #
+    # 用户报的 bug：待机/断网之后再双击开关，图标是绿的，但程序根本没起来。
+    # 根因是 toggle() 先写绿点、再起进程，之后再也不回头看。所以这组断言钉的是
+    # **图标只由观测到的状态决定，不由"用户按过开关"决定**。
+    assert shortcut_state(running=False, stale=False) == "off"
+    assert shortcut_state(running=False, stale=True) == "off", \
+        "进程都没了还显示黄叹号 —— 没在跑就该一律灰杠"
+    assert shortcut_state(running=True, stale=False) == "on"
+    assert shortcut_state(running=True, stale=True) == "alert", \
+        "在跑但没数据必须变黄叹号，否则和健康状态看不出区别"
 
-    # ② 哨兵那条：传进来的命令必须被**原样采纳**。
-    #    这才是"目标不是写死的"的证明 —— 写死 .venv/Scripts/pythonw.exe 的
-    #    旧写法同样含 pythonw.exe，光看①根本区分不出来。
-    _sentinel_ps = _ps_seen[1]
-    assert r"C:\sentinel\focus-monitor.exe" in _sentinel_ps, \
-        "快捷方式的目标是写死的，没有采用传入的命令 —— " \
-        "发布包里 TargetPath 会指向不存在的文件，桌面开关直接是死的"
-    assert "--sentinel-arg" in _sentinel_ps, \
-        "传入命令的额外参数没被写进快捷方式"
+    # 三个状态必须是**三个不同的文件**：.lnk 的 IconLocation 存的是路径，
+    # Windows 按路径缓存图标 —— 同一个路径只换内容，桌面往往不刷新，
+    # 于是"图标改了、用户看到的还是绿的"。旧的 ensure_icons() 就是这种写法。
+    _icons = ensure_icons()
+    assert set(_icons) == set(_ICON_STATES), _icons
+    assert len({p.read_bytes() for p in _icons.values()}) == 3, \
+        "三个状态的图标内容一模一样 —— 桌面开关分不出在跑/没在跑"
+
+    # 两条都容易写反的规则
+    assert not should_sync_shortcut(False, "on", None, True), \
+        "快捷方式不存在时不该替用户凭空建一个（不是所有人都要桌面开关）"
+    assert not should_sync_shortcut(True, "on", "on", False), \
+        "状态没变不该重写 —— 看门狗每 30 秒调一次，每次写都白起一次 PowerShell"
+    assert should_sync_shortcut(True, "alert", "on", False), "状态变了必须重写"
+    assert should_sync_shortcut(True, "on", "on", True), "force 必须能强制写"
+
+    # 「起没起来」要真的去等、去确认。probe 可注入，否则"失败"那一支在开发机上
+    # 永远没人跑过：本机真开着监视时 running_pid() 恒为真。
+    assert _wait_until_running(timeout=1.0, probe=lambda: 1234) is True, \
+        "进程起来了却判定失败 —— 绿点会永远写不出来"
+    _t0 = time.time()
+    assert _wait_until_running(timeout=0.3, probe=lambda: None) is False, \
+        "进程根本没起来却判定成功 —— 正是用户报的那个 bug"
+    assert time.time() - _t0 < 5.0, "确认失败也不该拖很久"
 
     # ── 结构性断言：采集循环里的「视觉链路」必须还连着 ──
     #
@@ -2226,6 +2494,21 @@ def selftest() -> None:
                 < _loop_src.index("vision.read_face(proc)")), \
             "闭眼计时的复位跑到读脸之后了 —— 暂停后恢复时它不会执行，" \
             "陈旧的起点会让「疲劳」在恢复的瞬间就误报"
+
+        # 桌面开关：绿点必须是**确认启动成功**的结果，不能是"用户按了开关"。
+        #
+        # 这条行为上测不到（toggle 要真的起进程、真的弹窗，还不能真的动用户的
+        # 桌面），只能钉顺序：确认动作 _start_engine 必须排在写绿点之前，
+        # 而且写绿点只能有一处。用户报的"待机/断网后双击开关，图标是绿的
+        # 但程序没在跑"就是旧写法（先写绿点、再起进程）的直接后果。
+        _toggle_src = _src[_src.index("def toggle() -> None:")
+                           :_src.index("def install_shortcut")]
+        assert _toggle_src.count("running=True") == 1, \
+            "toggle() 里有多处写绿点 —— 绿点只该出现在确认启动成功那一处"
+        assert _toggle_src.index("_start_engine") < _toggle_src.index("running=True"), \
+            "toggle() 在确认进程起来之前就写了绿点 —— 正是用户报的那个 bug"
+        assert _toggle_src.count("sync_shortcut_icon") >= 3, \
+            "toggle() 的三条出路（关掉 / 起成功 / 起失败）都要同步图标"
 
     # 版本号有两处副本，必须一致 —— __version__ 正上方那行注释就是这么写的。
     # 但注释看得见、没人会去看：上游 aaa2c0a「v0.2.3: 版本号跟进」就只改了
@@ -2387,6 +2670,9 @@ def main() -> None:
     finally:
         mon.stop()
         PID_PATH.unlink(missing_ok=True)
+        # 退出兜底：进程都走了，桌面开关不能还挂着绿点。走的是同一条
+        # 观测逻辑（running=False → 灰杠），所以退出路径不止这一条也没关系。
+        sync_shortcut_icon(force=True, running=False)
         log.info("专注监视已退出")
     print("已退出，运行 `uv run focus.py --report` 看报告")
 
