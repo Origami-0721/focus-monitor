@@ -1000,6 +1000,42 @@ class Monitor(threading.Thread):
             # 摄像头 read / 重开 那些分支有自己的 continue 语义，
             # 混进 try 里会改变它们的退出路径，得不偿失。
             try:
+                # ── 视觉：人脸 / 姿态 ──
+                #
+                # 这两段必须放在这个 try 里，不能放外面：except 那一支本来就写着
+                # "非数据库异常（模型、解码、算法）几乎总是瞬时或单帧的" ——
+                # 模型推理正是这里最可能抛异常的东西，一个坏帧不该杀掉采集。
+                #
+                # 为什么给这段写了这么多注释：它在一次采集循环重构里被整段删掉过
+                # （vision 调用 + 四个缓冲区的填充一起没了，消费端却留着）。
+                # 后果是 face_buf / tilt_buf / _ear_hist 永远为空 → present 恒为
+                # False → decide() 只会返回 distracted / away，**专注、中性、伏案、
+                # 疲劳四种状态一个都出不来**，而自检全绿 —— 因为它测的是 decide()
+                # 和 ear_threshold() 本身，测不出"输入根本没接上"。
+                # 现在有两道防线盯这个：自检末尾的结构性断言（搜"视觉链路断了"）
+                # 负责"生产端被删了"，CI 里的 smoke_pipeline.py 负责真跑一遍、
+                # 确认喂了正对屏幕的人脸之后确实产出「专注」。
+                if now - last_face >= 1.0 / FACE_FPS:
+                    last_face = now
+                    got = vision.read_face(proc)
+                    if got:
+                        face_buf.append(got)
+                        scale_hist.append(got["scale"])
+                        self._ear_hist.append(got["ear"])
+                        base = float(np.median(scale_hist)) if scale_hist else got["scale"]
+                        lean = got["scale"] / base if base > 1e-6 else 1.0
+                        closed_since = (None if got["ear"] >= self._ear_thr
+                                        else (closed_since or now))
+                        away_since = None
+                    else:
+                        away_since = away_since or now
+
+                if now - last_pose >= 1.0 / POSE_FPS:
+                    last_pose = now
+                    tilt = vision.read_posture(proc)
+                    if tilt is not None:
+                        tilt_buf.append(tilt)
+
                 # 每秒结算一次
                 if now - last_flush >= 1.0:
                     last_flush = now
@@ -1660,6 +1696,7 @@ def selftest() -> None:
                    "应用使用记录", "占活跃", "时段"):
         assert needle in html, f"报告缺少 {needle}"
     assert html.count("<html") == 1
+
     # 时长全为 0 的数据不能把报告搞崩。
     #
     # 第三轮审查把"hour_avg 除零"列进"未能确认的项"，当时只加了个防御性守卫。
@@ -1920,6 +1957,34 @@ def selftest() -> None:
     assert not should_prompt_rating(0.0, False), "没有可评的块就不弹"
     assert not should_prompt_rating(FLOW_QUIET + 3600, False, 999999), \
         "没有可评的块时，上限也不能把它放行"
+
+    # ── 结构性断言：采集循环里的「视觉链路」必须还连着 ──
+    #
+    # 来自一次真实事故：采集循环重构时，把 vision.read_face / read_posture 和
+    # 四个缓冲区的填充**整段删掉了，消费端却留着**。于是 face_buf / tilt_buf /
+    # _ear_hist 永远为空 → present 恒为 False → decide() 只会返回
+    # distracted / away —— 专注 / 中性 / 伏案 / 疲劳四种状态一个都出不来。
+    #
+    # 当时自检**全绿**。因为它测的是 decide() 和 ear_threshold() 本身，
+    # 而这两个函数的逻辑确实没问题，坏的是"根本没人喂数据给它"。
+    # 纯逻辑断言对"接线断了"这一类故障是盲的，所以补一条只验证接线、
+    # 不验证行为的断言 —— 这正是当时丢掉的那个东西。
+    #
+    # 只扫 def selftest 之前的源码：否则下面这些针脚字符串会自己命中自己
+    # （它们本身就是本函数的字面量），断言就变成永远为真的摆设。
+    _self_src = ROOT / "focus.py"
+    if _self_src.exists():                 # 冻结成 exe 后源码不在旁边，跳过
+        _src = _self_src.read_text(encoding="utf-8")
+        _loop_src = _src[:_src.index("def selftest")]
+        for _needle in (
+            "vision.read_face(proc)", "vision.read_posture(proc)",
+            "face_buf.append(got)", "tilt_buf.append(tilt)",
+            'scale_hist.append(got["scale"])', 'self._ear_hist.append(got["ear"])',
+            'closed_since = (None if got["ear"] >= self._ear_thr',
+        ):
+            assert _needle in _loop_src, \
+                f"采集循环的视觉链路断了：找不到 {_needle!r}" \
+                "（生产端被删了、消费端还在，会静默只产出走神/离开）"
 
     # 版本号有两处副本，必须一致 —— __version__ 正上方那行注释就是这么写的。
     # 但注释看得见、没人会去看：上游 aaa2c0a「v0.2.3: 版本号跟进」就只改了
