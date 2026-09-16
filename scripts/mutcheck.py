@@ -39,8 +39,9 @@ SKIP = (".venv", "__pycache__", ".git", "icons", "models", "build", "dist",
         "focus.db", "focus.db-*", "focus.log", "focus.log.*", "focus.pid",
         "focus-backup-*.db*", "_selftest*.db*", "report.html", "focus-*.csv")
 
-# (说明, 原片段, 改坏后的片段)
+# (说明, 原片段, 改坏后的片段[, 目标文件])
 # 原片段必须在源码里**只出现一次**，否则拒绝变异（改错了地方会给出假结果）。
+# 目标文件默认为 focus.py；要变异别的文件就补第 4 项（相对工程根）。
 MUTATIONS: list[tuple[str, str, str]] = [
     (
         "shortcut_state 忽略 running（进程没了也显示绿/黄）",
@@ -86,6 +87,48 @@ MUTATIONS: list[tuple[str, str, str]] = [
         '    if _start_engine():\n'
         '        print("已启动专注监视，面板就绪后会自动打开。")\n',
     ),
+    (
+        "_switch_wal 无条件返回 True（假定切成功，其实库还在 delete 模式）",
+        '    return journal_mode(conn) == "wal"\n',
+        "    return True\n",
+    ),
+    (
+        "open_db 不再验证/切换 WAL（老代码的形态：裸 connect）",
+        '    if journal_mode(conn) != "wal":\n',
+        "    if False:\n",
+    ),
+    (
+        "main() 不再做启动时的 WAL 迁移（采集起来后切不动）",
+        "    ensure_wal()\n",
+        "",
+    ),
+    (
+        "采集循环的清理不在 finally 里（线程一死就把库锁死）",
+        "        finally:\n            # 无论怎么退出都要**关掉写连接**",
+        "        except BaseException:\n"
+        "            raise\n"
+        "        if True:\n"
+        "            # 无论怎么退出都要**关掉写连接**",
+    ),
+    (
+        "面板的 500 用 log.error 代替 log.exception（记了日志，但没栈）",
+        '            log.exception("面板处理 GET %s 出错", raw_path)\n',
+        '            log.error("面板处理 GET %s 出错", raw_path)\n',
+        "dashboard.py",
+    ),
+    (
+        "面板的 500 分支忘了补日志配置（单独跑面板时栈直接消失）",
+        "        except Exception as exc:                       # 单次请求出错不该带崩服务\n"
+        "            _ensure_log()\n",
+        "        except Exception as exc:                       # 单次请求出错不该带崩服务\n",
+        "dashboard.py",
+    ),
+    (
+        "面板 POST 的 500 分支不记栈（只改了 GET 那条）",
+        '            log.exception("面板处理 POST %s 出错", path)\n',
+        "",
+        "dashboard.py",
+    ),
 ]
 
 
@@ -122,13 +165,15 @@ def main() -> int:
     print(f"基线（未变异）: 自检通过，共 {len(MUTATIONS)} 条变异待验\n")
 
     escaped: list[str] = []
-    for name, old, new in MUTATIONS:
+    for mut in MUTATIONS:
+        name, old, new = mut[0], mut[1], mut[2]
+        rel = mut[3] if len(mut) > 3 else "focus.py"
         with tempfile.TemporaryDirectory() as td:
             tree = copy_project(Path(td) / "m")
-            f = tree / "focus.py"
+            f = tree / rel
             src = f.read_text(encoding="utf-8")
             if src.count(old) != 1:
-                print(f"?? {name}\n     原片段出现 {src.count(old)} 次，无法变异")
+                print(f"?? {name}\n     在 {rel} 里出现 {src.count(old)} 次，无法变异")
                 escaped.append(name)
                 continue
             f.write_text(src.replace(old, new), encoding="utf-8")

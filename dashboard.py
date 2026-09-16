@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html
 import http.server
+import logging
 import re
 import secrets
 import threading
@@ -31,6 +32,26 @@ from report import (FLOW_MIN, SESSION_GAP, _dur, _hm, _label, _mdhm,
 DEFAULT_PORT = 8787
 LIVE_WINDOW = 30 * 3600   # 实时面板只看最近 30 小时，够覆盖"今天"且不必全表扫
 STALE_AFTER = 90.0        # 超过这么久没新样本，就认为记录程序挂了
+
+log = logging.getLogger("focus.dashboard")
+
+_log_ready = False
+
+
+def _ensure_log() -> None:
+    """面板被单独跑起来（python dashboard.py）时，没人调过 setup_log。
+
+    不补这一次的话，500 的栈只会落到 stderr —— 而 pythonw 启动时根本没有
+    stderr，等于什么都没留下。这就是"自评分打不开、日志里却查不到原因"的
+    成因：页面把异常字符串吞了，日志里一行都没有。
+    """
+    global _log_ready
+    if _log_ready:
+        return
+    _log_ready = True
+    if not logging.getLogger().handlers:               # 已有配置就别重来
+        focus.setup_log()
+
 
 _server: http.server.ThreadingHTTPServer | None = None
 
@@ -702,7 +723,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send("<h1>404</h1>", 404)
         except Exception as exc:                       # 单次请求出错不该带崩服务
-            self._send(f"<h1>500</h1><pre>{html.escape(str(exc))}</pre>", 500)
+            _ensure_log()
+            # 必须记栈。之前这里只把 str(exc) 塞进页面，日志里一个字都没有 ——
+            # 用户截图发过来只有 "database is locked" 一句，看不到是从哪条路径
+            # 抛的、也看不到 concurrent 的上下文。页面留着原因是给用户看的，
+            # 完整栈是给排查用的，两者都要。
+            log.exception("面板处理 GET %s 出错", raw_path)
+            self._send(f"<h1>500</h1><pre>{html.escape(str(exc))}</pre>"
+                       "<p>完整栈已写进 focus.log。</p>", 500)
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._guard():
@@ -761,7 +789,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             focus.save_config(cfg)                     # 立刻 apply，监视进程随后也会重载
             self._redirect("/settings?saved=1")
         except Exception as exc:
-            self._send(f"<h1>500</h1><pre>{html.escape(str(exc))}</pre>", 500)
+            _ensure_log()
+            log.exception("面板处理 POST %s 出错", path)
+            self._send(f"<h1>500</h1><pre>{html.escape(str(exc))}</pre>"
+                       "<p>完整栈已写进 focus.log。</p>", 500)
 
     def log_message(self, *args) -> None:
         pass                                           # 别把控制台刷爆

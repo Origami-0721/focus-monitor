@@ -745,6 +745,73 @@ def open_camera(preferred: int | None = None) -> cv2.VideoCapture:
 # dashboard /live 每 3 秒（读）、/report 全表扫（读）。
 # 全部走这一个入口，PRAGMA 才有一处可改，不会漏掉某个连接点。
 
+def journal_mode(conn: sqlite3.Connection) -> str:
+    """读回连接当前实际的日志模式。"""
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    return str(row[0]).lower() if row else "?"
+
+
+_wal_warned = False
+
+
+def _switch_wal(conn: sqlite3.Connection) -> bool:
+    """在 conn 上尝试切到 WAL，**读回实际模式**判断成败。
+
+    为什么不能"发一条 PRAGMA 就当成功了"：`PRAGMA journal_mode=WAL` 需要
+    **排他锁**，拿不到就抛 `database is locked` —— 而 `busy_timeout` 在这条
+    PRAGMA 上**不起作用**。实测：旁边有一个持写锁的连接（BEGIN IMMEDIATE）
+    时，它在 **0.0 秒**就抛了，一点不等。
+
+    失败时必须如实返回 False。假装成功的话，库其实还留在
+    `journal_mode=delete` —— 那个模式**读写互斥**，面板/报告每一条读都可能
+    撞锁，用户看到的就是「自评分打不开：database is locked」，而且这个状态
+    会一直持续下去（没人会再去切第二次）。
+    """
+    global _wal_warned
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError as exc:
+        if not _wal_warned:
+            _wal_warned = True
+            log.warning(
+                "切 WAL 失败（库仍是 %s）：%s\n"
+                "  这个模式下读写互斥，面板和报告随时可能报 database is locked。"
+                "采集线程攒批提交会连续持有写锁十几秒，运行期基本切不动 —— "
+                "重启一次即可（启动时采集还没起来，没有竞争）。",
+                journal_mode(conn), exc)
+        return False
+    return journal_mode(conn) == "wal"
+
+
+def ensure_wal(timeout: float = 20.0) -> bool:
+    """把 focus.db 切到 WAL 并**确认**成功；返回是否处于 WAL。
+
+    **必须在采集线程起来之前调用**（main 里就是这么用的）。这是唯一能可靠
+    切成功的时机：没有别的连接持锁。库一旦切过去就是持久的，之后每次启动
+    只是读一下模式，几乎零成本。
+
+    为什么值得单独立一个入口，而不是靠 open_db 每次顺手切：采集线程每
+    SAMPLE_COMMIT_EVERY 条才 commit 一次，也就是**连续持有写锁十几秒**，
+    那段时间里切模式必然失败。所以运行期的尝试只是兜底，
+    真正的迁移必须发生在启动时。
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    try:
+        before = journal_mode(conn)
+        if before == "wal":
+            return True
+        deadline = time.time() + timeout
+        while True:
+            if _switch_wal(conn):
+                log.info("focus.db 已切到 WAL（原模式 %s）", before)
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
+    finally:
+        conn.close()
+
+
 def open_db(path: Path | None = None, readonly: bool = False,
             timeout: float = 15.0) -> sqlite3.Connection:
     """打开 focus.db，统一设好并发相关的 PRAGMA。
@@ -770,12 +837,14 @@ def open_db(path: Path | None = None, readonly: bool = False,
 
     conn = sqlite3.connect(path, timeout=timeout)
     conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.DatabaseError as exc:
-        # 网络盘 / 只读挂载上 WAL 可能建不起来。降级继续跑，
-        # 但记一笔 —— 否则"为什么还是经常撞锁"会查不出来。
-        log.warning("无法启用 WAL（降级为默认日志模式）：%s", exc)
+    # 先读回实际模式再决定要不要切。库已经是 WAL 时这一步只是读一下文件头，
+    # 不去抢锁，所以挂在每个连接上也不心疼。
+    if journal_mode(conn) != "wal":
+        # 运行期切多半切不动（见 _switch_wal / ensure_wal 的说明），但值得试
+        # 一次：这个进程可能没走 main（--report、--dashboard 单独跑），
+        # 也可能上一次是旧版本进程留下的 delete 模式。
+        if _switch_wal(conn):
+            log.info("focus.db 已切到 WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -963,212 +1032,223 @@ class Monitor(threading.Thread):
         last_face_seen = 0.0
         lean = 0.0
 
-        while self.running:
-            # 暂停必须真的把摄像头释放掉。以前只是跳过后处理，read 照跑，
-            # 指示灯还亮着 —— 用户以为关了其实没关。
-            if self.paused:
-                if cap is not None:
-                    cap.release()
-                    cap = None
-                    log.info("已暂停，摄像头已释放")
-                beat()                # 暂停时也不刷"停摆"告警：这是预期状态
-                time.sleep(0.5)
-                continue
-            if cap is None:
-                try:
-                    cap = open_camera(self.camera)
-                    log.info("已恢复，摄像头已重新打开")
-                except RuntimeError:
-                    time.sleep(3)
-                    continue
-
-            ok, frame = cap.read()
-            if not ok:
-                # 休眠唤醒后、或摄像头被别的程序抢走时，read 会一直失败。
-                # 置空交给循环开头重开，重开逻辑只有一处。
-                fails += 1
-                if fails > 100:
-                    cap.release()
-                    cap = None
-                    fails = 0
-                    continue
-                time.sleep(0.05)
-                continue
-            fails = 0
-
-            now = time.time()
-            beat()                    # 心跳：告诉托盘"我还活着"，见 is_stale()
-            h, w = frame.shape[:2]
-            proc = cv2.resize(frame, (PROC_WIDTH, int(h * PROC_WIDTH / w)))
-
-            # 一次帧处理出错绝不能带走整个采集线程。
-            # 以前循环体整段裸露在外，一次 sqlite3 "database is locked" 就会
-            # 沿 run() 抛出、被 excepthook 记一行日志、线程结束 —— 用户只看到
-            # 图标慢慢变黄，唯一线索是 focus.log 里一行栈。
-            # 现在把每帧的处理包起来：撞锁退避重试，其他异常跳过这一帧。
-            #
-            # 只在"快要落库"那一段（每秒结算）里包，不包整个循环体：
-            # 摄像头 read / 重开 那些分支有自己的 continue 语义，
-            # 混进 try 里会改变它们的退出路径，得不偿失。
-            try:
-                # ── 视觉：人脸 / 姿态 ──
-                #
-                # 这两段必须放在这个 try 里，不能放外面：except 那一支本来就写着
-                # "非数据库异常（模型、解码、算法）几乎总是瞬时或单帧的" ——
-                # 模型推理正是这里最可能抛异常的东西，一个坏帧不该杀掉采集。
-                #
-                # 为什么给这段写了这么多注释：它在一次采集循环重构里被整段删掉过
-                # （vision 调用 + 四个缓冲区的填充一起没了，消费端却留着）。
-                # 后果是 face_buf / tilt_buf / _ear_hist 永远为空 → present 恒为
-                # False → decide() 只会返回 distracted / away，**专注、中性、伏案、
-                # 疲劳四种状态一个都出不来**，而自检全绿 —— 因为它测的是 decide()
-                # 和 ear_threshold() 本身，测不出"输入根本没接上"。
-                # 现在有两道防线盯这个：自检末尾的结构性断言（搜"视觉链路断了"）
-                # 负责"生产端被删了"，CI 里的 smoke_pipeline.py 负责真跑一遍、
-                # 确认喂了正对屏幕的人脸之后确实产出「专注」。
-                if now - last_face >= 1.0 / FACE_FPS:
-                    last_face = now
-                    # 上一次真的看到脸已经过去太久了 —— 中间那段盲区里的闭眼计时
-                    # 不该接着累加，作废它。
-                    #
-                    # closed_since 只由"看到脸且 EAR 低"推进，丢脸时原本不动它，
-                    # 于是"闭眼 2 秒 → 转头出画 3 秒 → 回来还闭着眼"会被算成
-                    # 连续闭眼 5 秒，人刚回来 1 秒就记一条「疲劳」（实测复现，
-                    # 见 smoke_pipeline.py 里那段脚本化的时间线）。拦住它的那条
-                    # away_for >= AWAY_FACE 是 20 秒，拦不住 3 秒的短转头。
-                    #
-                    # 判据是"盲区超过了宽限期"，不是"有没有掉帧"：单帧抖动
-                    # （now - last_face_seen 只有 0.1 秒）不清零，真断了才清零。
-                    # 留宽限是必须的 —— FACE_FPS=10 下单帧丢失很常见，掉一帧就
-                    # 清零的话，真犯困时反而永远攒不满 EAR_SUSTAIN。
-                    #
-                    # 为什么不怕把真疲劳一起清掉：脸不在画面里的时候 decide()
-                    # 本来就返回 distracted，closed_for 再大也轮不到它说话。
-                    #
-                    # 放在"重新开始观察"这一侧（而不是丢脸那一侧）是有意的：
-                    # 丢脸、暂停后恢复、摄像头重开、休眠唤醒都归这一条管 ——
-                    # 它们共同的特征就是"这一帧之前有一段时间没在观察"。
-                    # 写在丢脸那一支的话，暂停那条路径根本走不到（它在循环开头
-                    # 就 continue 了），恢复时那个陈旧的 closed_since 会直接命中。
-                    if (closed_since is not None
-                            and now - last_face_seen > FACE_LOSS_GRACE):
-                        closed_since = None
-                    got = vision.read_face(proc)
-                    if got:
-                        face_buf.append(got)
-                        scale_hist.append(got["scale"])
-                        self._ear_hist.append(got["ear"])
-                        base = float(np.median(scale_hist)) if scale_hist else got["scale"]
-                        lean = got["scale"] / base if base > 1e-6 else 1.0
-                        closed_since = (None if got["ear"] >= self._ear_thr
-                                        else (closed_since or now))
-                        away_since = None
-                        last_face_seen = now
-                    else:
-                        away_since = away_since or now
-
-                if now - last_pose >= 1.0 / POSE_FPS:
-                    last_pose = now
-                    tilt = vision.read_posture(proc)
-                    if tilt is not None:
-                        tilt_buf.append(tilt)
-
-                # 每秒结算一次
-                if now - last_flush >= 1.0:
-                    last_flush = now
-                    maybe_reload_config()      # 设置页改完立即生效，不用重启
-                    self._ear_thr = ear_threshold(self._ear_hist)
-                    if now - last_beat >= 600:
-                        # 心跳：进程要是被静默干掉，日志里至少能看出它活到几点
-                        last_beat = now
-                        log.info("心跳：本次运行累计 %d 条样本，当前状态 %s",
-                                 n_rows, self.state)
-                    if now - last_rating_check >= 300:
-                        last_rating_check = now
-                        self._prompt_rating(now)
-                    present = len(face_buf) > 0
-                    yaw = float(np.median([f["yaw"] for f in face_buf])) if face_buf else 0.0
-                    pitch = float(np.median([f["pitch"] for f in face_buf])) if face_buf else 0.0
-                    ear = float(np.median([f["ear"] for f in face_buf])) if face_buf else 0.0
-                    tilt = float(np.median(tilt_buf)) if tilt_buf else 0.0
-                    closed_for = (now - closed_since) if closed_since else 0.0
-                    away_for = (now - away_since) if away_since else 0.0
-                    exe, title = active_window()
-                    kind = classify_app(exe, title)
-
-                    st = decide(face_present=present, yaw=yaw, pitch=pitch,
-                                closed_for=closed_for, idle_sec=idle_seconds(),
-                                app_kind=kind, away_for=away_for)
-
-                    # 离开期间降频落库。**判断必须在 INSERT 之前** ——
-                    # 原来这段写在 commit() 之后，样本早就落库了，continue
-                    # 只能跳过状态更新，等于降频从未生效（整夜待机照样每 2 秒
-                    # 一条，一晚一万四千行）。降频要真的省下写入，就必须
-                    # 在写库之前决定写不写。
-                    #
-                    # 例外：状态**刚**变成 away 的那一条永远要写，否则"离开"
-                    # 这个事件本身就不落库了，报告里会看到"专注 → 直接没有"。
-                    away_throttled = (st == "away" and self.state == "away"
-                                      and now - last_away_write < AWAY_WRITE_EVERY)
-                    if away_throttled:
-                        # 样本不写库，但缓冲清理照旧 —— 内存操作，跟落库无关。
-                        face_buf.clear()
-                    else:
-                        conn.execute(
-                            "INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                            (now, st, exe, title[:200], yaw, pitch, ear, tilt,
-                             lean, 1 if present else 0, idle_seconds()))
-                        n_rows += 1
-                        last_away_write = now
-                        # 攒批提交：每 SAMPLE_COMMIT_EVERY 条才 commit 一次。
-                        # 每条单独 commit 在 journal_mode=delete 下等于每条一次
-                        # fsync + 一次持写锁，把撞锁概率放大十几倍。
-                        if n_rows % SAMPLE_COMMIT_EVERY == 0:
-                            conn.commit()
-
-                        # 跟踪"这段连续投入持续了多久"，评分提醒靠它决定要不要闭嘴
-                        if st in ENGAGED:
-                            if self._engaged_since is None:
-                                self._engaged_since = now
-                            self._engaged_run = now - self._engaged_since
-                        else:
-                            self._engaged_since = None
-                            self._engaged_run = 0.0
-
-                        if st != self.state:
-                            self.state = st
-                            self.on_state(st)
-
-                        face_buf.clear()
-                        # tilt_buf 不清空：留成 4 秒滚动窗口，中位数才压得住单帧跳变
-                db_fails = 0
-            except sqlite3.OperationalError as exc:
-                # 撞锁是预期内的（读数进程很多），退避后继续，不致命。
-                # 退避上限 5 秒：长时间锁定通常意味着别的进程开了长事务，
-                # 无限指数退避会让采集"看起来"死掉，反而更难查。
-                db_fails += 1
-                if db_fails in (1, 10, 100) or db_fails % 500 == 0:
-                    log.warning("写库失败第 %d 次（已退避重试）：%s",
-                                db_fails, exc)
-                time.sleep(min(0.5 * db_fails, 5.0))
-                continue
-            except Exception:
-                # 非数据库异常（模型、解码、算法）几乎总是瞬时或单帧的，
-                # 记日志后继续 —— 让一个坏帧杀掉采集是明显的错误取舍。
-                log.exception("本帧处理出错，已跳过")
-                time.sleep(0.05)
-                continue
-
-        if cap is not None:        # 暂停状态下退出时它已经是 None 了
-            cap.release()
-        # finally 里关连接：上面 try 里 continue 不会走到这儿，
-        # 但真要是有没接住的异常穿出去，至少别把写连接和 WAL 文件晾着。
         try:
-            conn.commit()          # 把不足一批的尾巴补上，否则最后十几条白采
-        except sqlite3.Error:
-            log.exception("退出前补提交失败")
-        conn.close()
-        log.info("采集线程已停止")
+            while self.running:
+                # 暂停必须真的把摄像头释放掉。以前只是跳过后处理，read 照跑，
+                # 指示灯还亮着 —— 用户以为关了其实没关。
+                if self.paused:
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                        log.info("已暂停，摄像头已释放")
+                    beat()                # 暂停时也不刷"停摆"告警：这是预期状态
+                    time.sleep(0.5)
+                    continue
+                if cap is None:
+                    try:
+                        cap = open_camera(self.camera)
+                        log.info("已恢复，摄像头已重新打开")
+                    except RuntimeError:
+                        time.sleep(3)
+                        continue
+
+                ok, frame = cap.read()
+                if not ok:
+                    # 休眠唤醒后、或摄像头被别的程序抢走时，read 会一直失败。
+                    # 置空交给循环开头重开，重开逻辑只有一处。
+                    fails += 1
+                    if fails > 100:
+                        cap.release()
+                        cap = None
+                        fails = 0
+                        continue
+                    time.sleep(0.05)
+                    continue
+                fails = 0
+
+                now = time.time()
+                beat()                    # 心跳：告诉托盘"我还活着"，见 is_stale()
+                h, w = frame.shape[:2]
+                proc = cv2.resize(frame, (PROC_WIDTH, int(h * PROC_WIDTH / w)))
+
+                # 一次帧处理出错绝不能带走整个采集线程。
+                # 以前循环体整段裸露在外，一次 sqlite3 "database is locked" 就会
+                # 沿 run() 抛出、被 excepthook 记一行日志、线程结束 —— 用户只看到
+                # 图标慢慢变黄，唯一线索是 focus.log 里一行栈。
+                # 现在把每帧的处理包起来：撞锁退避重试，其他异常跳过这一帧。
+                #
+                # 只在"快要落库"那一段（每秒结算）里包，不包整个循环体：
+                # 摄像头 read / 重开 那些分支有自己的 continue 语义，
+                # 混进 try 里会改变它们的退出路径，得不偿失。
+                try:
+                    # ── 视觉：人脸 / 姿态 ──
+                    #
+                    # 这两段必须放在这个 try 里，不能放外面：except 那一支本来就写着
+                    # "非数据库异常（模型、解码、算法）几乎总是瞬时或单帧的" ——
+                    # 模型推理正是这里最可能抛异常的东西，一个坏帧不该杀掉采集。
+                    #
+                    # 为什么给这段写了这么多注释：它在一次采集循环重构里被整段删掉过
+                    # （vision 调用 + 四个缓冲区的填充一起没了，消费端却留着）。
+                    # 后果是 face_buf / tilt_buf / _ear_hist 永远为空 → present 恒为
+                    # False → decide() 只会返回 distracted / away，**专注、中性、伏案、
+                    # 疲劳四种状态一个都出不来**，而自检全绿 —— 因为它测的是 decide()
+                    # 和 ear_threshold() 本身，测不出"输入根本没接上"。
+                    # 现在有两道防线盯这个：自检末尾的结构性断言（搜"视觉链路断了"）
+                    # 负责"生产端被删了"，CI 里的 smoke_pipeline.py 负责真跑一遍、
+                    # 确认喂了正对屏幕的人脸之后确实产出「专注」。
+                    if now - last_face >= 1.0 / FACE_FPS:
+                        last_face = now
+                        # 上一次真的看到脸已经过去太久了 —— 中间那段盲区里的闭眼计时
+                        # 不该接着累加，作废它。
+                        #
+                        # closed_since 只由"看到脸且 EAR 低"推进，丢脸时原本不动它，
+                        # 于是"闭眼 2 秒 → 转头出画 3 秒 → 回来还闭着眼"会被算成
+                        # 连续闭眼 5 秒，人刚回来 1 秒就记一条「疲劳」（实测复现，
+                        # 见 smoke_pipeline.py 里那段脚本化的时间线）。拦住它的那条
+                        # away_for >= AWAY_FACE 是 20 秒，拦不住 3 秒的短转头。
+                        #
+                        # 判据是"盲区超过了宽限期"，不是"有没有掉帧"：单帧抖动
+                        # （now - last_face_seen 只有 0.1 秒）不清零，真断了才清零。
+                        # 留宽限是必须的 —— FACE_FPS=10 下单帧丢失很常见，掉一帧就
+                        # 清零的话，真犯困时反而永远攒不满 EAR_SUSTAIN。
+                        #
+                        # 为什么不怕把真疲劳一起清掉：脸不在画面里的时候 decide()
+                        # 本来就返回 distracted，closed_for 再大也轮不到它说话。
+                        #
+                        # 放在"重新开始观察"这一侧（而不是丢脸那一侧）是有意的：
+                        # 丢脸、暂停后恢复、摄像头重开、休眠唤醒都归这一条管 ——
+                        # 它们共同的特征就是"这一帧之前有一段时间没在观察"。
+                        # 写在丢脸那一支的话，暂停那条路径根本走不到（它在循环开头
+                        # 就 continue 了），恢复时那个陈旧的 closed_since 会直接命中。
+                        if (closed_since is not None
+                                and now - last_face_seen > FACE_LOSS_GRACE):
+                            closed_since = None
+                        got = vision.read_face(proc)
+                        if got:
+                            face_buf.append(got)
+                            scale_hist.append(got["scale"])
+                            self._ear_hist.append(got["ear"])
+                            base = float(np.median(scale_hist)) if scale_hist else got["scale"]
+                            lean = got["scale"] / base if base > 1e-6 else 1.0
+                            closed_since = (None if got["ear"] >= self._ear_thr
+                                            else (closed_since or now))
+                            away_since = None
+                            last_face_seen = now
+                        else:
+                            away_since = away_since or now
+
+                    if now - last_pose >= 1.0 / POSE_FPS:
+                        last_pose = now
+                        tilt = vision.read_posture(proc)
+                        if tilt is not None:
+                            tilt_buf.append(tilt)
+
+                    # 每秒结算一次
+                    if now - last_flush >= 1.0:
+                        last_flush = now
+                        maybe_reload_config()      # 设置页改完立即生效，不用重启
+                        self._ear_thr = ear_threshold(self._ear_hist)
+                        if now - last_beat >= 600:
+                            # 心跳：进程要是被静默干掉，日志里至少能看出它活到几点
+                            last_beat = now
+                            log.info("心跳：本次运行累计 %d 条样本，当前状态 %s",
+                                     n_rows, self.state)
+                        if now - last_rating_check >= 300:
+                            last_rating_check = now
+                            self._prompt_rating(now)
+                        present = len(face_buf) > 0
+                        yaw = float(np.median([f["yaw"] for f in face_buf])) if face_buf else 0.0
+                        pitch = float(np.median([f["pitch"] for f in face_buf])) if face_buf else 0.0
+                        ear = float(np.median([f["ear"] for f in face_buf])) if face_buf else 0.0
+                        tilt = float(np.median(tilt_buf)) if tilt_buf else 0.0
+                        closed_for = (now - closed_since) if closed_since else 0.0
+                        away_for = (now - away_since) if away_since else 0.0
+                        exe, title = active_window()
+                        kind = classify_app(exe, title)
+
+                        st = decide(face_present=present, yaw=yaw, pitch=pitch,
+                                    closed_for=closed_for, idle_sec=idle_seconds(),
+                                    app_kind=kind, away_for=away_for)
+
+                        # 离开期间降频落库。**判断必须在 INSERT 之前** ——
+                        # 原来这段写在 commit() 之后，样本早就落库了，continue
+                        # 只能跳过状态更新，等于降频从未生效（整夜待机照样每 2 秒
+                        # 一条，一晚一万四千行）。降频要真的省下写入，就必须
+                        # 在写库之前决定写不写。
+                        #
+                        # 例外：状态**刚**变成 away 的那一条永远要写，否则"离开"
+                        # 这个事件本身就不落库了，报告里会看到"专注 → 直接没有"。
+                        away_throttled = (st == "away" and self.state == "away"
+                                          and now - last_away_write < AWAY_WRITE_EVERY)
+                        if away_throttled:
+                            # 样本不写库，但缓冲清理照旧 —— 内存操作，跟落库无关。
+                            face_buf.clear()
+                        else:
+                            conn.execute(
+                                "INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (now, st, exe, title[:200], yaw, pitch, ear, tilt,
+                                 lean, 1 if present else 0, idle_seconds()))
+                            n_rows += 1
+                            last_away_write = now
+                            # 攒批提交：每 SAMPLE_COMMIT_EVERY 条才 commit 一次。
+                            # 每条单独 commit 在 journal_mode=delete 下等于每条一次
+                            # fsync + 一次持写锁，把撞锁概率放大十几倍。
+                            if n_rows % SAMPLE_COMMIT_EVERY == 0:
+                                conn.commit()
+
+                            # 跟踪"这段连续投入持续了多久"，评分提醒靠它决定要不要闭嘴
+                            if st in ENGAGED:
+                                if self._engaged_since is None:
+                                    self._engaged_since = now
+                                self._engaged_run = now - self._engaged_since
+                            else:
+                                self._engaged_since = None
+                                self._engaged_run = 0.0
+
+                            if st != self.state:
+                                self.state = st
+                                self.on_state(st)
+
+                            face_buf.clear()
+                            # tilt_buf 不清空：留成 4 秒滚动窗口，中位数才压得住单帧跳变
+                    db_fails = 0
+                except sqlite3.OperationalError as exc:
+                    # 撞锁是预期内的（读数进程很多），退避后继续，不致命。
+                    # 退避上限 5 秒：长时间锁定通常意味着别的进程开了长事务，
+                    # 无限指数退避会让采集"看起来"死掉，反而更难查。
+                    db_fails += 1
+                    if db_fails in (1, 10, 100) or db_fails % 500 == 0:
+                        log.warning("写库失败第 %d 次（已退避重试）：%s",
+                                    db_fails, exc)
+                    time.sleep(min(0.5 * db_fails, 5.0))
+                    continue
+                except Exception:
+                    # 非数据库异常（模型、解码、算法）几乎总是瞬时或单帧的，
+                    # 记日志后继续 —— 让一个坏帧杀掉采集是明显的错误取舍。
+                    log.exception("本帧处理出错，已跳过")
+                    time.sleep(0.05)
+                    continue
+
+        finally:
+            # 无论怎么退出都要**关掉写连接** —— 正常停止、还是没接住的异常穿出去。
+            #
+            # 这一条是"库被锁死两小时"那个事故的最后一道防线。实测的用户日志：
+            # 采集线程死在 `conn.commit()` 上（database is locked），连接没关、
+            # 写事务还开着，于是**接下来 1 小时 49 分里每一条读都撞同一个锁** ——
+            # 面板、报告、自评分全部 500，而进程还活着、桌面图标也还在，
+            # 看起来"在跑"。把清理放进 finally，线程怎么死都不会把库晾在锁定状态。
+            #
+            # 光靠循环体里的 try/except 是不够的：那个 try 只包住"每秒结算"那一段，
+            # 摄像头 read、cv2.resize、重开摄像头都在它外面 —— 那些地方抛一次
+            # 就会穿出去。这不是假想：这次就是这么死的。
+            if cap is not None:        # 暂停状态下退出时它已经是 None 了
+                cap.release()
+            try:
+                conn.commit()          # 把不足一批的尾巴补上，否则最后十几条白采
+            except sqlite3.Error:
+                log.exception("退出前补提交失败")
+            conn.close()
+            log.info("采集线程已停止")
 
     def stop(self) -> None:
         self.running = False
@@ -2267,6 +2347,240 @@ def selftest() -> None:
                 list(ROOT.glob("_selftest_notable.db*")):
             p.unlink(missing_ok=True)
 
+    # ── WAL：切不过去必须被**看见**，绝不能假定成功 ──
+    #
+    # 用户报的「自评分打不开：database is locked」根因就在这里。老代码是裸的
+    # `sqlite3.connect()`，压根没开 WAL —— journal_mode=delete 下**读写互斥**，
+    # 而采集线程攒批提交（每 SAMPLE_COMMIT_EVERY 条一次）会**连续持有写锁
+    # 十几秒**，读端在第一条语句（连 sqlite_master 的存在性检查）上就撞锁。
+    #
+    # 但光"开了 WAL"不是重点，重点是**切失败时不能假装成功**。
+    # `PRAGMA journal_mode=WAL` 有两种失败形态，都必须被抓住：
+    #   ① 抛异常 —— 需要排他锁而拿不到时（`busy_timeout` 在这条 PRAGMA 上
+    #      **不起作用**，实测 0.0 秒就抛）；
+    #   ② **不抛异常，但模式也没变** —— 内存库就是这样（只支持 memory）。
+    # 只测 ① 是不够的：`return True` 那种"假定成功"的写法照样能过 ①。
+    with tempfile.TemporaryDirectory() as _wtd:
+        _wp = Path(_wtd) / "focus.db"
+        _keep_db = globals()["DB_PATH"]
+        globals()["DB_PATH"] = _wp
+        # 记着所有连接，统一在 finally 里关掉：断言失败时中途退出会漏句柄，
+        # Windows 上文件锁着，临时目录清理会抛 PermissionError ——
+        # 那会把真正的断言信息盖掉，看起来像"文件被占用"而不是"库不是 WAL"。
+        _conns: list[sqlite3.Connection] = []
+
+        def _at(p: Path | str, timeout: float = 5.0) -> sqlite3.Connection:
+            c = sqlite3.connect(p, timeout=timeout)
+            _conns.append(c)
+            return c
+
+        def _mode(p: Path) -> str:
+            c = sqlite3.connect(p, timeout=5.0)
+            try:
+                return journal_mode(c)
+            finally:
+                c.close()
+
+        def _reset_delete() -> None:
+            """把库退回 delete 模式，好让下一条断言真的在测"切换"这件事。
+
+            少了这一步，"open_db 之后是 WAL"会在库本来就是 WAL 时假绿 ——
+            连"open_db 完全不做切换"都测不出来。
+            """
+            c = _at(_wp)
+            c.execute("PRAGMA journal_mode=delete")
+            c.commit()
+            assert journal_mode(c) == "delete", journal_mode(c)
+            c.close()
+            _conns.remove(c)
+
+        _keep_level = log.level
+        try:
+            # 这一段会**故意**制造"切 WAL 失败"，警告是预期的。不压住的话，
+            # 一次全绿的自检里会冒出「切 WAL 失败（库仍是 delete）」——
+            # 看日志的人会以为真出事了，而不是"这是被断言覆盖的那条路径"。
+            log.setLevel(logging.CRITICAL)
+            # 造一个 delete 模式的库 —— 正是用户那份的形态
+            _c = _at(_wp)
+            _c.execute("PRAGMA journal_mode=delete")
+            _c.execute("CREATE TABLE samples(ts REAL)")
+            _c.commit()
+            assert journal_mode(_c) == "delete", journal_mode(_c)
+
+            # ① 能切的时候要真的切过去，并且**读回**确认
+            assert _switch_wal(_c) is True, "空库上切 WAL 应该成功"
+            assert journal_mode(_c) == "wal", "PRAGMA 发出去了但库没变成 WAL"
+
+            # ② open_db 之后库必须处于 WAL —— 不是"试一下就算了"
+            _reset_delete()
+            _o = open_db(_wp)
+            try:
+                assert journal_mode(_o) == "wal", \
+                    "open_db 之后库不是 WAL —— 老代码就是这么留在 delete 模式的"
+            finally:
+                _o.close()
+
+            # ③ ensure_wal（启动时那条路）同样要确认
+            _reset_delete()
+            assert ensure_wal(timeout=5.0) is True, "启动时应该能切到 WAL"
+            assert _mode(_wp) == "wal", _mode(_wp)
+
+            # ④ 失败形态①：拿不到排他锁时**必须如实返回 False**。
+            #    busy_timeout 在这条 PRAGMA 上不起作用（实测 0.0 秒就抛），
+            #    所以这是"采集线程正在写"时最真实的那种失败。
+            _reset_delete()
+            _blk = _at(_wp)
+            _blk.execute("BEGIN IMMEDIATE")       # 占住写锁，模拟采集线程
+            _blk.execute("INSERT INTO samples VALUES(1.0)")
+            _probe = _at(_wp)
+            assert _switch_wal(_probe) is False, \
+                "拿不到排他锁却报告切成功 —— 库其实还在 delete 模式，" \
+                "读照样会撞 database is locked"
+            assert journal_mode(_probe) != "wal", journal_mode(_probe)
+            _blk.rollback()
+
+            # ⑤ 失败形态②：**不抛异常但模式也没变**。内存库就是这种
+            #    （只支持 journal_mode=memory）。少了这一条，
+            #    "return True 就算成功"的写法能一路绿过去 —— 而那正是
+            #    老代码的形态：吞掉结果、假定成功。
+            _mem = _at(":memory:")
+            assert journal_mode(_mem) == "memory", journal_mode(_mem)
+            assert _switch_wal(_mem) is False, \
+                "PRAGMA 没抛异常就当切成功了 —— 内存库根本没变成 WAL"
+            assert journal_mode(_mem) == "memory", journal_mode(_mem)
+        finally:
+            log.setLevel(_keep_level)
+            for _cc in _conns:
+                try:
+                    _cc.close()
+                except Exception:
+                    pass
+            globals()["DB_PATH"] = _keep_db
+
+    # ── 面板的 500 必须把栈写进日志 ──
+    #
+    # 用户报的是"自评分打不开"：/rate 回了一个 500 页面，页面上只有一句
+    # `database is locked`，而 focus.log 里**一个字都没有** —— 页面把异常字符串
+    # 塞进 HTML 就完事了，栈压根没记。结果只能拿截图里那一句话去猜。
+    #
+    # 这里用真请求打一遍（真起 server、真发 HTTP、真走 CSRF 校验），确认：
+    #   ① 故障确实变成 500（而不是把服务带崩、或静默回 200）
+    #   ② 日志里有一条 ERROR
+    #   ③ 那条日志**带 exc_info** —— 没有栈的日志等于没记
+    # GET 和 POST 两条分支各打一遍：只修一条是最容易犯的错。
+    _dash = None
+    try:
+        import dashboard as _dash
+    except Exception as _imp_exc:               # 面板缺依赖不该让自检整体挂掉
+        print(f"  (跳过面板日志自检：dashboard 导入失败 {_imp_exc!r})")
+
+    if _dash is not None:
+        import http.server as _httpsrv
+        import urllib.error as _urlerr
+        import urllib.parse as _urlparse
+
+        class _Capture(logging.Handler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.records: list[logging.LogRecord] = []
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.records.append(record)
+
+        _cap = _Capture()
+        _dlog = logging.getLogger("focus.dashboard")
+        _root = logging.getLogger()
+        _keep_handlers = _root.handlers[:]
+        _keep_dlvl = _dlog.level
+        # 临时掐断根日志的出口：注入的故障栈不该被写进用户真正的 focus.log。
+        # 顺带让 _ensure_log 认为"已经配好了"，不去碰真实文件。
+        _root.handlers = [logging.NullHandler()]
+        _dlog.addHandler(_cap)
+        _dlog.setLevel(logging.DEBUG)
+        _srv = None
+        _orig_rate = _dash._rate_page
+        _orig_save = None
+        try:
+            def _boom(*_a, **_k):
+                raise RuntimeError("自检注入的故障")
+
+            _dash._rate_page = _boom
+            _srv = _httpsrv.ThreadingHTTPServer(("127.0.0.1", 0), _dash._Handler)
+            _srv.daemon_threads = True
+            _port = _srv.server_address[1]
+            threading.Thread(target=_srv.serve_forever, daemon=True).start()
+
+            def _hit(path: str, data: bytes | None = None) -> tuple[int, str]:
+                """真发一个请求，返回 (状态码, 页面文本)。500 也要拿得到 body。"""
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{_port}{path}",
+                            data=data, timeout=15) as _r:
+                        return _r.status, _r.read().decode("utf-8")
+                except _urlerr.HTTPError as _he:
+                    return _he.code, _he.read().decode("utf-8")
+
+            def _check(what: str, code: int, body: str) -> None:
+                assert code == 500, \
+                    f"{what}：注入故障后应该回 500，实际 {code}"
+                assert "500" in body, f"{what}：500 的页面内容不对"
+                _recs = _cap.records
+                assert [r for r in _recs if r.levelno >= logging.ERROR], \
+                    f"{what}：500 没写日志 —— 页面又把原因吞掉了（只能靠截图猜）"
+                assert any(r.exc_info for r in _recs), \
+                    f"{what}：记了日志但没带 exc_info —— 没有栈，等于还是查不出原因"
+                assert any(r.exc_info and "RuntimeError" in str(r.exc_info[0])
+                           for r in _recs), \
+                    f"{what}：日志里的栈不是被注入的那个异常"
+
+            # ① GET 分支
+            _check("GET /rate", *_hit("/rate"))
+
+            # ② POST 分支。CSRF 是真校验（compare_digest），所以得拿本次进程
+            #    生成的那个 token —— 这也顺带证明"500 发生在校验之后"，
+            #    不是被 403 挡掉后误判成成功。
+            _cap.records.clear()
+            import ratings as _ratings
+            _orig_save = _ratings.save
+            _ratings.save = _boom
+            _form = _urlparse.urlencode({
+                "csrf": _dash.CSRF_TOKEN, "block_start": "1", "score": "3",
+            }).encode("utf-8")
+            _check("POST /rate", *_hit("/rate", data=_form))
+
+            # _ensure_log 的补配分支：面板被**单独**跑起来（python dashboard.py）
+            # 时没人调过 setup_log，而 pythonw 没有 stderr —— 不补就什么都留不下。
+            # 把 setup_log 换掉再验，避免真去动用户的 focus.log。
+            #
+            # 注意这里不能用 `focus.setup_log`：`--selftest` 下本文件是 __main__，
+            # 而 dashboard 里的 `focus` 是**另一个**模块对象（sys.modules["focus"]，
+            # 由 dashboard 的 `import focus` 产生）。补丁要打在它身上才生效。
+            _fmod = sys.modules.get("focus")
+            assert _fmod is not None, "dashboard 导入后 sys.modules 里应该有 focus"
+            _calls: list[int] = []
+            _orig_setup = _fmod.setup_log
+            _keep_ready = _dash._log_ready
+            try:
+                _fmod.setup_log = lambda *a, **k: _calls.append(1)
+                _root.handlers = []
+                _dash._log_ready = False
+                _dash._ensure_log()
+                assert _calls, \
+                    "根日志没有出口时 _ensure_log 没补配 —— 单独跑面板时栈会消失"
+            finally:
+                _fmod.setup_log = _orig_setup
+                _dash._log_ready = _keep_ready
+        finally:
+            _dash._rate_page = _orig_rate
+            if _orig_save is not None:
+                _ratings.save = _orig_save
+            if _srv is not None:
+                _srv.shutdown()
+                _srv.server_close()
+            _dlog.removeHandler(_cap)
+            _dlog.setLevel(_keep_dlvl)
+            _root.handlers = _keep_handlers
+
     # 评分提醒的时机：正在连续投入时不准打扰（这是明确要求的行为）
     assert not should_prompt_rating(FLOW_QUIET, True), "正在心流中不该弹提醒"
     assert not should_prompt_rating(FLOW_QUIET + 3600, True), \
@@ -2510,6 +2824,70 @@ def selftest() -> None:
         assert _toggle_src.count("sync_shortcut_icon") >= 3, \
             "toggle() 的三条出路（关掉 / 起成功 / 起失败）都要同步图标"
 
+        # WAL 迁移必须在**采集线程起来之前**，也必须在面板开始接请求之前。
+        #
+        # 这条只能钉顺序，行为测不到（main 要起托盘和窗口）。理由：切
+        # journal_mode 需要排他锁，而 busy_timeout 在这条 PRAGMA 上不起作用；
+        # 采集线程攒批提交会连续持有写锁十几秒，那时候再切必然失败，库就留在
+        # "读写互斥"的 delete 模式 —— 用户看到的正是「自评分打不开：
+        # database is locked」。启动时没有竞争，一次就成。
+        #
+        # 用 rindex 而不是 index：**本函数里就写着 "def main() -> None:" 这个
+        # 字面量**，用 index 会命中自己，切出一段从 selftest 中间开始的源码 ——
+        # 那样下面几条断言会互相命中，全部变成永远为真的摆设（这个坑上面的
+        # 注释警告过一次，我还是先踩了一遍）。真正的定义在 selftest 之后。
+        _main_src = _src[_src.rindex("def main() -> None:"):]
+        assert "def selftest" not in _main_src, \
+            "切片起点取错了（命中了自检里的字面量），下面的顺序断言会全部失效"
+        assert "ensure_wal()" in _main_src, \
+            "main() 里没调用 ensure_wal() —— 库可能一直留在 delete 模式"
+        assert (_main_src.index("ensure_wal()")
+                < _main_src.index("mon.start()")), \
+            "ensure_wal() 跑到采集线程后面了 —— 那时切不动 WAL"
+        assert (_main_src.index("ensure_wal()")
+                < _main_src.index("serve_background")), \
+            "ensure_wal() 跑到面板之后了 —— 面板随时可能开始接请求并撞锁"
+        # 而且必须在 first_run 之后：ensure_wal 会把 focus.db 建出来，
+        # 放前面的话"首次运行"永远判不出来，新手第一次启动看不到面板。
+        assert (_main_src.index("first_run = not DB_PATH.exists()")
+                < _main_src.index("ensure_wal()")), \
+            "ensure_wal() 跑到 first_run 之前了 —— 首次运行的面板不会再弹"
+
+        # 采集线程的退出清理必须在 **finally** 里。
+        #
+        # 这条也是行为测不到的（要构造"采集循环意外死掉"才能验证），只能钉结构。
+        # 但它对应的事故很实在：用户日志里 Thread-2 死在 `conn.commit()` 上，
+        # 连接没关、写事务还开着，**接下来 1 小时 49 分每一条读都撞同一个锁**
+        # —— 面板、报告、自评分全部 500，而进程还活着、桌面图标也还在，
+        # 看起来"在跑"。清理一旦不在 finally 里，任何没接住的异常（摄像头 read、
+        # cv2.resize、重开摄像头都在循环体的 try 之外）都能重现这个状态。
+        _run_src = _src[_src.index("    def run(self) -> None:")
+                        :_src.index("    def stop(self) -> None:")]
+        assert "        try:\n            while self.running:" in _run_src, \
+            "采集循环没被 try 包住 —— 线程意外死掉时 finally 不会执行"
+        assert "        finally:\n" in _run_src, \
+            "采集循环没有 finally —— 写连接不会关，库会被锁死"
+        _fin = _run_src.index("        finally:\n")
+        assert "conn.close()" in _run_src[_fin:], \
+            "finally 里没有 conn.close() —— 库会被锁死"
+        assert "cap.release()" in _run_src[_fin:], \
+            "finally 里没有释放摄像头 —— 指示灯会一直亮着"
+
+        # 面板两条 500 分支都得既补日志配置、又记栈。
+        #
+        # 行为测试只打得到 GET 那条（POST 要 CSRF token、要真提交表单），
+        # 所以 POST 这条只能钉结构 —— 别让下一个人只改了 GET 就以为完事。
+        _dpath = _self_src.parent / "dashboard.py"
+        if _dpath.exists():
+            _dtxt = _dpath.read_text(encoding="utf-8")
+            _ensure_calls = sum(1 for _ln in _dtxt.splitlines()
+                                if _ln.strip() == "_ensure_log()")
+            assert _ensure_calls >= 2, \
+                f"面板只有 {_ensure_calls} 处 _ensure_log()：两条 500 分支" \
+                "都要补日志配置，否则单独跑面板时栈直接消失"
+            assert _dtxt.count("log.exception(") >= 2, \
+                "面板的 500 分支没记栈 —— 页面会把原因吞掉，日志里查不到"
+
     # 版本号有两处副本，必须一致 —— __version__ 正上方那行注释就是这么写的。
     # 但注释看得见、没人会去看：上游 aaa2c0a「v0.2.3: 版本号跟进」就只改了
     # pyproject.toml，漏掉 __version__，于是 `focus.py --version` 报 0.2.2、
@@ -2633,6 +3011,15 @@ def main() -> None:
     # 什么都没发生"。开一次面板就把"在记录、状态是什么、摄像头通不通"
     # 一次全回答了，成本只是一个 if。
     first_run = not DB_PATH.exists()
+
+    # 把库切到 WAL —— **必须在采集线程起来之前**，也必须在面板开始接请求之前。
+    # 这时没有别的连接持锁，一次就成；一旦晚了，采集线程攒批提交会连续持有
+    # 写锁十几秒，切模式基本切不动，库会一直留在"读写互斥"的 delete 模式，
+    # 面板和报告就会报 database is locked。
+    #
+    # 位置也讲究：必须放在 first_run 之后 —— ensure_wal 会把 focus.db 建出来，
+    # 放在前面的话"首次运行"就永远判不出来，新手第一次启动看不到面板。
+    ensure_wal()
 
     # 面板随监视一起起，这样桌面快捷方式随时点得开，不用先去托盘菜单。
     # 只监听 127.0.0.1；起不来也不影响采集，所以异常只记日志。
