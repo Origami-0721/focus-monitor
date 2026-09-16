@@ -129,6 +129,43 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "",
         "dashboard.py",
     ),
+    (
+        "run_tray 裸 import window（窗口层一坏，整个程序跟着退出）",
+        '    try:\n'
+        '        import window\n'
+        '    except Exception:\n'
+        '        log.exception("窗口层加载不了，面板/报告将改用系统浏览器；"\n'
+        '                      "记录与托盘继续运行")\n'
+        '        window = None\n',
+        '    import window\n',
+    ),
+    (
+        "没有窗口层时主线程直接返回（daemon 的托盘和采集被一起拔掉）",
+        '        _quit.wait()\n        return\n',
+        '        return\n',
+    ),
+    (
+        "open_page 不再退到系统浏览器（窗口层坏了就「点了没反应」）",
+        '    try:\n'
+        '        webbrowser.open(url)\n'
+        '        log.info("已改用系统浏览器打开：%s", url)\n'
+        '    except Exception:\n'
+        '        log.exception("系统浏览器也打不开：%s", url)\n',
+        '    if False:\n'
+        '        webbrowser.open(url)\n',
+    ),
+    (
+        "托盘菜单绕过 open_page 自己 import window（窗口层坏掉就失灵）",
+        '    def on_rate(icon, _item):\n        open_page("rate")\n',
+        '    def on_rate(icon, _item):\n'
+        '        import window\n'
+        '        window.open_page("rate")\n',
+    ),
+    (
+        "open_page 把页面路由丢了（评分/报告全落到首页）",
+        '_PAGE_PATHS = {"panel": "/", "rate": "/rate", "report": "/report"}\n',
+        '_PAGE_PATHS = {}\n',
+    ),
 ]
 
 

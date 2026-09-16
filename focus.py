@@ -1331,7 +1331,7 @@ def _icon_image(color: str, shape: str = "solid"):
 def _panel_url(path: str = "") -> str:
     """面板地址。端口可能不是默认的，所以问 dashboard 要，别硬编码。
 
-    托盘打开页面已走 window.open_page；这里保留是给浏览器回退等场合用。
+    托盘/菜单打开页面走 open_page()；这里保留是给浏览器回退等场合用。
     """
     import dashboard
     dashboard.serve_background(open_browser=False)
@@ -1367,8 +1367,56 @@ def _today_engaged_seconds() -> int:
         return 0
 
 
+# 页面路由 —— 和 window.py 里那份保持一致。这里**刻意不 import window**：
+# 这个函数的全部意义就是"窗口层没了也要能把页面显示出来"。
+_PAGE_PATHS = {"panel": "/", "rate": "/rate", "report": "/report"}
+
+
+def open_page(page: str) -> None:
+    """把面板 / 自述评分 / 完整报告显示出来 —— **窗口层不可用也必须能看**。
+
+    优先走应用窗口（pywebview / WebView2）。窗口层加载不了时（没装
+    pywebview、pythonnet 起不来、系统缺 WebView2 运行时）退到系统浏览器：
+    这些页面本来就是本地 HTTP 服务，浏览器一样能看。
+
+    为什么值得单独抽一个函数：托盘菜单里原本是各处自己
+    `import window; window.open_page(...)`。窗口层一坏，**所有菜单项都变成
+    "点了没反应"** —— 而它们正是用户唯一的入口（发布包是 --windowed 的，
+    没有控制台）。更糟的是 `import window` 抛出的异常在菜单回调里没人接，
+    等于把"打不开页面"升级成"托盘失灵"。
+
+    `import window` 失败**必须**走浏览器兜底，不能只是记条日志就算了 ——
+    "点了没反应"和"用浏览器打开了"对用户是天壤之别。
+
+    另外这个 import 是**延迟**的（放在函数里而不是模块顶层）：
+    pywebview 会拖起 pythonnet，开机自启时不该为它多花那几百毫秒 ——
+    而绝大多数启动根本不会调用这个函数。
+    """
+    try:
+        import window
+        window.open_page(page)
+        return
+    except Exception:
+        log.exception("应用窗口打不开（%s），改用系统浏览器", page)
+    # 走 _panel_url 而不是硬编码 8787：端口被占时 dashboard 会往后顺延，
+    # 写死端口的话兜底打开的会是一个连不上的地址 —— 比不打开更让人困惑。
+    try:
+        url = _panel_url(_PAGE_PATHS.get(page, "/"))
+    except Exception:
+        log.exception("连面板地址都拿不到，放弃打开 %s", page)
+        return
+    try:
+        webbrowser.open(url)
+        log.info("已改用系统浏览器打开：%s", url)
+    except Exception:
+        log.exception("系统浏览器也打不开：%s", url)
+
+
 def run_tray(mon: Monitor) -> None:
     import pystray
+
+    # 没有窗口层时，主线程靠它退出（有窗口时靠 quit_app 让 GUI 循环返回）。
+    _quit = threading.Event()
 
     def refresh(icon) -> None:
         # 桌面开关的图标也在这里一起刷。托盘图标能自己反映"在跑但没数据"，
@@ -1425,22 +1473,16 @@ def run_tray(mon: Monitor) -> None:
                         "专注监视 · 启动失败")
         except Exception:
             log.exception("失败提示失败")
-        try:
-            import window
-            window.open_page("panel")
-        except Exception:
-            log.exception("打开面板失败")
+        open_page("panel")
 
     mon.on_progress = on_progress
     mon.on_fatal = on_fatal
 
     def on_panel(icon, _item):
-        import window                     # 延迟：开机自启时别拖 pythonnet 加载
-        window.open_page("panel")
+        open_page("panel")
 
     def on_rate(icon, _item):
-        import window                     # 延迟：开机自启时别拖 pythonnet 加载
-        window.open_page("rate")
+        open_page("rate")
 
     def on_default(icon, _item):
         """左键单击图标：有待评分就去评分页，否则打开面板。
@@ -1454,7 +1496,7 @@ def run_tray(mon: Monitor) -> None:
         """生成报告文件，再到应用窗口里展示。"""
         import report                   # 延迟 import，见 on_panel 注释
         report.main()
-        window.open_page("report")
+        open_page("report")
 
     def on_log(icon, _item):
         """用系统默认程序打开 focus.log。
@@ -1501,8 +1543,14 @@ def run_tray(mon: Monitor) -> None:
         except Exception:
             pass
         icon.stop()
-        import window                     # 延迟：与其余菜单项保持一致
-        window.quit_app()                 # 销毁窗口 → GUI 循环返回 → 进程真正退出
+        _quit.set()                       # 没有窗口层时，主线程靠它退出
+        try:
+            import window                 # 延迟：与其余菜单项保持一致
+            window.quit_app()             # 销毁窗口 → GUI 循环返回 → 进程真正退出
+        except Exception:
+            # 窗口层坏了不该把"退出"变成"退不掉"：_quit 已经置位，
+            # 主线程会从 run_tray 返回，main() 的 finally 照常收尾。
+            log.exception("销毁窗口失败，主线程会自行退出")
 
     def on_pause(icon, _item):
         mon.paused = not mon.paused
@@ -1573,7 +1621,27 @@ def run_tray(mon: Monitor) -> None:
     threading.Thread(target=_watchdog, daemon=True).start()
 
     # 主线程让给 pywebview：GUI 循环硬性要求主线程，托盘消息循环不受限。
-    import window
+    #
+    # **窗口层加载不了不能把整个程序带走。** 这里是 run_tray 的最后一步，
+    # 异常穿出去会被 main() 的 `except BaseException` 接住然后 `raise` ——
+    # 进程直接退出，而 pythonw 没有 stderr，用户看到的只是
+    # "托盘图标闪一下就没了"。而采集线程和托盘都**不依赖**窗口层：
+    # 没装 pywebview、pythonnet 加载失败、系统缺 WebView2 运行时，
+    # 这些都只该让"窗口"这个功能降级，不该让记录停摆。
+    # （实测事故：用户的 .venv 里没有 pywebview —— 他更新前那版是用浏览器
+    #  开面板的，压根不需要这个依赖 —— 启动两秒后进程就没了。）
+    try:
+        import window
+    except Exception:
+        log.exception("窗口层加载不了，面板/报告将改用系统浏览器；"
+                      "记录与托盘继续运行")
+        window = None
+    if window is None:
+        # 没有窗口层就没有"GUI 循环"可等，主线程只能守着。
+        # 直接 return 的话 main() 会走到结尾 —— 而托盘和采集都是 daemon 线程，
+        # 主线程一退出它们就被硬拔掉，程序等于白启动。
+        _quit.wait()
+        return
     window.start_main()
 
 
@@ -1868,19 +1936,10 @@ def wait_and_open(timeout: float = 120.0) -> None:
         log.warning("等面板就绪超时（%.0f 秒），放弃自动打开窗口", timeout)
         return
 
-    # 第二段：开窗口。开不了就退到系统浏览器 —— window.open_page() 自己也
-    # 承诺了这个兜底，但它在 `import window` 这一步就失败时根本走不到。
-    try:
-        import window                   # 延迟 import，见 on_panel 注释
-        window.open_page("panel")
-        log.info("应用窗口已打开：%s", url)
-    except Exception:
-        log.exception("应用窗口打不开，改用系统浏览器")
-        try:
-            import webbrowser
-            webbrowser.open(url)
-        except Exception:
-            log.exception("系统浏览器也打不开：%s", url)
+    # 第二段：开页面。走 open_page()，它自己带"窗口层坏了退到浏览器"的兜底 ——
+    # 这段逻辑原先在这里手写了一份，托盘菜单里又各写各的，窗口层一坏就
+    # 三处一起失灵。抽成一处，行为测试也才测得到。
+    open_page("panel")
 
 
 def _start_engine(timeout: float = 15.0) -> bool:
@@ -2661,6 +2720,34 @@ def selftest() -> None:
     assert _opened, \
         "窗口层 import 失败时没有退到系统浏览器 —— 用户会看到「双击了没反应」"
 
+    # ── open_page：窗口层坏了要退到浏览器，**而且托盘菜单必须都走它** ──
+    #
+    # 这条是实测踩出来的。用户的 .venv 里**没有 pywebview** —— 他更新前那版
+    # 是用系统浏览器开面板的，压根不需要这个依赖；而更新后的 run_tray 最后
+    # 一步是裸的 `import window; window.start_main()`，异常一路穿到 main() 的
+    # `except BaseException` 再 `raise`，**进程启动两秒后就没了**。
+    # 采集线程和托盘都不依赖窗口层，凭什么让它们陪葬。
+    _win_mod2 = sys.modules.get("window", "__absent__")
+    _real_open2 = webbrowser.open
+    _keep_lvl = log.level
+    _urls: list[str] = []
+    try:
+        sys.modules["window"] = None          # import 直接抛 ImportError
+        webbrowser.open = lambda u, *a, **k: _urls.append(u)
+        # 注入的故障栈是预期的，压住别刷控制台（和 WAL 那段同理）
+        log.setLevel(logging.CRITICAL)
+        open_page("rate")
+        assert _urls, "窗口层不可用时 open_page 必须退到系统浏览器"
+        assert _urls[-1].endswith("/rate"), \
+            f"退到浏览器时页面路由错了：{_urls[-1]}（rate 不该落到首页）"
+    finally:
+        log.setLevel(_keep_lvl)
+        webbrowser.open = _real_open2
+        if _win_mod2 == "__absent__":
+            sys.modules.pop("window", None)
+        else:
+            sys.modules["window"] = _win_mod2
+
     # ── 桌面快捷方式的目标必须来自 relaunch_cmd() ──
     #
     # 桌面开关是不是死的，全看这一条：写死 .venv/Scripts/pythonw.exe 的话，
@@ -2873,6 +2960,29 @@ def selftest() -> None:
         assert "cap.release()" in _run_src[_fin:], \
             "finally 里没有释放摄像头 —— 指示灯会一直亮着"
 
+        # 窗口层加载不了**不能把整个进程带走**。
+        #
+        # 这条行为上很难测（要真的把 pywebview 从环境里拿掉），只能钉结构。
+        # 但它对应的事故是实测的：用户的 .venv 里没有 pywebview（更新前那版
+        # 用浏览器开面板，不需要这个依赖），而 run_tray 最后一步是裸的
+        # `import window; window.start_main()` —— 异常穿到 main() 的
+        # `except BaseException` 再 raise，**进程启动两秒后就没了**，
+        # pythonw 还没有 stderr，用户只看到托盘图标闪一下。
+        # 采集和托盘都不依赖窗口层，凭什么陪葬。
+        _tray_src = _src[_src.index("def run_tray(mon: Monitor) -> None:")
+                         :_src.index("# ══════════════════════ 开 / 关 / 桌面开关")]
+        assert "    try:\n        import window\n" in _tray_src, \
+            "run_tray 裸 import window —— 窗口层一坏，整个程序跟着退出"
+        assert "_quit.wait()" in _tray_src, \
+            "没有窗口层时主线程必须守着（_quit.wait()）—— 直接返回的话 main() " \
+            "会走到结尾，而托盘和采集都是 daemon 线程，会被一起拔掉"
+        # 托盘菜单不许再各写各的 `import window`：窗口层一坏，那些菜单项
+        # 全变成"点了没反应"，而它们是用户唯一的入口（发布包没有控制台）。
+        assert "window.open_page" not in _tray_src, \
+            "托盘菜单绕过了 open_page() —— 窗口层坏掉时那些菜单项会失灵"
+        assert _tray_src.count("open_page(") >= 4, \
+            "托盘里打开页面的入口都要走 open_page()（面板/评分/报告/失败提示）"
+
         # 面板两条 500 分支都得既补日志配置、又记栈。
         #
         # 行为测试只打得到 GET 那条（POST 要 CSRF token、要真提交表单），
@@ -3038,8 +3148,7 @@ def main() -> None:
         def _show_first_run() -> None:
             time.sleep(3.0)
             try:
-                import window
-                window.open_page("panel")
+                open_page("panel")        # 带浏览器兜底，见 open_page 注释
             except Exception:
                 log.exception("首次运行打开面板失败")
 
