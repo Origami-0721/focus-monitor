@@ -1191,6 +1191,15 @@ def run_tray(mon: Monitor) -> None:
 
     def on_quit(icon, _item):
         mon.stop()
+        # 给采集线程一个收尾的机会：不 join 的话，下面 quit_app 一销毁窗口、
+        # 主线程立即退出进程，daemon 采集线程被硬拔，退出前的补提交
+        # （conn.commit() 尾部样本）根本没机会执行 —— 最后 ≤15 条样本
+        # （约半分钟）白采。join 只等它在循环里看到 running=False，
+        # 正常时瞬时返回；摄像头阻塞等极端情况靠超时兜底。
+        try:
+            mon.join(timeout=3)
+        except Exception:
+            pass
         icon.stop()
         import window                     # 延迟：与其余菜单项保持一致
         window.quit_app()                 # 销毁窗口 → GUI 循环返回 → 进程真正退出
@@ -1203,7 +1212,14 @@ def run_tray(mon: Monitor) -> None:
 
     def _state_text(_i) -> str:
         if is_stale():
-            return f"当前状态：无数据（{int(heartbeat_age())} 秒前）— 记录可能已停止"
+            # 从未有过任何一次心跳时 heartbeat_age() 返回 inf ——
+            # int(inf) 直接 OverflowError，会把托盘线程炸掉。实测路径：
+            # 模型下载失败 / 摄像头打不开 → 采集线程没起来 → 90 秒后
+            # 打开菜单，这一行必崩。这种情况要诚实地写"从未采集"。
+            age = heartbeat_age()
+            ago = ("从未采集" if age == float("inf")
+                   else f"{int(age)} 秒前")
+            return f"当前状态：无数据（{ago}）— 记录可能已停止"
         if is_paused():
             return "当前状态：已暂停"
         label = STATES.get(mon.state, ("未知", "#64748b"))[0]
