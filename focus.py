@@ -3022,6 +3022,29 @@ def selftest() -> None:
         assert meta_version == __version__, \
             f"版本号不一致：pyproject.toml={meta_version}，focus.py={__version__}"
 
+        # 第三处副本：uv.lock。这条是**实测撞出来的**，不是假想 ——
+        # 仓库里提交的 uv.lock 一直写着 `focus-monitor version = "0.2.1"`，
+        # 而 pyproject.toml 早就是 0.2.3 了（0.2.3 那次只改了 pyproject，
+        # 没人记得 lock 里也有一份）。后果很实在：
+        #   - `uv sync --extra build` 要先重新 lock 才知道 build extra 存在，
+        #     发布脚本提示的那条命令在离线/CI 下会失败；
+        #   - lock 里没有 pyinstaller 那一串（altgraph/macholib/pefile…）。
+        # 锁文件是**生成物**，但既然提交进仓库了，就该有人检查它跟 pyproject
+        # 对不对得上 —— 否则它只是一个会腐烂的副本。
+        # 冻结成 exe 后 uv.lock 不会跟着打包，找不到就跳过。
+        uvlock = ROOT / "uv.lock"
+        if uvlock.exists():
+            # 不用正则，省得为这一处引入 import re —— 锁文件这个片段是固定形状的
+            _txt = uvlock.read_text(encoding="utf-8")
+            _key = 'name = "focus-monitor"\nversion = "'
+            _i = _txt.find(_key)
+            assert _i >= 0, \
+                "uv.lock 里找不到 focus-monitor 的版本号（锁文件格式变了？）"
+            _lock_ver = _txt[_i + len(_key):].split('"', 1)[0]
+            assert _lock_ver == meta_version, \
+                (f"uv.lock 里的版本号是 {_lock_ver}，pyproject.toml 是 "
+                 f"{meta_version} —— 改了版本号记得跑一次 `uv lock`")
+
     # 这行以前是"踩着自己写的规矩"崩的：上面注释声称刻意只用 ASCII，消息本身
     # 却是中文。中文 Windows 的 GBK 控制台打得出来，所以本机一直没暴露；到了
     # GitHub Actions 的西文代码页就抛 UnicodeEncodeError，把一次断言全过的自检

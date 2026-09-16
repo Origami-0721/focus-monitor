@@ -166,6 +166,12 @@ MUTATIONS: list[tuple[str, str, str]] = [
         '_PAGE_PATHS = {"panel": "/", "rate": "/rate", "report": "/report"}\n',
         '_PAGE_PATHS = {}\n',
     ),
+    (
+        "uv.lock 的版本号没跟上 pyproject（真实的旧状态：0.2.1 vs 0.2.3）",
+        'name = "focus-monitor"\nversion = "0.2.3"\n',
+        'name = "focus-monitor"\nversion = "0.2.1"\n',
+        "uv.lock",
+    ),
 ]
 
 
