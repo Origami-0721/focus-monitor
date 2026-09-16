@@ -2096,9 +2096,13 @@ def selftest() -> None:
         f"源码运行要用 pythonw（不弹控制台），实际是 {_dev[0]}"
     assert _dev[-1].endswith("focus.py"), \
         f"源码运行的入口是 focus.py，实际是 {_dev[-1]}"
-    # 源码形态下 PYW 必须真的存在，否则开发机上双击开关就是坏的
-    # （冻结态没有 .venv，所以只在非冻结时检查）。
-    if not getattr(sys, "frozen", False):
+    # 源码形态下 PYW 必须真的存在，否则开发机上双击开关就是坏的。
+    #
+    # 但**只在项目确实用了本地 .venv 时**才检查：CI 是用 actions/setup-python
+    # 装全局依赖的，根本没有 .venv —— 无条件断言会在 CI 上红，而本机
+    # （有 .venv）永远复现不了。这条是实测踩出来的：第一版就是这么红的。
+    # 断言不能编码"开发机的目录布局"这种环境假设。
+    if not getattr(sys, "frozen", False) and (ROOT / ".venv").exists():
         assert PYW.exists(), f"找不到 {PYW} —— 开发机上桌面开关会失效"
 
     # ── wait_and_open：服务等不到要退出、窗口开不了要退到浏览器 ──
