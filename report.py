@@ -677,14 +677,24 @@ def build_html(rows: list[tuple]) -> str:
     # 每小时归一成"平均每天"：只早上用电脑的人，上午柱不再被几天撑虚高。
     # 原始累计 hour_active 仍留给黄金时段排序，柱状图只看平均强度。
     #
-    # 分母理论上是 0 会 ZeroDivisionError。hour_active 和 hour_active_days
-    # 是同一处代码同时写的，所以构造不出真实触发路径（第三轮审查把它列进
-    # "未能确认的项"）。但报告是"点一下就该出来"的东西，为一个假设中的路径
-    # 让整页崩掉不划算 —— 这里直接跳过没有活跃日记录的钟点。
+    # 分母 len(days) 不会是 0：hour_active 和 hour_active_days 是同一处代码
+    # 同时写的（`if state != "away"` 那个块），所以键存在就至少有一个活跃日。
+    # 这里的 `days and` 是防御性的，不是真实风险 —— 真实风险在下面 peak。
     hour_avg = {h: hour_active[h] / len(days)
                 for h, days in hour_active_days.items()
                 if days and h in hour_active}
-    peak = max(hour_avg.values()) if hour_avg else 1.0
+    # peak 必须用 `or 1.0` 兜住"全是 0"，只兜"字典为空"不够。
+    #
+    # 触发条件是某小时内**所有**非离开样本的 dur 都是 0 → hour_avg 全 0 →
+    # peak = 0 → 算柱高时 0/0 直接崩（实测：所有样本同 ts、最后一条是离开，
+    # 就能构造出 ZeroDivisionError）。第三轮审查把这一项列进"未能确认"，
+    # 现在确认了：**能触发，但触发点在这里，不在 len(days)**。
+    #
+    # 采集出来的数据撞不上：写入侧有 `now - last_flush >= 1.0` 闸门，
+    # 相邻样本至少差 1 秒，dur 必然 ≥ 1，于是 hour_active 必然 > 0。
+    # 但报告是"点一下就该出来"的东西 —— 手工导入的数据、或者将来动了那个
+    # 闸门，都不该让整页崩掉，所以这里照兜。
+    peak = max(hour_avg.values(), default=0.0) or 1.0
     hours_bar = "".join(
         f'<div class="hbar"><span class="hv">{_dur(hour_avg[h])}</span>'
         f'<div class="hbg"><i style="height:{max(3, round(hour_avg[h] / peak * 110))}px"'
@@ -701,7 +711,10 @@ def build_html(rows: list[tuple]) -> str:
             f'<div class="hbg"><i style="height:'
             f'{max(3, round(day_engaged.get(d, 0) / day_peak * 110))}px"'
             f' title="{d} 投入 {_dur(day_engaged.get(d, 0))} · '
-            f'专注率 {day_engaged.get(d, 0) / day_active[d] * 100:.0f}%"></i></div>'
+            # day_active[d] 和上面的 peak 是同一类问题：全是 0 时算专注率会 0/0。
+            # 键存在只保证"那天有非离开样本"，不保证那些样本的 dur 非 0。
+            f'专注率 {day_engaged.get(d, 0) / (day_active[d] or 1.0) * 100:.0f}%">'
+            f'</i></div>'
             f'<span class="hl">{d[5:]}</span></div>'
             for d in day_keys)
     else:

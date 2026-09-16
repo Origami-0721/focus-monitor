@@ -1660,6 +1660,24 @@ def selftest() -> None:
                    "应用使用记录", "占活跃", "时段"):
         assert needle in html, f"报告缺少 {needle}"
     assert html.count("<html") == 1
+    # 时长全为 0 的数据不能把报告搞崩。
+    #
+    # 第三轮审查把"hour_avg 除零"列进"未能确认的项"，当时只加了个防御性守卫。
+    # 现在确认了：**能触发，但触发点不在守卫的那个分母上**。
+    # `hour_active_days` 的键一旦存在就至少有一个活跃日（它和 hour_active 是
+    # 同一处代码同时写的），所以 len(days) 恒 ≥ 1；真正会变成 0 的是
+    # `peak = max(hour_avg)` —— 某小时内所有非离开样本的 dur 都是 0 时，
+    # hour_avg 全 0，算柱高就 0/0。day_active[d] 是同一类问题（算专注率时分母）。
+    #
+    # 采集出来的数据撞不上：写入侧有 `now - last_flush >= 1.0` 闸门，
+    # 相邻样本至少差 1 秒，dur 必然 ≥ 1。但手工导入的数据能构造出来 ——
+    # 所以照兜，并在这里钉死，免得将来有人把那两个 `or 1.0` 当冗余删掉。
+    _zt = 1789000000.0
+    zero_dur = [(_zt, "focused", "code.exe", "t", 0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0)
+                for _ in range(10)]
+    zero_dur.append((_zt, "away", "", "", 0.0, 0.0, 0.0, 0.0, 0.0, 0, 300.0))
+    assert "<html" in report.build_html(zero_dur), \
+        "时长全为 0 的数据把报告搞崩了（peak / day_active 的除零兜底失效）"
 
     # ── 走神归因的拆分 ──
     assert report._is_looking(1, 0.0, 10.0)
