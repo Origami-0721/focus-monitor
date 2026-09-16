@@ -1026,6 +1026,31 @@ class Monitor(threading.Thread):
                 # 确认喂了正对屏幕的人脸之后确实产出「专注」。
                 if now - last_face >= 1.0 / FACE_FPS:
                     last_face = now
+                    # 上一次真的看到脸已经过去太久了 —— 中间那段盲区里的闭眼计时
+                    # 不该接着累加，作废它。
+                    #
+                    # closed_since 只由"看到脸且 EAR 低"推进，丢脸时原本不动它，
+                    # 于是"闭眼 2 秒 → 转头出画 3 秒 → 回来还闭着眼"会被算成
+                    # 连续闭眼 5 秒，人刚回来 1 秒就记一条「疲劳」（实测复现，
+                    # 见 smoke_pipeline.py 里那段脚本化的时间线）。拦住它的那条
+                    # away_for >= AWAY_FACE 是 20 秒，拦不住 3 秒的短转头。
+                    #
+                    # 判据是"盲区超过了宽限期"，不是"有没有掉帧"：单帧抖动
+                    # （now - last_face_seen 只有 0.1 秒）不清零，真断了才清零。
+                    # 留宽限是必须的 —— FACE_FPS=10 下单帧丢失很常见，掉一帧就
+                    # 清零的话，真犯困时反而永远攒不满 EAR_SUSTAIN。
+                    #
+                    # 为什么不怕把真疲劳一起清掉：脸不在画面里的时候 decide()
+                    # 本来就返回 distracted，closed_for 再大也轮不到它说话。
+                    #
+                    # 放在"重新开始观察"这一侧（而不是丢脸那一侧）是有意的：
+                    # 丢脸、暂停后恢复、摄像头重开、休眠唤醒都归这一条管 ——
+                    # 它们共同的特征就是"这一帧之前有一段时间没在观察"。
+                    # 写在丢脸那一支的话，暂停那条路径根本走不到（它在循环开头
+                    # 就 continue 了），恢复时那个陈旧的 closed_since 会直接命中。
+                    if (closed_since is not None
+                            and now - last_face_seen > FACE_LOSS_GRACE):
+                        closed_since = None
                     got = vision.read_face(proc)
                     if got:
                         face_buf.append(got)
@@ -1039,20 +1064,6 @@ class Monitor(threading.Thread):
                         last_face_seen = now
                     else:
                         away_since = away_since or now
-                        # 丢脸丢久了就把"连续闭眼"的计时作废。
-                        #
-                        # closed_since 只由"看到脸且 EAR 低"推进，丢脸时原本不动它，
-                        # 于是"闭眼 2 秒 → 转头出画 3 秒 → 回来还闭着眼"会被算成
-                        # 连续闭眼 5 秒，人刚回来 1 秒就记一条「疲劳」（实测复现，
-                        # 见 smoke_pipeline.py 里那段脚本化的时间线）。
-                        # 判据是"盲区超过了宽限期"，不是"有没有掉帧"：单帧抖动
-                        # （now - last_face_seen 只有 0.1 秒）不清零，真断了才清零。
-                        #
-                        # 为什么不怕把真疲劳一起清掉：脸不在画面里的时候 decide()
-                        # 本来就返回 distracted，closed_for 再大也轮不到它说话。
-                        if (closed_since is not None
-                                and now - last_face_seen > FACE_LOSS_GRACE):
-                            closed_since = None
 
                 if now - last_pose >= 1.0 / POSE_FPS:
                     last_pose = now
@@ -2013,6 +2024,17 @@ def selftest() -> None:
             assert _needle in _loop_src, \
                 f"采集循环的视觉链路断了：找不到 {_needle!r}" \
                 "（生产端被删了、消费端还在，会静默只产出走神/离开）"
+
+        # 光"还在"不够 —— 那句复位必须待在"重新开始观察"那一侧，也就是
+        # 读脸**之前**。放进"丢脸"那一支同样能让丢脸场景变绿，但暂停那条
+        # 路径在循环开头就 continue 了，根本走不到那一支：恢复时陈旧的
+        # closed_since 会直接命中，人一恢复就被记一条「疲劳」。
+        # 这个顺序约束没法用"子串在不在"表达，只能比下标。
+        # 对应的行为测试是 smoke_pipeline.py 的场景③。
+        assert (_loop_src.index("now - last_face_seen > FACE_LOSS_GRACE")
+                < _loop_src.index("vision.read_face(proc)")), \
+            "闭眼计时的复位跑到读脸之后了 —— 暂停后恢复时它不会执行，" \
+            "陈旧的起点会让「疲劳」在恢复的瞬间就误报"
 
     # 版本号有两处副本，必须一致 —— __version__ 正上方那行注释就是这么写的。
     # 但注释看得见、没人会去看：上游 aaa2c0a「v0.2.3: 版本号跟进」就只改了

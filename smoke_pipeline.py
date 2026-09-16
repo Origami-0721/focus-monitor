@@ -24,6 +24,10 @@ distracted / away —— 专注、中性、伏案、疲劳四种状态一个都�
      这一段同时验反面：一直闭着眼不丢脸时「疲劳」**必须**照样判得出来 ——
      修 bug 不能顺手把功能一起修没了。
 
+  ③ 暂停 → 恢复 —— 暂停时循环在开头就 continue，根本走不到视觉那一段，
+     所以"只在丢脸时复位"救不了它。恢复时那个陈旧的起点会直接命中。
+     ②③ 一起才能钉住"复位要放在重新开始观察的那一侧"。
+
 用法:
     python smoke_pipeline.py
 """
@@ -134,8 +138,57 @@ class _ScriptedVision:
         return 3.0
 
 
-def _run(vision_cls, db: Path, duration: float) -> None:
-    """把外部依赖全部换掉（摄像头、模型、前台窗口、键鼠空闲）后真跑一遍采集循环。"""
+# ────────────────────── 场景③：暂停 → 恢复 ──────────────────────
+#
+# 暂停那条分支在循环**开头**就 `continue` 了，根本走不到视觉那一段 ——
+# 所以"只在丢脸时复位"这种写法救不了它：暂停期间 closed_since 没人动，
+# 恢复时 `closed_since or now` 直接沿用暂停前的起点，人一恢复就被记「疲劳」。
+#
+# 时间轴（相对本段开始，单位秒）：
+#
+#   0.0 – 1.2   睁眼          基线建立
+#   1.2 – 2.0   闭眼          closed_since ≈ 1.2
+#   2.0 – 4.0   **暂停**      摄像头已释放，循环在开头 continue
+#   4.0 – 8.0   恢复，仍闭眼   计时应该从 4.0 之后**重新开始**
+#
+# 判据同场景②：第一条「疲劳」必须落在"恢复之后 ≥ 1.5 秒"。
+#
+# 为什么要单独测这一条：复位写在"丢脸"那一支也能让场景②变绿，
+# 但暂停这条路径根本不经过那一支。两个场景一起才能钉住
+# "复位要放在重新开始观察的那一侧"这个设计决定。
+_PAUSE_AT = 2.0
+_RESUME_AT = 4.0
+_PAUSE_TIMELINE_DURATION = 8.0
+
+_resume_ts = 0.0        # 实际解除暂停的时刻，main() 之外由 _resume() 写
+
+
+class _ClosedAfterPauseVision:
+    """睁眼一会儿 → 之后一直闭着眼（暂停期间它根本不会被调用）。"""
+
+    def __init__(self):
+        pass
+
+    def read_face(self, frame):
+        t = time.time() - _T0
+        ear = _EAR_OPEN if t < _OPEN_UNTIL else _EAR_CLOSED
+        return {"yaw": 0.0, "pitch": 5.0, "ear": ear, "scale": 1.0}
+
+    def read_posture(self, frame):
+        return 3.0
+
+
+def _resume(mon) -> None:
+    global _resume_ts
+    mon.paused = False
+    _resume_ts = time.time()
+
+
+def _run(vision_cls, db: Path, duration: float, arm=None) -> None:
+    """把外部依赖全部换掉（摄像头、模型、前台窗口、键鼠空闲）后真跑一遍采集循环。
+
+    `arm(mon)` 用来在 run() 之前挂上定时器（暂停/恢复这类按时间轴驱动的动作）。
+    """
     focus.DB_PATH = db
     focus.ensure_models = lambda on_progress=None: None
     focus.Vision = vision_cls
@@ -144,6 +197,8 @@ def _run(vision_cls, db: Path, duration: float) -> None:
     focus.idle_seconds = lambda: 0.0
 
     mon = focus.Monitor()
+    if arm is not None:
+        arm(mon)
     threading.Timer(duration, mon.stop).start()
     mon.run()
 
@@ -218,13 +273,55 @@ def _check_face_loss_timeline() -> str:
             f"第一条在脸回来之后 {offset:.1f} 秒")
 
 
+def _check_resume_after_pause() -> str:
+    """场景③：暂停再恢复之后，闭眼计时不该拿着暂停前的起点接着算。"""
+    global _T0, _resume_ts
+    saved = focus.EAR_MIN_SAMPLES, focus.EAR_SUSTAIN
+    focus.EAR_MIN_SAMPLES = 8
+    focus.EAR_SUSTAIN = 2.0
+    try:
+        db = Path(tempfile.mkdtemp()) / "pipeline-pause.db"
+        _resume_ts = 0.0
+        _T0 = time.time()
+
+        def arm(mon):
+            threading.Timer(_PAUSE_AT,
+                            lambda: setattr(mon, "paused", True)).start()
+            threading.Timer(_RESUME_AT, lambda: _resume(mon)).start()
+
+        _run(_ClosedAfterPauseVision, db, _PAUSE_TIMELINE_DURATION, arm=arm)
+        rows = _rows(db)
+    finally:
+        focus.EAR_MIN_SAMPLES, focus.EAR_SUSTAIN = saved
+
+    drowsy = [ts for ts, st, _e in rows if st == "drowsy"]
+    assert _resume_ts > 0, "时间线没跑到「恢复」那一段"
+    assert drowsy, (
+        f"恢复之后一直闭着眼却判不出「疲劳」，实际状态分布 "
+        f"{sorted({st for _t, st, _e in rows})}")
+
+    # _resume_ts 记的是"解除暂停"那一刻，而循环最多晚 0.5 秒（暂停时的 sleep）
+    # 才真正回到采集 —— 这个偏差只会让 offset 更大，所以是安全方向。
+    offset = drowsy[0] - _resume_ts
+    assert offset >= 1.5, (
+        f"恢复之后 {offset:.1f} 秒就记了「疲劳」：闭眼计时沿用了暂停前的起点"
+        f"（人一恢复就被判疲劳）")
+
+    return (f"{len(rows)} 条样本，{len(drowsy)} 条疲劳，"
+            f"第一条在恢复之后 {offset:.1f} 秒")
+
+
 def main() -> int:
     focus.use_safe_console()
 
     summary1 = _check_constant_input()
     summary2 = _check_face_loss_timeline()
+    summary3 = _check_resume_after_pause()
 
-    print(f"管线冒烟通过\n  ① 恒定输入：{summary1}\n  ② 丢脸时间线：{summary2}")
+    print(f"管线冒烟通过\n"
+          f"  ① 恒定输入：{summary1}\n"
+          f"  ② 丢脸时间线：{summary2}\n"
+          f"  ③ 暂停恢复：{summary3}")
     return 0
 
 
