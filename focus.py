@@ -772,6 +772,125 @@ def open_db(path: Path | None = None, readonly: bool = False,
     return conn
 
 
+def _size(n: float) -> str:
+    """字节数转人能读的形式。"""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _stamp(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def backup_db(out: Path | None = None) -> Path:
+    """把 focus.db 备份成一个独立文件，返回备份路径。
+
+    为什么不用 shutil.copy：WAL 模式下 focus.db 和 focus.db-wal 是**两个文件**，
+    还没 checkpoint 的最新样本全在 -wal 里。单拷 focus.db 会安静地丢掉最近一段
+    数据 —— 备份出来的库能打开、能查询，只是少了一截，最难发现的那种坏法。
+    sqlite3 的 backup API 在事务层面取一致快照，能同时看见 WAL 的内容，
+    而且**可以在采集线程正在写的时候安全执行**，不用先停监视。
+
+    备份不做保留策略：它可能正是你唯一的救命文件，轮转掉就白备份了。
+    """
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"还没有数据库可备份：{DB_PATH}")
+    if out is None:
+        out = DB_PATH.with_name(f"{DB_PATH.stem}-backup-{time.strftime('%Y%m%d-%H%M%S')}.db")
+
+    src = open_db(DB_PATH)
+    try:
+        dst = sqlite3.connect(out)
+        try:
+            src.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    print(f"已备份: {out}  ({_size(out.stat().st_size)})")
+    return out
+
+
+def compact_db(days: float, assume_yes: bool = False) -> None:
+    """删除 `days` 天以前的原始样本并回收磁盘空间。
+
+    这是全项目唯一会**删数据**的操作，所以设了三道闸门：
+      1. 默认只预演：把要删的行数、时间范围打出来就结束，真要删必须显式 --yes。
+      2. 真删之前**强制先备份**，备份失败就中止 —— 不允许出现"删了但没备份"。
+      3. 备份路径和删除范围都打印出来，用户随时能自己找回。
+
+    为什么不做"聚合成小时级摘要"：报告的每一个数字都来自同一条样本序列，
+    `_timed()` 按相邻样本的时间差算时长、上限 5 秒。把一小时压成一行之后，
+    这行只能贡献 5 秒，所有时长统计都会塌掉。要让聚合数据进报告，就得给
+    报告开第二条数据通路，让每个板块都能同时读两种口径 —— 那是重构级别的改动，
+    而本项目只有 --selftest 一套测试，不值得为"少一个功能"冒这个险。
+    所以这里选择**明确地删**，而不是做一个"看起来还在、其实已经失真"的聚合。
+    """
+    if days <= 0:
+        print("保留天数必须为正数。想保留全部，就别执行 --compact。")
+        return
+    if not DB_PATH.exists():
+        print("还没有数据库，无需整理。")
+        return
+
+    cutoff = time.time() - days * 86400
+    conn = open_db(DB_PATH)
+    try:
+        # 库文件存在 ≠ 有样本表：老版本留下的、或者只被 ratings 建过表的
+        # focus.db 都可能没有 samples。这时直接 SELECT 会抛一个很难看的
+        # OperationalError，而用户只是想整理一下磁盘。
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='samples'"
+        ).fetchone()
+        if not has_table:
+            print("库里还没有样本表（可能还没真正开始采集过），无需整理。")
+            return
+        total = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        n, oldest, newest = conn.execute(
+            "SELECT COUNT(*), MIN(ts), MAX(ts) FROM samples WHERE ts < ?",
+            (cutoff,)).fetchone()
+        if not n:
+            print(f"没有超过 {days:g} 天的样本（共 {total} 行），无需整理。")
+            return
+        print(f"共 {total} 行，其中 {n} 行早于 {days:g} 天前"
+              f"（{_stamp(oldest)} ~ {_stamp(newest)}）。")
+        if not assume_yes:
+            print("以上只是预演，没有删除任何数据。")
+            print("确认后重新执行并加上 --yes 才会真正删除（删除前会自动备份）。")
+            return
+
+        try:
+            backup_db()
+        except (OSError, sqlite3.Error) as exc:
+            print(f"备份失败，已中止，未删除任何数据：{exc}")
+            return
+
+        before = DB_PATH.stat().st_size
+        conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+        conn.commit()
+        # VACUUM 必须在事务外，且会重建整个库 —— 这才是真正把文件缩小的一步，
+        # 只 DELETE 的话空间只是进了 freelist，文件大小纹丝不动。
+        # 单独兜一层：删除已经提交了，VACUUM 失败（比如监视正持有读事务）
+        # 不能被报成"整理失败" —— 否则用户以为数据还在，再跑一次发现行数
+        # 对不上，反而更慌。
+        try:
+            conn.execute("VACUUM")
+        except sqlite3.Error as exc:
+            print(f"数据已删除，但回收空间失败：{exc}")
+            print("（监视还在运行的话，先 --stop 再单独跑一次即可。）")
+    finally:
+        conn.close()
+
+    after = DB_PATH.stat().st_size
+    print(f"完成：删除 {n} 行，{_size(before)} → {_size(after)}"
+          f"（回收 {_size(max(0.0, before - after))}）。")
+    print("注意：这段历史在报告里就没有了。想保留请先留着上面那份备份。")
+
+
 class Monitor(threading.Thread):
     """后台采集：读摄像头 → 算指标 → 每秒落一条样本。"""
 
@@ -1700,6 +1819,77 @@ def selftest() -> None:
         globals()["DB_PATH"] = real_db
         tmp_db.unlink(missing_ok=True)
 
+    # ── 备份与保留策略 ──
+    # backup_db / compact_db 是全项目唯一会碰用户数据文件的路径，必须有断言兜着：
+    # "备份少拷了一截"和"没先备份就删"都是不可逆的事故，靠人工检查是查不出来的。
+    real_db = globals()["DB_PATH"]
+    tmp_db = ROOT / "_selftest_compact.db"
+    globals()["DB_PATH"] = tmp_db
+    try:
+        def _count(path: Path) -> int:
+            c = sqlite3.connect(path)
+            try:
+                return c.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+            finally:
+                c.close()
+
+        now = time.time()
+        conn = open_db(tmp_db)
+        conn.executescript(SCHEMA)
+        conn.execute("DELETE FROM samples")
+        # 3 条 400 天前的旧样本 + 2 条刚采的
+        for i in range(3):
+            conn.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (now - 400 * 86400 + i, "focused", "code.exe", "t",
+                          0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0))
+        for i in range(2):
+            conn.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (now - i, "focused", "code.exe", "t",
+                          0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0))
+        conn.commit()
+        conn.close()
+        assert _count(tmp_db) == 5
+
+        # 备份出来的必须是**完整**的一份。WAL 下如果只拷 focus.db 主文件，
+        # 还没 checkpoint 的样本会全部丢掉 —— 库能打开、能查，只是少一截。
+        bk = backup_db(ROOT / "_selftest_bk.db")
+        assert bk.exists(), "备份文件没生成"
+        assert _count(bk) == 5, f"备份不完整：{_count(bk)} != 5"
+
+        # 预演阶段一行都不许少
+        compact_db(90, assume_yes=False)
+        assert _count(tmp_db) == 5, "预演阶段就删了数据"
+
+        # 真删：旧的清掉、新的留着
+        compact_db(90, assume_yes=True)
+        assert _count(tmp_db) == 2, f"应剩 2 条新样本，实际 {_count(tmp_db)}"
+        # 真删之前必须留下备份 —— 目录里应该多出一个 backup 文件
+        assert list(ROOT.glob("_selftest_compact-backup-*.db")), \
+            "删数据前没有自动备份"
+
+        # 保留天数非正 → 什么都不动（这是"想保留全部"的表达方式）
+        compact_db(0, assume_yes=True)
+        assert _count(tmp_db) == 2, "保留天数非正时不该删任何东西"
+
+        # 备份文件必须被 .gitignore 排除：内容和 focus.db 一样敏感，
+        # 而 focus.db / focus.db-* 这两条通配**盖不住** focus-backup-*.db。
+        ignore = ROOT / ".gitignore"
+        if ignore.exists():                       # 打包成 exe 后没有这个文件
+            assert "focus-backup-*.db" in ignore.read_text(encoding="utf-8"), \
+                "备份文件没被 .gitignore 排除，一次 git add -A 就泄露个人数据"
+
+        # 库存在但没有 samples 表（老版本残留）时不能抛异常
+        empty_db = ROOT / "_selftest_notable.db"
+        sqlite3.connect(empty_db).close()
+        globals()["DB_PATH"] = empty_db
+        compact_db(90, assume_yes=True)           # 只该打印一句提示
+    finally:
+        globals()["DB_PATH"] = real_db
+        for p in list(ROOT.glob("_selftest_compact*.db*")) + \
+                list(ROOT.glob("_selftest_bk.db*")) + \
+                list(ROOT.glob("_selftest_notable.db*")):
+            p.unlink(missing_ok=True)
+
     # 评分提醒的时机：正在连续投入时不准打扰（这是明确要求的行为）
     assert not should_prompt_rating(FLOW_QUIET, True), "正在心流中不该弹提醒"
     assert not should_prompt_rating(FLOW_QUIET + 3600, True), \
@@ -1736,6 +1926,16 @@ def main() -> None:
     ap.add_argument("--wait-open", action="store_true",
                     help=argparse.SUPPRESS)   # 内部用：等面板就绪再开浏览器
     ap.add_argument("--selftest", action="store_true", help="跑自检，不开摄像头")
+    ap.add_argument("--backup", action="store_true",
+                    help="把 focus.db 备份一份（监视运行中也能安全执行）")
+    ap.add_argument("--out", default=None,
+                    help="--backup 的备份路径，默认写在 focus.db 旁边")
+    ap.add_argument("--compact", action="store_true",
+                    help="删除旧样本并回收空间；默认只预演，加 --yes 才真删")
+    ap.add_argument("--days", type=float, default=90.0,
+                    help="--compact 的保留天数，默认 90")
+    ap.add_argument("--yes", action="store_true",
+                    help="--compact 真正执行删除（不加则只预演）")
     ap.add_argument("--install-startup", action="store_true", help="装开机自启")
     ap.add_argument("--uninstall-startup", action="store_true", help="卸载开机自启")
     ap.add_argument("--version", action="version",
@@ -1744,6 +1944,20 @@ def main() -> None:
 
     if args.selftest:
         selftest()
+        return
+    if args.backup:
+        # 这两条命令用户会在"磁盘快满了"的时候才想起来跑，那时最不该看到的是
+        # 一段 traceback —— 路径写错、库还没建、目标盘不可写都要给一句人话。
+        try:
+            backup_db(Path(args.out) if args.out else None)
+        except (OSError, sqlite3.Error) as exc:
+            sys.exit(f"备份失败：{exc}")
+        return
+    if args.compact:
+        try:
+            compact_db(args.days, assume_yes=args.yes)
+        except sqlite3.Error as exc:
+            sys.exit(f"整理失败：{exc}（监视还在运行的话，先 --stop 再试）")
         return
     if args.install_startup:
         install_startup()

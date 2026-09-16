@@ -676,8 +676,14 @@ def build_html(rows: list[tuple]) -> str:
 
     # 每小时归一成"平均每天"：只早上用电脑的人，上午柱不再被几天撑虚高。
     # 原始累计 hour_active 仍留给黄金时段排序，柱状图只看平均强度。
-    hour_avg = {h: hour_active[h] / len(hour_active_days[h])
-                for h in hour_active}
+    #
+    # 分母理论上是 0 会 ZeroDivisionError。hour_active 和 hour_active_days
+    # 是同一处代码同时写的，所以构造不出真实触发路径（第三轮审查把它列进
+    # "未能确认的项"）。但报告是"点一下就该出来"的东西，为一个假设中的路径
+    # 让整页崩掉不划算 —— 这里直接跳过没有活跃日记录的钟点。
+    hour_avg = {h: hour_active[h] / len(days)
+                for h, days in hour_active_days.items()
+                if days and h in hour_active}
     peak = max(hour_avg.values()) if hour_avg else 1.0
     hours_bar = "".join(
         f'<div class="hbar"><span class="hv">{_dur(hour_avg[h])}</span>'
