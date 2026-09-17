@@ -172,6 +172,22 @@ MUTATIONS: list[tuple[str, str, str]] = [
         'name = "focus-monitor"\nversion = "0.2.1"\n',
         "uv.lock",
     ),
+    (
+        "把 Origin: null 当跨源拒（真实的旧状态：窗口里所有表单都 403）",
+        '    if origin.strip().lower() == "null":     # 不透明来源，见上\n'
+        '        return True\n',
+        '    if False:                                # 变异：null 当跨源拒\n'
+        '        return True\n',
+        "dashboard.py",
+    ),
+    (
+        "403 的现场只记 debug（等于没记：用户还是只能给一张截图）",
+        '        log.warning(\n'
+        '            "拒绝 %s %s：%s（Host=%r Origin/Referer=%r Sec-Fetch-Site=%r）",\n',
+        '        log.debug(\n'
+        '            "拒绝 %s %s：%s（Host=%r Origin/Referer=%r Sec-Fetch-Site=%r）",\n',
+        "dashboard.py",
+    ),
 ]
 
 

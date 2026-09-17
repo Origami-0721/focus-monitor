@@ -645,8 +645,23 @@ def _origin_ok(origin: str, port: int) -> bool:
 
     浏览器对跨源 POST 会带上 Origin，对同源表单不一定带 —— 所以
     "没有 Origin" 不算错（放行），"有 Origin 但不是自己" 才拒绝。
+
+    `null` 同样放行，这不是妥协而是必须 —— 实测（Edge 153 / WebView2）里
+    **同源表单 POST 送的就是 `Origin: null`**：
+
+        POST /rate   Origin: null   Sec-Fetch-Site: same-origin
+
+    旧写法"scheme 不是 http/https 就拒"会把它判成跨源，于是应用窗口里
+    **所有**表单（自述评分、跳过、设置保存）点下去都是一张 403 页面。
+    不透明来源（null）不携带任何主机信息，凭它分不出敌我，不能当拒绝依据；
+    这条路径真正的防线在别处：
+        · POST —— CSRF token：跨源页面读不到我们的页面，猜不出那 32 字节
+        · GET  —— Host 白名单：DNS rebinding 的 Host 是攻击者域名
+        · 不透明来源的页面读不走响应体：没有 CORS 头，浏览器不给读
     """
     if not origin:
+        return True
+    if origin.strip().lower() == "null":     # 不透明来源，见上
         return True
     try:
         parts = urllib.parse.urlsplit(origin)
@@ -679,18 +694,34 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _port(self) -> int:
         return self.server.server_port if self.server else DEFAULT_PORT
 
+    def _reject(self, why: str, host: str, origin: str) -> None:
+        """回 403 之前先把现场写进日志。
+
+        只丢一张 403 页面的话，用户能提供的就只有一张截图 —— 哪个头不对、
+        值长什么样，全靠猜。这次 `Origin: null` 被误判成跨源就是这么发生的：
+        页面写着"来源不是本机面板"，日志里一个字都没有，只能靠起一个真
+        WebView2 去抓请求头才定位到。
+        """
+        _ensure_log()
+        log.warning(
+            "拒绝 %s %s：%s（Host=%r Origin/Referer=%r Sec-Fetch-Site=%r）",
+            self.command, self.path, why, host, origin,
+            self.headers.get("Sec-Fetch-Site"))
+        self._send(f"<h1>403</h1><p>{why}，已拒绝。</p>", 403)
+
     def _guard(self) -> bool:
         """请求是否来自本机面板。不是就回 403 并返回 False。
 
         GET 和 POST 都要过 —— /report 是无参数纯 GET，但输出的是
         数月的窗口标题排行，不能让它被任意页面读走。
         """
-        if not _host_ok(self.headers.get("Host", ""), self._port()):
-            self._send("<h1>403</h1><p>Host 不是本机回环地址，已拒绝。</p>", 403)
-            return False
+        host = self.headers.get("Host", "")
         ref = self.headers.get("Origin") or self.headers.get("Referer") or ""
+        if not _host_ok(host, self._port()):
+            self._reject("Host 不是本机回环地址", host, ref)
+            return False
         if not _origin_ok(ref, self._port()):
-            self._send("<h1>403</h1><p>请求来源不是本机面板，已拒绝。</p>", 403)
+            self._reject("请求来源不是本机面板", host, ref)
             return False
         return True
 

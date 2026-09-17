@@ -2640,6 +2640,116 @@ def selftest() -> None:
             _dlog.setLevel(_keep_dlvl)
             _root.handlers = _keep_handlers
 
+        # ③ 守卫必须认得 WebView2 的**表单 POST**。
+        #    实测（Edge 153 / WebView2）同源表单 POST 送的是
+        #        Origin: null    Sec-Fetch-Site: same-origin
+        #    而不是 Origin: http://127.0.0.1:端口。旧写法把"scheme 不是
+        #    http/https"一律当跨源拒掉，于是应用窗口里**所有**表单
+        #    （自述评分、跳过、设置保存）点下去都只得到一张 403 页面。
+        #
+        #    上面两段 500 自检永远碰不到这条路径：urllib 默认**不发** Origin，
+        #    所以"拿 urlopen 打一个 POST"和真实客户端长得一点都不像。
+        #    要按真客户端的头来发，才测得出来。
+        assert _dash._origin_ok("null", 8787), \
+            "Origin: null 是 WebView2 同源表单 POST 的正常值，必须放行"
+        assert _dash._origin_ok("", 8787), "没有 Origin 必须放行"
+        assert _dash._origin_ok("NULL", 8787), "大小写不该改变结论"
+        assert _dash._origin_ok("http://127.0.0.1:8787", 8787), "本机同源放行"
+        assert _dash._origin_ok("http://localhost:8787", 8787), "localhost 放行"
+        assert not _dash._origin_ok("http://evil.example", 8787), \
+            "跨源 Origin 必须拒 —— 放行 null 不能顺手把防线拆了"
+        assert not _dash._origin_ok("http://127.0.0.1:9999", 8787), \
+            "回环但不是本面板的端口，要拒"
+        assert not _dash._origin_ok("file:///C:/x.html", 8787), \
+            "file:// 带主机路径，不是不透明来源，照旧拒"
+
+        _srv2 = _httpsrv.ThreadingHTTPServer(("127.0.0.1", 0), _dash._Handler)
+        _srv2.daemon_threads = True
+        _port2 = _srv2.server_address[1]
+        threading.Thread(target=_srv2.serve_forever, daemon=True).start()
+        _dlog.addHandler(_cap)
+        _dlog.setLevel(logging.DEBUG)
+        _keep_ready2 = _dash._log_ready
+        _root.handlers = [logging.NullHandler()]
+        try:
+            def _hit2(path: str, data: bytes | None = None,
+                      origin: str | None = None,
+                      site: str | None = None) -> tuple[int, str]:
+                """按真实浏览器的头发请求 —— Origin 由调用方指定。"""
+                hdrs = {}
+                if origin is not None:
+                    hdrs["Origin"] = origin
+                if site is not None:
+                    hdrs["Sec-Fetch-Site"] = site
+                    hdrs["Sec-Fetch-Mode"] = "navigate"
+                    hdrs["Sec-Fetch-Dest"] = "document"
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{_port2}{path}", data=data, headers=hdrs)
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        return r.status, r.read().decode("utf-8")
+                except _urlerr.HTTPError as he:
+                    return he.code, he.read().decode("utf-8")
+
+            # 窗口首次加载页面：无 Origin（Sec-Fetch-Site: none）
+            code, _b = _hit2("/settings")
+            assert code == 200, f"窗口首次加载页面被拒：{code}"
+
+            # WebView2 的评分提交：Origin: null 要过守卫，落到业务校验（400）
+            _form0 = _urlparse.urlencode({
+                "csrf": _dash.CSRF_TOKEN, "block_start": "0", "score": "3",
+            }).encode("utf-8")
+            code, body = _hit2("/rate", data=_form0, origin="null",
+                               site="same-origin")
+            assert code != 403 and "已拒绝" not in body, (
+                f"WebView2 的表单 POST（Origin: null）被守卫拒了：{code} —— "
+                "应用窗口里的自述评分/跳过/设置保存会全部打不开")
+            assert code == 400, (
+                "Origin: null 的表单应该过守卫、过 token 校验，落到 "
+                f"block_start 的业务校验（400），实际 {code}")
+
+            # 跨源来源照旧拒
+            code, body = _hit2("/rate", data=_form0,
+                               origin="http://evil.example", site="cross-site")
+            assert code == 403 and "来源" in body, "跨源 Origin 必须继续拒"
+            code, _b = _hit2("/settings", origin="http://evil.example")
+            assert code == 403, "跨源页面不能读到面板内容"
+
+            # 不透明来源不是免死金牌：token 照旧要校验
+            code, body = _hit2("/rate", data=_urlparse.urlencode({
+                "csrf": "x" * 8, "block_start": "0", "score": "3",
+            }).encode("utf-8"), origin="null", site="same-origin")
+            assert code == 403 and "令牌" in body, (
+                "Origin: null + 错 token 必须拒 —— POST 的真防线是 token，"
+                f"不是来源（实际 {code}）")
+
+            # DNS rebinding 那条线：Host 不是回环地址一律拒
+            import http.client as _httpc
+            _conn = _httpc.HTTPConnection("127.0.0.1", _port2, timeout=15)
+            try:
+                _conn.request("GET", "/settings",
+                              headers={"Host": "evil.example"})
+                _hostcode = _conn.getresponse().status
+            finally:
+                _conn.close()
+            assert _hostcode == 403, \
+                "Host 不是回环地址必须拒（DNS rebinding 防线）"
+
+            # 403 必须留下现场：被拒的 Origin 值要进日志，否则用户只能靠截图
+            _cap.records.clear()
+            _hit2("/settings", origin="http://evil.example")
+            _warns = [r for r in _cap.records if r.levelno >= logging.WARNING]
+            assert _warns, "403 没写日志 —— 用户只能拿一张截图来问，没法自查"
+            assert any("evil.example" in r.getMessage() for r in _warns), (
+                "403 的日志里没带上被拒的 Origin 值，等于没写")
+        finally:
+            _dash._log_ready = _keep_ready2
+            _dlog.removeHandler(_cap)
+            _dlog.setLevel(_keep_dlvl)
+            _root.handlers = _keep_handlers
+            _srv2.shutdown()
+            _srv2.server_close()
+
     # 评分提醒的时机：正在连续投入时不准打扰（这是明确要求的行为）
     assert not should_prompt_rating(FLOW_QUIET, True), "正在心流中不该弹提醒"
     assert not should_prompt_rating(FLOW_QUIET + 3600, True), \
@@ -2995,14 +3105,31 @@ def selftest() -> None:
         #
         # 行为测试只打得到 GET 那条（POST 要 CSRF token、要真提交表单），
         # 所以 POST 这条只能钉结构 —— 别让下一个人只改了 GET 就以为完事。
+        #
+        # 这里**不能数总数**：`_ensure_log()` 现在有三处（403 拒绝路径也补了
+        # 一次），数 `>= 2` 的话，删掉一条 500 分支的调用还剩两处，断言照样绿
+        # ——变异测试抓出来的就是这个。改成钉住"每个 500 分支的 log.exception
+        # 往上第一个非注释行必须是 _ensure_log()"，位置错了就红。
         _dpath = _self_src.parent / "dashboard.py"
         if _dpath.exists():
             _dtxt = _dpath.read_text(encoding="utf-8")
-            _ensure_calls = sum(1 for _ln in _dtxt.splitlines()
-                                if _ln.strip() == "_ensure_log()")
-            assert _ensure_calls >= 2, \
-                f"面板只有 {_ensure_calls} 处 _ensure_log()：两条 500 分支" \
-                "都要补日志配置，否则单独跑面板时栈直接消失"
+            _dlines = _dtxt.splitlines()
+            _branches = 0
+            for _i, _ln in enumerate(_dlines):
+                if not _ln.strip().startswith('log.exception("面板处理 '):
+                    continue
+                _branches += 1
+                for _j in range(_i - 1, -1, -1):
+                    _up = _dlines[_j].strip()
+                    if _up and not _up.startswith("#"):
+                        assert _up == "_ensure_log()", (
+                            f"面板的 500 分支（{_ln.strip()[:44]}…）往上第一个"
+                            f"非注释行是 {_up!r}，不是 _ensure_log() —— "
+                            "单独跑面板时栈会直接消失")
+                        break
+            assert _branches >= 2, \
+                f"面板只有 {_branches} 条 500 分支的 log.exception —— " \
+                "GET 和 POST 都得记栈，否则页面会把原因吞掉"
             assert _dtxt.count("log.exception(") >= 2, \
                 "面板的 500 分支没记栈 —— 页面会把原因吞掉，日志里查不到"
 
