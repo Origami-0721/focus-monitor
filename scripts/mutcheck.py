@@ -224,6 +224,19 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "        base_note = f'校准中 {len(ears)}/{focus.EAR_MIN_SAMPLES}'\n",
         "dashboard.py",
     ),
+    (
+        "设置页某个字段名打错（用户改完保存，值静默丢失）",
+        '        ("EAR_SUSTAIN", "持续闭眼判疲劳（秒）", ""),\n',
+        '        ("EAR_SUSTAINT", "持续闭眼判疲劳（秒）", ""),\n',
+        "dashboard.py",
+    ),
+    (
+        "配置里有、设置页却改不到的键（用户只能手改 config.json）",
+        '        ("AWAY_WRITE_EVERY", "离开时落库间隔（秒）",\n'
+        '         "离开期间降频写库，避免整夜待机撑爆数据库"),\n',
+        "",
+        "dashboard.py",
+    ),
 ]
 
 

@@ -2186,6 +2186,26 @@ def selftest() -> None:
             f"横幅让用户去改「{report._FIX_FIELD}」，但设置页里没有这个字段。"
             f"现有标签：{sorted(_labels)}")
 
+        # 设置页渲染的每个字段都必须真的存在于配置里 —— 否则用户改完点保存，
+        # 那个值会被**静默丢掉**（apply_config 只认 _SCALARS / _LIST_KEYS 里的键），
+        # 而界面上看不出任何异常：输入框还在、值也回显了，就是没生效。
+        # 这是"指向不存在的地方"的镜像版本：界面指向一个配置里没有的键。
+        # 反向也要钉：配置里有、界面改不到的键，用户只能去手改 config.json。
+        _rendered = {_k for _g, _f in _dash_chk._FIELDS for _k, _l, _h in _f}
+        _rendered_txt = {_k for _k, _l, _h in _dash_chk._TEXTAREAS}
+        assert not (_rendered - set(_SCALARS)), (
+            f"设置页有这些字段，但配置里没有：{sorted(_rendered - set(_SCALARS))}"
+            " —— 用户改完保存会静默丢失")
+        assert not (_rendered_txt - set(_LIST_KEYS)), (
+            f"设置页有这些文本框，但配置里没有："
+            f"{sorted(_rendered_txt - set(_LIST_KEYS))}")
+        assert not (set(_SCALARS) - _rendered), (
+            f"配置里有这些标量，但设置页改不到：{sorted(set(_SCALARS) - _rendered)}"
+            " —— 用户只能手改 config.json")
+        assert not (set(_LIST_KEYS) - _rendered_txt), (
+            f"配置里有这些列表，但设置页改不到："
+            f"{sorted(set(_LIST_KEYS) - _rendered_txt)}")
+
     # 指的文档小节也必须真的有这个标题
     _tut = (ROOT / "使用教程.md").read_text(encoding="utf-8")
     assert f"## {report._FIX_DOC}" in _tut, (
