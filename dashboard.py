@@ -209,13 +209,20 @@ def _live_html() -> str:
     label, color = STATES.get(last[2], ("未知", "#64748b"))
 
     # 记录程序是否还活着 —— 这是这个面板最重要的一个数字
-    # 校准状态：复用 focus.ear_threshold 的同一套逻辑，只是数据源换成库里的 ear 列
+    # 睁眼基线的学习进度：复用 focus.ear_threshold 的同一套逻辑，
+    # 只是数据源换成库里的 ear 列。
+    #
+    # 措辞刻意**不用"校准"**：界面上一出现"校准中"，用户就会去找一个能点的
+    # 校准按钮，而程序里根本没有这个功能（基线是自动学的）—— 实测反馈原话
+    # 就是「没找到校准交互」。说"学习中"的进度，和下面那档"已自适应"正好是一对：
+    # 一个是"还没学好、你不用管"，一个是"学好了、你不用管"，都不暗示有操作。
+    # 变量名也从 cal 改掉 —— 留着就是"校准"这个词的半个影子。
     ears = [x[7] for x in items if x[9]][-600:]
     if len(ears) >= focus.EAR_MIN_SAMPLES:
-        cal = (f'睁眼基线 {focus.ear_threshold(ears) / focus.EAR_RATIO:.3f}'
-               f' · 已自适应')
+        base_note = (f'睁眼基线 {focus.ear_threshold(ears) / focus.EAR_RATIO:.3f}'
+                     f' · 已自适应')
     else:
-        cal = f'校准中 {len(ears)}/{focus.EAR_MIN_SAMPLES}'
+        base_note = f'睁眼基线学习中 {len(ears)}/{focus.EAR_MIN_SAMPLES}'
 
     if focus.is_paused():
         # 主动暂停和程序挂了是两回事：暂停时数据停滞是预期的，别报故障
@@ -226,7 +233,7 @@ def _live_html() -> str:
                   f'记录程序似乎没在运行</span>')
     else:
         health = (f'<span class="ok">记录中 · {lag:.0f} 秒前更新</span>'
-                  f' · <span class="muted">{cal}</span>')
+                  f' · <span class="muted">{base_note}</span>')
 
     # 当前这次连续投入（往回数）
     # 时间空档必须断开：睡眠/关机期间没有样本，但 _timed 已经给每条样本

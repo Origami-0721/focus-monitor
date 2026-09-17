@@ -218,6 +218,12 @@ MUTATIONS: list[tuple[str, str, str]] = [
         '        return f"中等相关 —— 大方向对得上，但阈值需要重新校准{loose}"\n',
         "ratings.py",
     ),
+    (
+        "面板上退回「校准中 N/60」（又让人去找一个不存在的校准按钮）",
+        "        base_note = f'睁眼基线学习中 {len(ears)}/{focus.EAR_MIN_SAMPLES}'\n",
+        "        base_note = f'校准中 {len(ears)}/{focus.EAR_MIN_SAMPLES}'\n",
+        "dashboard.py",
+    ),
 ]
 
 

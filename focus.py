@@ -2378,6 +2378,45 @@ def selftest() -> None:
                 f"verdict({_r}, {_nn}) 里出现了「校准」：{_v!r} —— "
                 "程序没有校准功能，用户会照着去找（实测反馈过）")
 
+    # ── 实时面板上同样不许出现「校准」──
+    # 和上面同源：用户看到"校准中 37/60"会去找一个能点的校准按钮，
+    # 而程序里没有这个功能。所以这条不是措辞偏好，是同一个缺陷的另一处。
+    #
+    # 直接渲染**真实的面板页面**来查，不读源码猜 —— 那行文案是内联在
+    # _live_html() 里的，没有独立函数可以单测。样本数**故意少于
+    # EAR_MIN_SAMPLES**：要命中的是"还在学"那一档，样本够了走的是
+    # "已自适应"，那档本来就不含这个词，测了等于没测。
+    try:
+        import dashboard as _dash_live_mod
+    except Exception:
+        _dash_live_mod = None
+    if _dash_live_mod is not None:
+        _real_pref = report.DB_PATH
+        _pdb = ROOT / "_selftest_panel.db"
+        try:
+            _pc = open_db(_pdb)
+            try:
+                _pc.executescript(SCHEMA)
+                _now = time.time()
+                _pc.executemany(
+                    "INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    [(_now - 60 + i, "focused", "code.exe", "t",
+                      0.0, 0.0, 0.30, 1.0, 1.0, 1, 0.0)
+                     for i in range(5)])
+                _pc.commit()
+            finally:
+                _pc.close()
+            report.DB_PATH = _pdb
+            _panel = _dash_live_mod._live_html()
+            assert "校准" not in _panel, (
+                "实时面板上出现了「校准」—— 用户会去找一个不存在的校准按钮"
+                "（实测反馈原话：「没找到校准交互」）")
+            assert "学习中" in _panel, (
+                "面板没写出基线还在学习 —— 用户不知道那个 37/60 是什么")
+        finally:
+            report.DB_PATH = _real_pref
+            _pdb.unlink(missing_ok=True)
+
     # 数据库往返。用临时库 —— 绝不能污染用户的真实 focus.db
     real_db = globals()["DB_PATH"]
     tmp_db = ROOT / "_selftest_ratings.db"
