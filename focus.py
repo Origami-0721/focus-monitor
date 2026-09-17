@@ -2350,6 +2350,34 @@ def selftest() -> None:
     assert "还可能变" in ratings.verdict(0.8, ratings.MIN_PAIRS + 1), \
         "刚过门槛的高相关必须带样本量提醒"
 
+    # 低相关 / 负相关这两条**才是真正推着用户去动阈值**的结论，
+    # 样本量提醒必须挂在这里 —— 原来只挂在上面两条"结论不错"的分支上，
+    # 恰好把会引发动作的两条漏了（verdict 的 docstring 写的正是防这个）。
+    # n=31 时半宽 0.37 > 0.25（该提醒），n=100 时 0.20（样本够了，不该再提）。
+    assert "先别急着动阈值" in ratings.verdict(0.1, ratings.MIN_PAIRS + 1), \
+        "低相关 + 刚过门槛时，必须劝住用户先别动阈值"
+    assert "阈值需要重新调" in ratings.verdict(0.1, 100), \
+        "样本够了却还是低相关，才该直接说阈值要调"
+    assert "先别" not in ratings.verdict(0.1, 100), \
+        "样本已经够了还说「先别急着」就是一句空话"
+    assert "还可能变" in ratings.verdict(-0.5, ratings.MIN_PAIRS + 1)
+    assert "建议先查阈值" in ratings.verdict(-0.5, 100)
+    assert "还可能变" not in ratings.verdict(-0.5, 100), \
+        "样本够了就不该再挂「结论还可能变」"
+
+    # 措辞里不许出现「校准」——程序里没有这个功能（EAR 基线是自动学的），
+    # 写了就是把人指到一个不存在的地方（实测反馈：用户说「没找到校准交互」）。
+    # 扫全部 (r, n) 组合而不是抽查几条：以后任何分支想加回"重新校准"，
+    # 都会在这里被拦下，不用指望谁记得住这条规则。
+    for _r in (None, -1.0, -0.5, -0.4, -0.3, 0.0, 0.1, 0.39, 0.4, 0.5,
+               0.69, 0.7, 0.8, 1.0):
+        for _nn in (3, 4, 5, ratings.MIN_PAIRS, ratings.MIN_PAIRS + 1,
+                    64, 65, 100, 500):
+            _v = ratings.verdict(_r, _nn)
+            assert "校准" not in _v, (
+                f"verdict({_r}, {_nn}) 里出现了「校准」：{_v!r} —— "
+                "程序没有校准功能，用户会照着去找（实测反馈过）")
+
     # 数据库往返。用临时库 —— 绝不能污染用户的真实 focus.db
     real_db = globals()["DB_PATH"]
     tmp_db = ROOT / "_selftest_ratings.db"
