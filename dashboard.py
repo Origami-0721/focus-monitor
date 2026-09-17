@@ -748,7 +748,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     "已记录。" if "done" in query else "")))
             elif raw_path == "/report":
                 from report import build_html
-                self._send(build_html(load()))
+                # 报告页要带导航 —— 它自己就会给出"去调阈值"的建议，
+                # 而页面上原来一个入口都没有，用户读完只能关窗口（实测反馈）。
+                # 导航复用 _NAV 而不是让 report 再抄一份链接：
+                # 以后加页面，报告页不会漏掉那个入口。
+                # 导出成 report.html 时不传 —— 独立文件里的链接是点不动的死链。
+                self._send(build_html(load(), nav_html=_NAV))
             elif raw_path == "/":
                 self._send(_shell(_live_html(), poll=True))
             else:

@@ -429,15 +429,73 @@ def _rate_cell(pct: float) -> str:
 
 # ─────────────────── 主渲染 ───────────────────
 
-def build_html(rows: list[tuple]) -> str:
+# 相关系数低时要指给用户看的位置。抽成常量是为了让自检能断言
+# **它指向的设置项真的存在**（见 focus.py 自检里那条跨模块断言）——
+# 一句指向不存在的地方的建议比不给建议更糟：用户会照着去找，然后卡住。
+# 这里点名的是设置页「判定阈值」分组里的字段标签原文。
+_FIX_FIELD = "闭眼 EAR 阈值"
+_FIX_PATH = f"设置 → 判定阈值 → {_FIX_FIELD}"
+# 想看"为什么这么调"该翻哪一节。自检会去文档里核对这个标题真的存在。
+_FIX_DOC = "两周后：决定要不要调阈值"
+
+# 报告页是**独立页面**（还会被导出成 report.html），所以导航样式得自带。
+# 导航的**内容**由调用方传进来（面板传 dashboard._NAV），不在这里再抄一份链接 ——
+# 抄一份的话，以后加了新页面，报告页就会漏掉那个入口（"多处副本"的老毛病）。
+# 而报告页原来压根没有导航：用户在报告里读到"去调阈值"的建议，
+# 页面上连一个能点去「设置」的地方都没有。
+_NAV_CSS = (
+    "  .nav { display:flex; gap:18px; margin:0 0 22px; padding:10px 14px;"
+    " background:#1e293b; border:1px solid #334155; border-radius:8px; }\n"
+    "  .nav a { color:#e2e8f0; text-decoration:none; font-size:14px;"
+    " padding:4px 2px; opacity:.75; }\n"
+    "  .nav a:hover { color:#60cdfe; opacity:1; }\n"
+)
+
+
+def trust_banner(corr: float | None, n_pairs: int) -> str:
+    """自述对照的可信度横幅 —— 全报告的信任基础，放在最上面。
+
+    它同时是"这份报告能不能读"的开关：相关系数低的时候，下面所有结论都不该信。
+    所以这条横幅**必须给出可照做的下一步**，而且位置要指名道姓。
+
+    原来写的是"请先按「校准」一节调阈值"，实测用户反馈是「没找到校准交互」——
+    因为程序里**根本没有校准这个功能**（EAR 基线是自动学的，没有任何校准界面），
+    文档里的「校准」一节也只讲"什么时候该调"，不讲"怎么调"、更没说在哪个文档。
+    一句话把人指到一个不存在的东西上，比什么都不说更浪费时间。
+    """
+    if corr is None:
+        return ("<div class='trust pending'><b>数据可信度尚未验证</b> · "
+                f"已配对 {n_pairs}/{ratings.MIN_PAIRS} 个自述评分 —— "
+                "先把这个凑够，再信下面的结论更有意义。</div>")
+    if corr >= 0.7:
+        return (f"<div class='trust good'><b>数据可信</b> · 自评和实测"
+                f"相关系数 r = {corr:.2f}，两者是一致的。</div>")
+    if corr >= 0.4:
+        return (f"<div class='trust mid'><b>大致对得上</b> · r = {corr:.2f}，"
+                "大方向一致，但阈值还有调整空间。</div>")
+    return (f"<div class='trust bad'><b>先别信其他结论</b> · "
+            f"r = {corr:.2f} 说明测量和你的感受对不上。"
+            f"要调阈值就去 <b>{_FIX_PATH}</b>（顺序：先 EAR、再姿态角），"
+            "保存后 1 秒内生效。"
+            "注意程序里<b>没有</b>单独的「校准」功能，EAR 基线是自动学的 —— "
+            "只有这种怎么调都对不上的情况才需要手工动它；"
+            f"动手前先读「使用教程 · {_FIX_DOC}」。</div>")
+
+
+def build_html(rows: list[tuple], nav_html: str = "") -> str:
     focus.maybe_reload_config()          # 报告用当前设置，不是进程启动时的
     ENGAGED = focus.ENGAGED              # 局部绑定，下面所有引用都取最新值
     TILT_WARN = focus.TILT_WARN
     if not rows:
         return ("<!DOCTYPE html><html lang='zh-CN'><meta charset='utf-8'>"
                 "<title>专注度报告</title>"
+                f"<style>{_NAV_CSS}</style>"
                 "<body style='font:16px system-ui;background:#0f172a;color:#e2e8f0;"
-                "padding:60px;text-align:center'><h1>还没有数据</h1>"
+                "padding:60px;text-align:center'>"
+                # 空数据页也要有导航：不然用户从托盘点进「完整报告」，
+                # 看到"还没有数据"之后就只能关窗口，回不去面板
+                f"{nav_html}"
+                "<h1>还没有数据</h1>"
                 "<p>先跑 <code>uv run focus.py</code> 记录一段时间。</p></body></html>")
 
     items = _timed(rows)
@@ -789,20 +847,7 @@ def build_html(rows: list[tuple]) -> str:
     # ── 自述对照：这是全报告的信任基础，提到顶部而不是埋在中部 ──
     # README 自己说 r < 0.4 时"别急着信报告里的其他结论"，那就不该让用户
     # 先读完几十行分析才看到它。原来它用 .sub（全文最暗的灰）渲染。
-    if corr is None:
-        trust_tone = ("<div class='trust pending'><b>数据可信度尚未验证</b> · "
-                      f"已配对 {len(pairs)}/{ratings.MIN_PAIRS} 个自述评分 —— "
-                      "先把这个凑够，再信下面的结论更有意义。</div>")
-    elif corr >= 0.7:
-        trust_tone = (f"<div class='trust good'><b>数据可信</b> · 自评和实测"
-                      f"相关系数 r = {corr:.2f}，两者是一致的。</div>")
-    elif corr >= 0.4:
-        trust_tone = (f"<div class='trust mid'><b>大致对得上</b> · r = {corr:.2f}，"
-                      "大方向一致，但阈值还有调整空间。</div>")
-    else:
-        trust_tone = (f"<div class='trust bad'><b>先别信其他结论</b> · "
-                      f"r = {corr:.2f} 说明测量和你的感受对不上，"
-                      "请先按「校准」一节调阈值。</div>")
+    trust_tone = trust_banner(corr, len(pairs))
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -891,7 +936,8 @@ def build_html(rows: list[tuple]) -> str:
   .trust.bad {{ background:#450a0a; border-color:#ef4444; color:#fca5a5; }}
   .trust.pending {{ background:#1e293b; border-color:#475569; color:#94a3b8; }}
   .card .n {{ font-size:12px; color:#94a3b8; margin-top:6px; line-height:1.5; }}
-</style></head><body><div class="wrap">
+{_NAV_CSS}</style></head><body><div class="wrap">
+{nav_html}
 <h1>专注度报告</h1>
 <p class="sub">{_mdhm(rows[0][0])} – {_mdhm(rows[-1][0])} · {days} 天 · {len(rows)} 条样本</p>
 

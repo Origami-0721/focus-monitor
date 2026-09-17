@@ -188,6 +188,18 @@ MUTATIONS: list[tuple[str, str, str]] = [
         '            "拒绝 %s %s：%s（Host=%r Origin/Referer=%r Sec-Fetch-Site=%r）",\n',
         "dashboard.py",
     ),
+    (
+        "低相关横幅退回「请先按「校准」一节调阈值」（指到不存在的地方）",
+        '            f"要调阈值就去 <b>{_FIX_PATH}</b>（顺序：先 EAR、再姿态角），"\n',
+        '            "请先按「校准」一节调阈值。"\n',
+        "report.py",
+    ),
+    (
+        "面板不把导航传给报告页（用户读到「去设置调阈值」却无处可点）",
+        "build_html(load(), nav_html=_NAV)",
+        "build_html(load())",
+        "dashboard.py",
+    ),
 ]
 
 

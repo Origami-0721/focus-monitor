@@ -2157,6 +2157,41 @@ def selftest() -> None:
         assert needle in html, f"报告缺少 {needle}"
     assert html.count("<html") == 1
 
+    # ── 报告给出的行动建议必须**能照着做** ──
+    #
+    # 这条是补出来的：低相关横幅原来写"请先按「校准」一节调阈值"，而
+    # 程序里根本没有校准功能（EAR 基线是自动学的，没有任何校准界面），
+    # 文档的「校准」一节也只讲"什么时候该调"、不讲"在哪调"。
+    # 用户照这句话去找 → 卡住（实测反馈原话："没找到校准交互"）。
+    # 一句把人指到不存在的地方的建议，比什么都不说更浪费时间。
+    assert "数据可信" in report.trust_banner(0.8, 40)
+    assert "大致对得上" in report.trust_banner(0.5, 40)
+    assert "尚未验证" in report.trust_banner(None, 3)
+    _low = report.trust_banner(0.1, 40)
+    assert "先别信" in _low, "低相关的横幅应该明确说「别信其他结论」"
+    assert report._FIX_FIELD in _low, (
+        f"低相关横幅没点名要改哪个设置项（{report._FIX_FIELD}）—— "
+        "用户只能自己猜去哪调")
+
+    # 点名的设置项必须在设置页真的存在（跨模块核对：横幅在 report，
+    # 字段标签在 dashboard）。标签写错了就是另一句照做不了的话。
+    try:
+        import dashboard as _dash_chk
+    except Exception:
+        _dash_chk = None
+    if _dash_chk is not None:
+        _labels = {_lab for _grp, _flds in _dash_chk._FIELDS
+                   for _k, _lab, _hint in _flds}
+        assert report._FIX_FIELD in _labels, (
+            f"横幅让用户去改「{report._FIX_FIELD}」，但设置页里没有这个字段。"
+            f"现有标签：{sorted(_labels)}")
+
+    # 指的文档小节也必须真的有这个标题
+    _tut = (ROOT / "使用教程.md").read_text(encoding="utf-8")
+    assert f"## {report._FIX_DOC}" in _tut, (
+        f"横幅让用户去读「使用教程 · {report._FIX_DOC}」，"
+        "但文档里没有这一节 —— 又是一句指向不存在的地方的建议")
+
     # 时长全为 0 的数据不能把报告搞崩。
     #
     # 第三轮审查把"hour_avg 除零"列进"未能确认的项"，当时只加了个防御性守卫。
@@ -2694,6 +2729,20 @@ def selftest() -> None:
             # 窗口首次加载页面：无 Origin（Sec-Fetch-Site: none）
             code, _b = _hit2("/settings")
             assert code == 200, f"窗口首次加载页面被拒：{code}"
+
+            # 报告页必须带导航。它自己就会给出「去设置调阈值」的建议，
+            # 而页面上原来一个入口都没有 —— 用户读完只能关窗口。
+            # 反过来，导出成 report.html 时**不该**有导航：独立文件里是死链。
+            code, body = _hit2("/report")
+            assert code == 200, f"报告页打不开：{code}"
+            assert '<div class="nav">' in body and 'href="/settings"' in body, (
+                "面板里的报告页没有导航 —— 用户读到「去设置调阈值」也无处可点")
+            assert '<div class="nav">' not in report.build_html([]), \
+                "导出的 report.html 不该有导航：独立文件里的链接点不动"
+            assert '<div class="nav">' not in report.build_html(
+                [(1789000000.0, "focused", "code.exe", "t",
+                  0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0)]), \
+                "导出的 report.html 不该有导航：独立文件里的链接点不动"
 
             # WebView2 的评分提交：Origin: null 要过守卫，落到业务校验（400）
             _form0 = _urlparse.urlencode({
