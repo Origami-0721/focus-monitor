@@ -189,6 +189,7 @@ def _run(vision_cls, db: Path, duration: float, arm=None) -> None:
 
     `arm(mon)` 用来在 run() 之前挂上定时器（暂停/恢复这类按时间轴驱动的动作）。
     """
+    global _T0
     focus.DB_PATH = db
     focus.ensure_models = lambda on_progress=None: None
     focus.Vision = vision_cls
@@ -197,6 +198,12 @@ def _run(vision_cls, db: Path, duration: float, arm=None) -> None:
     focus.idle_seconds = lambda: 0.0
 
     mon = focus.Monitor()
+    # 时间轴的原点必须在这里取，**不能留在调用方**：调用方是在 `Monitor()`
+    # 构造之前取的，而"跑多久"的计时器是从下面这一行才开始的 —— 两个原点
+    # 之间隔着 Monitor 构造那一段。本机是几毫秒，CI 上偶尔要一两秒，正好吃掉
+    # 场景②的余量（drowsy 最早 5.8 秒才出现，采集窗口只有 8.0 秒）→ 偶发红，
+    # 而且红在"判不出疲劳"这种看起来像逻辑坏了的断言上，极难查。
+    _T0 = time.time()
     if arm is not None:
         arm(mon)
     threading.Timer(duration, mon.stop).start()
@@ -251,7 +258,7 @@ def _check_face_loss_timeline() -> str:
     focus.EAR_SUSTAIN = 2.0
     try:
         db = Path(tempfile.mkdtemp()) / "pipeline-timeline.db"
-        _T0 = time.time()         # 必须在起线程之前，时间轴是相对它算的
+        _T0 = 0.0                 # 真值由 _run() 在起线程前取（见那里的注释）
         _run(_ScriptedVision, db, _TIMELINE_DURATION)
         rows = _rows(db)
     finally:
@@ -259,7 +266,8 @@ def _check_face_loss_timeline() -> str:
 
     drowsy = [ts for ts, st, _e in rows if st == "drowsy"]
     assert _ScriptedVision.return_ts is not None, (
-        "脚本化的时间线没跑到「回来」那一段 —— 采集循环可能提前停了")
+        "脚本化的时间线没跑到「回来」那一段 —— 采集循环可能提前停了"
+        f"（只落了 {len(rows)} 条样本）")
     assert drowsy, (
         f"一直闭着眼（3.8 秒起）却始终判不出「疲劳」，实际状态分布 "
         f"{sorted({st for _t, st, _e in rows})} —— 丢脸作废的逻辑把真疲劳也清掉了")
@@ -282,7 +290,7 @@ def _check_resume_after_pause() -> str:
     try:
         db = Path(tempfile.mkdtemp()) / "pipeline-pause.db"
         _resume_ts = 0.0
-        _T0 = time.time()
+        _T0 = 0.0                 # 真值由 _run() 在起线程前取（见那里的注释）
 
         def arm(mon):
             threading.Timer(_PAUSE_AT,
@@ -295,10 +303,11 @@ def _check_resume_after_pause() -> str:
         focus.EAR_MIN_SAMPLES, focus.EAR_SUSTAIN = saved
 
     drowsy = [ts for ts, st, _e in rows if st == "drowsy"]
-    assert _resume_ts > 0, "时间线没跑到「恢复」那一段"
+    assert _resume_ts > 0, (
+        f"时间线没跑到「恢复」那一段（只落了 {len(rows)} 条样本）")
     assert drowsy, (
         f"恢复之后一直闭着眼却判不出「疲劳」，实际状态分布 "
-        f"{sorted({st for _t, st, _e in rows})}")
+        f"{sorted({st for _t, st, _e in rows})}，只落了 {len(rows)} 条样本")
 
     # _resume_ts 记的是"解除暂停"那一刻，而循环最多晚 0.5 秒（暂停时的 sleep）
     # 才真正回到采集 —— 这个偏差只会让 offset 更大，所以是安全方向。
