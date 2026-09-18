@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import webbrowser
 
 import dashboard
@@ -65,6 +66,26 @@ def start_main() -> None:
     _window = page
     page.events.closing += _on_closing
     webview.start()
+
+
+def wait_until_ready(timeout: float = 20.0) -> bool:
+    """等 GUI 窗口对象建出来（`start_main` 在**主线程**上创建它）。
+
+    为什么要等：面板服务在 `run_tray` 之前就起来了，所以"请把面板显示出来"
+    这个请求可能比 GUI 循环更早到。那时 `_window` 还是 None，`open_page`
+    会走"窗口层不可用"的兜底 —— 用系统浏览器弹一个新网页。那正是要修的
+    bug（用户报的"不断开新网页弹出面板"），所以这里必须等一下，而不是
+    一看到 None 就当成"窗口层坏了"。
+
+    返回 False 表示超时（GUI 循环没跑起来）。**别在这里替调用方兜底** ——
+    降级成浏览器是调用方的决定，它才知道那时还有没有别的路可走。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _window is not None:
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def open_page(page: str = "panel") -> None:

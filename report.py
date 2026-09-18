@@ -23,7 +23,7 @@ from pathlib import Path
 
 import focus
 import ratings
-from focus import DB_PATH, STATES
+from focus import STATES
 
 # 打包成 exe 后 __file__ 指向临时解压目录，报告写进去等于没生成。
 # frozen 时以 exe 所在目录为根，报告和 CSV 落在用户看得见的地方。
@@ -108,12 +108,21 @@ def _band_from_hour(h: int, gran: str) -> str:
 def load(db_path: Path | None = None, since: float | None = None) -> list[tuple]:
     """读样本。since 是时间戳下界 —— 实时面板每次轮询都读，不能全表扫。
 
-    默认路径在**调用时**取，不写成 `db_path=DB_PATH` 参数默认值。
-    参数默认值在 import 时就绑定死了，而 focus.DB_PATH 是允许被改的
-    （自检、测试、多库对照都靠这个）—— 写死之后那些场景会静默读错文件，
-    返回空列表，看起来像"没数据"，很难查。
+    **默认库路径必须在调用时从 focus 取，只有这一个开关。**
+
+    原来写的是 `db_path = DB_PATH`，而那个 `DB_PATH` 是 `from focus import DB_PATH`
+    在 import 那一刻绑定的副本 —— 之后再改 `focus.DB_PATH` **完全不起作用**。
+    代码和它自己的说明是矛盾的：上面那句"focus.DB_PATH 是允许被改的"就写在这段
+    注释里，ratings.py 也确实是动态读的，只有这里没跟上。
+
+    后果不是报错，而是**静默混库**：样本来自 A 库、评分来自 B 库，
+    算出一个看起来合理、其实毫无意义的相关系数。做真机验证时中过招 ——
+    只把其中一个路径指向副本，报告照常渲染，数字也是"可信"的样子。
+
+    `focus.DB_PATH` 而不是参数默认值 `db_path=focus.DB_PATH`：参数默认值在
+    函数定义时就求值了，同样会绑死（自检里有一条断言专门钉这个）。
     """
-    db_path = DB_PATH if db_path is None else db_path
+    db_path = focus.DB_PATH if db_path is None else db_path
     sql = ("SELECT ts,state,app,title,yaw,pitch,ear,tilt,scale,present,idle "
            "FROM samples")
     args: tuple = ()

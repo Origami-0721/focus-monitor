@@ -180,6 +180,35 @@ FLOW_QUIET = 300.0
 # 否则"一整天不间断专注"的人永远收不到评分样本（见 should_prompt_rating）。
 PROMPT_CEILING = 2 * 3600.0
 
+# ── 走神的判据 ──
+# **应用类型永远不能单独判走神。** 实测被冤枉过：在 B 站看了半小时高数课，
+# 因为标题里带"哔哩哔哩"就被判成走神。平台是娱乐的，内容不是 —— 而程序
+# 只看得到进程名和标题、看不到内容，所以它没有资格下这个结论。
+#
+# 拿真实库（121286 条样本）核过：21765 条走神里，14909 条（68.5%）是
+# "脸在画面 + 正对屏幕"，只可能来自应用类型那条规则；而"脸在但转头/低头"
+# 只有 51 条。也就是说走神几乎全是这条规则造的，眼睛的动作反倒几乎没被用上。
+#
+# 所以应用类型降级成"只抬高、不贬低"：work 能升成「专注」，其余一律「中性」
+# （中性算投入时长，见 ENGAGED）。走神只剩两条**行为**判据：
+#   一、脸在画面但没朝向屏幕（转头 / 低得太狠）—— decide() 末尾那条，本来就在。
+#   二、在几个页面之间来回切、哪个都没停住 —— 下面这个阈值。
+DISTRACT_SWITCH_RATE = 20.0     # 次/分钟
+DISTRACT_SWITCH_WINDOW = 60.0   # 回看窗口（秒）
+# 20 是拿真实数据标定的，不是拍脑袋：他 66374 条非离开样本里，每 60 秒
+# 切换次数的 p50=2 / p75=5 / p90=8 / p95=10 / p99=14 / max=25。
+# 取 15 会命中 0.81% 的样本 —— 里面赫然有他写 C++ 的 Visual Studio 会话，
+# 那是真在干活。刚因为误判被投诉过，这条新规则宁可欠触发，所以取 20
+# （命中 0.11%：只有"平均每 3 秒换一个窗口、连着换满一分钟"才够得着）。
+# 想更严就调小（12 会命中 2.9%），想让它完全不触发就调到 9999。
+#
+# **别指望它抓短视频。** 刷抖音那种场景窗口标题一直不变、切换次数是 0 ——
+# 前置摄像头加窗口标题看不到内容，这类"什么都没干"它看不见。
+# 同理，标题里带时钟/进度的应用会被它当成一直在切，真遇到就调大这个值。
+# 另外，标题只多一个 `*`（编辑器的"已修改"标记）也算一次切换 ——
+# 实测他的数据里这不构成问题（次数到 20 时，一分钟内确实见过 5 个以上
+# 不同窗口），但这是个已知的粗糙处。
+
 WORK_APPS = {
     "code.exe", "code - insiders.exe", "cursor.exe", "devenv.exe", "idea64.exe",
     "pycharm64.exe", "sublime_text.exe", "notepad++.exe", "notepad.exe",
@@ -192,6 +221,12 @@ WORK_APPS = {
 # 既不会算专注也不会算走神。实测踩过的坑：游戏 exe 名（如 zenlesszonezero.exe）
 # 和中文标题都不匹配任何默认关键词，会被静默归到"中性"。
 # 分类在采集时就写入数据库了，改完这里要重新记录才生效。
+#
+# **DISTRACT_KEYWORDS 不再判走神**（见常量区 DISTRACT_SWITCH_RATE 上方那段）。
+# 它现在唯一的作用是"别硬说专注"：命中这里的应用，看着屏幕也只算「中性」。
+# 于是这张表配漏了不再有害（漏了顶多算中性），配多了也不再冤枉人 ——
+# 以前配错一个词就等于凭空给人扣一整天走神时长。想让应用完全不参与
+# 判定，把表清空即可。
 DISTRACT_KEYWORDS = (
     "抖音", "哔哩哔哩", "bilibili", "youtube", "微博", "weibo", "小红书",
     "知乎", "淘宝", "京东", "爱奇艺", "腾讯视频", "优酷", "直播", "游戏",
@@ -199,15 +234,24 @@ DISTRACT_KEYWORDS = (
     "王者荣耀", "英雄联盟", "漫画", "小说", "贴吧", "虎扑",
     "netflix", "twitch", "reddit", "instagram", "tiktok",
 )
-# 学习豁免表：只在"本来要判分心"时才启用（见 classify_app）。
-# 目的是救回"在 B 站看 C++ 课"这种情况 —— 平台是娱乐的，内容不是。
-# 别加"第""讲"这种单字，太泛，"【第5期】游戏实况"会被误救。
+# 学习豁免表：命中它就升成「专注」（见 classify_app）。
+# 目的是认出"在 B 站看 C++ 课"这种情况 —— 平台是娱乐的，内容不是。
+# 别加"第""讲"这种单字，太泛，"【第5期】游戏实况"会被误当成学习。
+#
+# 实测教训：**光靠关键词救不全，别指望它兜底。** 用户实际看的标题是
+# 《高等数学》全程教学视频【宋浩老师】、"2 函数"、"18 运算符-算术运算符"，
+# 一个词都没命中，全被判成走神。真正的修法是取消"应用类型判走神"，
+# 这张表只是锦上添花 —— 所以它命不中也不再是致命问题。
 STUDY_KEYWORDS = (
     "c++", "cpp", "python", "java", "javascript", "typescript", "rust",
     "golang", "kotlin", "swift", "sql", "linux", "docker", "git", "leetcode",
     "教程", "课程", "公开课", "网课", "mooc", "lecture", "tutorial",
     "算法", "数据结构", "编译原理", "操作系统", "计算机网络", "计网",
     "考研", "习题", "作业", "复习", "论文", "答辩", "文献",
+    # 学科名：实测漏得最狠的一类。"数学"这种词只会在已经命中娱乐平台
+    # （B 站/YouTube）时才起作用，所以误救风险很低。
+    "数学", "高数", "线代", "概率论", "离散数学", "物理", "化学", "英语",
+    "四级", "六级", "期末", "期中", "考试",
     "documentation", "文档", "手册", "api 参考", "网课笔记",
 )
 
@@ -243,6 +287,8 @@ _SCALARS: dict[str, type] = {
     "EAR_CLOSED": float, "EAR_SUSTAIN": float,
     "AWAY_FACE": float, "AWAY_IDLE": float,
     "TILT_WARN": float, "AWAY_WRITE_EVERY": float,
+    # 走神的行为判据，也是最该按自己习惯调的一个数（见常量区注释）
+    "DISTRACT_SWITCH_RATE": float,
 }
 _LIST_KEYS = ("WORK_APPS", "DISTRACT_KEYWORDS", "STUDY_KEYWORDS")
 
@@ -278,6 +324,10 @@ def validate_config(cfg: dict) -> list[str]:
             errs.append(f"{k} 必须为正数")
     if cfg["EAR_SUSTAIN"] <= 0 or cfg["AWAY_FACE"] <= 0:
         errs.append("疲劳/离开的持续秒数必须为正数")
+    # 配小了会把"正常来回切窗口"判成走神（0 的话**每条样本都判走神**，
+    # 直接把数据毁掉）；配太大则这条判据等于不存在。见常量区的标定说明。
+    if cfg["DISTRACT_SWITCH_RATE"] <= 0:
+        errs.append("「页面切换频率」必须为正数，否则每条样本都会判成走神")
     return errs
 
 
@@ -517,11 +567,18 @@ def shoulder_tilt(lx: float, ly: float, rx: float, ry: float) -> float:
 
 
 def classify_app(exe: str, title: str) -> str:
-    """把当前窗口分成 work / distract / other 三类。"""
+    """把当前窗口分成 work / distract / other 三类。
+
+    **这个分类只用来"抬高"，不用来"贬低"** —— 见 decide() 里的用法：
+    work 能升成「专注」，distract 只降到「中性」，永远不会降成「走神」。
+    理由见常量区 DISTRACT_SWITCH_RATE 上方那段：在 B 站看高数课被这个
+    分类直接判成走神，是实测报上来的 bug。
+    """
     hay = f"{exe} {title}".lower()
     if any(k in hay for k in DISTRACT_KEYWORDS):
-        # 学习豁免只在这条分支生效：本来要判分心的，如果内容看着是学习就算工作。
-        # 放在这里而不是最前面，是为了不去干扰正常工作应用的判断。
+        # 学习豁免：平台是娱乐的、内容不是（B 站看 C++ 课）。命中就直接升成
+        # work，也就是「专注」。它以前只是"免死金牌"，现在是真的加分项 ——
+        # 因为 distract 已经不再扣分了。
         if any(k in hay for k in STUDY_KEYWORDS):
             return "work"
         return "distract"
@@ -531,18 +588,36 @@ def classify_app(exe: str, title: str) -> str:
 
 
 def decide(*, face_present: bool, yaw: float, pitch: float, closed_for: float,
-           idle_sec: float, app_kind: str, away_for: float) -> str:
-    """输入这一秒的聚合指标，输出状态。状态机全部规则都在这。"""
+           idle_sec: float, app_kind: str, away_for: float,
+           switch_rate: float = 0.0) -> str:
+    """输入这一秒的聚合指标，输出状态。状态机全部规则都在这。
+
+    switch_rate 是"最近一分钟里活动窗口切换了几次"，由调用方在滚动窗口上
+    算好（见采集循环）。它有默认值 0.0，所以老调用方（自检里的单点断言）
+    不改也不会被这条误伤。
+
+    **应用类型只抬高、不贬低**：work → 专注，其余一律 → 中性。娱乐应用
+    不再直接判走神，理由见常量区 DISTRACT_SWITCH_RATE 上方那段。
+    """
     if idle_sec >= AWAY_IDLE or away_for >= AWAY_FACE:
         return "away"
     if not face_present:
         return "distracted"          # 短暂丢脸，还不算离开
     if closed_for >= EAR_SUSTAIN:
         return "drowsy"
+
+    # 在几个页面之间来回切、哪个都没停住 —— 典型的"翻来翻去但什么都没干"。
+    # 这是纯行为判据，不看用的是哪个应用。阈值是拿真实数据标定的。
+    if switch_rate >= DISTRACT_SWITCH_RATE:
+        return "distracted"
+
     if abs(yaw) <= YAW_TOL:
         if abs(pitch) <= PITCH_TOL:
-            # 看着屏幕
-            return {"work": "focused", "distract": "distracted"}.get(app_kind, "neutral")
+            # 看着屏幕。这里就是那个 bug 的位置：原来 distract 直接返回
+            # "distracted"，于是「看 B 站 = 走神」。现在只有白名单里的工作
+            # 应用能升成专注，其余（含娱乐应用、不认识的）都是中性 ——
+            # 中性算投入时长（见 ENGAGED），所以看网课不会再被扣分。
+            return "focused" if app_kind == "work" else "neutral"
         if PITCH_TOL < pitch <= DESK_PITCH_MAX:
             # 正对桌子低头 —— 看书 / 写作业，也可能是玩手机（前置摄像头分不出）。
             # 下界必须是 PITCH_TOL 而不是负无穷：仰头看天花板不算伏案。
@@ -1031,6 +1106,10 @@ class Monitor(threading.Thread):
         # 正好落进"丢脸超时"那一支，不会留下一个假的计时起点。
         last_face_seen = 0.0
         lean = 0.0
+        # 窗口/页面切换的时刻，用来算"来回切换"的频率（走神判据之一）。
+        # 只留最近 DISTRACT_SWITCH_WINDOW 秒，窗口外的即时丢掉。
+        switch_at: deque[float] = deque()
+        last_window: tuple[str, str] | None = None
 
         try:
             while self.running:
@@ -1166,9 +1245,24 @@ class Monitor(threading.Thread):
                         exe, title = active_window()
                         kind = classify_app(exe, title)
 
+                        # 「在几个页面之间来回切」的度量：最近一分钟换了几次
+                        # 前台窗口。这是纯行为判据，不看是哪个应用 ——
+                        # 见 decide() 里对它的用法和常量区的标定说明。
+                        #
+                        # 只在每秒结算时看一次，所以同一秒内连切几次只会被记成
+                        # 一次。真实的切换比这慢得多，够用，而且省掉一层采样。
+                        if (exe, title) != last_window:
+                            last_window = (exe, title)
+                            switch_at.append(now)
+                        while (switch_at
+                               and now - switch_at[0] > DISTRACT_SWITCH_WINDOW):
+                            switch_at.popleft()
+                        switch_rate = len(switch_at) * (60.0 / DISTRACT_SWITCH_WINDOW)
+
                         st = decide(face_present=present, yaw=yaw, pitch=pitch,
                                     closed_for=closed_for, idle_sec=idle_seconds(),
-                                    app_kind=kind, away_for=away_for)
+                                    app_kind=kind, away_for=away_for,
+                                    switch_rate=switch_rate)
 
                         # 离开期间降频落库。**判断必须在 INSERT 之前** ——
                         # 原来这段写在 commit() 之后，样本早就落库了，continue
@@ -1904,8 +1998,35 @@ def stop_running() -> None:
     print(f"已停止专注监视（PID {pid}）。")
 
 
+def show_panel(timeout: float = 20.0) -> None:
+    """把面板窗口显示出来。**只能在监视进程里调用。**
+
+    窗口是监视进程的（`window.start_main()` 在它的主线程上跑），别的进程
+    碰不到 —— 所以"显示面板"这个动作必须由**持有窗口的那个进程**来做。
+    见 wait_and_open 的注释：以前是在子进程里直接调 open_page()，而那边
+    `_window` 永远是 None，于是每次都退到系统浏览器弹一个新网页。
+
+    等 `_window` 建出来是必须的：面板服务比 GUI 循环起得早，"请显示面板"
+    这个请求常常先到，那时窗口对象还不存在 —— 直接 show 又会退到浏览器，
+    等于把这个 bug 换个地方复现一遍。
+    """
+    try:
+        import window
+    except Exception:
+        log.exception("窗口层加载不了，改用系统浏览器")
+        open_page("panel")
+        return
+    if not window.wait_until_ready(timeout):
+        # 窗口层在、但 GUI 循环没起来（pythonnet / WebView2 卡住之类）。
+        # 这时**必须**降级到浏览器，否则用户点了开关什么都看不到。
+        log.warning("等了 %.0f 秒窗口还没建出来，改用系统浏览器", timeout)
+        open_page("panel")
+        return
+    open_page("panel")
+
+
 def wait_and_open(timeout: float = 120.0) -> None:
-    """等面板就绪再打开应用窗口。
+    """等面板就绪，再请**监视进程**把它的窗口显示出来。
 
     模型加载要十几秒，启动后立刻打开只会看到「无法连接」。
 
@@ -1913,6 +2034,12 @@ def wait_and_open(timeout: float = 120.0) -> None:
     托盘那条路，所以它必须自己 setup_log()：不然它出的任何问题都进不了
     focus.log，而 exe 是 --windowed、连 stderr 都没有 ——
     用户看到的只是"双击了，什么都没打开"，没有任何线索可查。
+
+    **它不能自己 open_page()。** 窗口属于监视进程，这个子进程里的
+    `window._window` 永远是 None，`open_page` 于是每次都走"窗口层不可用"
+    的兜底 —— 用系统浏览器弹一个新网页。用户报的「双击开关就不断开新网页
+    弹出这个面板、真正的应用窗口却不见」就是这么来的：开关每点一次，
+    就多一个浏览器标签页。
     """
     setup_log()
     try:
@@ -1921,14 +2048,17 @@ def wait_and_open(timeout: float = 120.0) -> None:
         port = 8787
     url = f"http://127.0.0.1:{port}/"
 
-    # 第一段：只负责"等服务就绪"。**不要**把开窗口塞进同一个 try ——
-    # 塞在一起的话，`import window` 失败（发布包漏了 pywebview）会被当成
-    # "服务还没起来"，于是一路重试到超时、最后一声不吭地退出。
-    # 这两个失败的原因完全不同，必须分开处理。
+    # 第一段：只负责"等服务就绪"。**不要**把"显示面板"塞进同一个 try ——
+    # 塞在一起的话，那一步失败会被当成"服务还没起来"，于是一路重试到
+    # 超时、最后一声不吭地退出。这两个失败的原因完全不同，必须分开处理。
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            urllib.request.urlopen(url, timeout=2).close()
+            # 必须把响应体读掉再关。只调 .close() 等于中途掐断连接，服务端
+            # 写响应时会抛 ConnectionAbortedError，在用户日志里留下一串
+            # "面板处理 GET / 出错"的假故障 —— 排查时会被这堆噪音带偏。
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                resp.read()
             break
         except Exception:
             time.sleep(1.5)
@@ -1936,9 +2066,18 @@ def wait_and_open(timeout: float = 120.0) -> None:
         log.warning("等面板就绪超时（%.0f 秒），放弃自动打开窗口", timeout)
         return
 
-    # 第二段：开页面。走 open_page()，它自己带"窗口层坏了退到浏览器"的兜底 ——
-    # 这段逻辑原先在这里手写了一份，托盘菜单里又各写各的，窗口层一坏就
-    # 三处一起失灵。抽成一处，行为测试也才测得到。
+    # 第二段：请监视进程把窗口显示出来。
+    try:
+        with urllib.request.urlopen(url + "show-panel", timeout=10) as resp:
+            resp.read()
+        log.info("已请求监视进程显示面板")
+        return
+    except Exception:
+        log.exception("请求监视进程显示面板失败，退到本进程打开")
+
+    # 兜底：老版本的监视进程没有这个路由（用户刚更新了开关、后台进程还是
+    # 旧的）。这条路至少能让页面出现，哪怕它落在浏览器里 ——
+    # 比"双击了没反应"好。
     open_page("panel")
 
 
@@ -2100,6 +2239,12 @@ def selftest() -> None:
         "chrome.exe", "【C++】清华大学 程序设计基础 第3讲 - 哔哩哔哩") == "work"
     assert classify_app("chrome.exe", "算法导论 公开课 - 哔哩哔哩") == "work"
     assert classify_app("chrome.exe", "考研数学 复习 - 哔哩哔哩") == "work"
+    # 学科名是实测漏得最狠的一类：用户真正看的标题长这样，旧关键词一个都不含。
+    assert classify_app(
+        "firefox.exe",
+        "《高等数学》全程教学视频 2.0版【宋浩老师】_哔哩哔哩") == "work"
+    assert classify_app("firefox.exe", "2 函数_哔哩哔哩") == "distract", \
+        "「2 函数」这种标题本来就认不出来 —— 它只能落到中性，绝不能判走神"
     # 豁免不能滥用：不带学习关键词的娱乐内容照常判分心
     assert classify_app("chrome.exe", "【4K】舞蹈区精选 - 哔哩哔哩") == "distract"
     assert classify_app("chrome.exe", "王者荣耀 直播 - 哔哩哔哩") == "distract"
@@ -2109,7 +2254,27 @@ def selftest() -> None:
                 idle_sec=0.0, app_kind="work", away_for=0.0)
     assert decide(**base) == "focused"
     assert decide(**{**base, "app_kind": "other"}) == "neutral"
-    assert decide(**{**base, "app_kind": "distract"}) == "distracted"
+    # ── 应用类型只抬高、不贬低 ──
+    # 实测 bug：在 B 站看半小时高数课被判成走神，因为标题里带"哔哩哔哩"。
+    # 娱乐应用现在只降到「中性」（中性算投入时长，见 ENGAGED）。
+    assert decide(**{**base, "app_kind": "distract"}) == "neutral", \
+        "娱乐应用又被直接判走神了 —— 用户在 B 站看高数课就是被这条冤枉的"
+    # 走神只剩行为判据。第一条：来回切窗口（不看是哪个应用）。
+    assert decide(**{**base, "switch_rate": DISTRACT_SWITCH_RATE}) == "distracted"
+    assert decide(**{**base, "switch_rate": DISTRACT_SWITCH_RATE - 1}) == "focused"
+    assert decide(**{**base, "app_kind": "work",
+                     "switch_rate": DISTRACT_SWITCH_RATE}) == "distracted", \
+        "来回切窗口的判据必须对工作应用同样生效 —— 它压根不看应用类型"
+    # 通用护栏：只要脸在、正对屏幕、没在狂切窗口，**任何**应用都不能判走神。
+    # 上一条断言钉的是那一个 bug，这条钉的是"不许再长出一个同类规则"。
+    for _kind in ("work", "distract", "other", "", "WORK"):
+        for _y, _p in ((0.0, 0.0), (YAW_TOL, PITCH_TOL), (-YAW_TOL, 15.8)):
+            _st = decide(**{**base, "app_kind": _kind, "yaw": _y, "pitch": _p})
+            assert _st != "distracted", (
+                f"app_kind={_kind!r} 正对屏幕却被判走神（{_st}）—— 应用类型"
+                "没有资格单独判走神（实测：B 站看高数课就是这么被冤枉的）")
+    # 默认值必须是 0.0：老调用方（上面的单点断言）不该被新判据误伤
+    assert decide(**{**base, "app_kind": "distract"}) == "neutral"
     assert decide(**{**base, "yaw": 60.0}) == "distracted"        # 转头
     assert decide(**{**base, "pitch": -40.0}) == "distracted"     # 仰头看天花板
     # 伏案：低头对着桌子，但没低到贴桌面
@@ -2398,6 +2563,35 @@ def selftest() -> None:
                 f"verdict({_r}, {_nn}) 里出现了「校准」：{_v!r} —— "
                 "程序没有校准功能，用户会照着去找（实测反馈过）")
 
+    # ── report.load() 必须跟着 focus.DB_PATH 走 ──
+    # 这是"多库对照"的唯一开关：ratings 一直是动态读的，report 原来读的是
+    # `from focus import DB_PATH` 在 import 那一刻的副本，改了 focus.DB_PATH
+    # 对它**完全不起作用** —— 而它自己的 docstring 恰好写着这个开关是有效的。
+    # 后果不是报错而是**静默混库**：样本来自 A 库、评分来自 B 库，算出一个
+    # 看起来合理、其实毫无意义的相关系数。（做真机验证时就是这么中招的。）
+    _seam_db = ROOT / "_selftest_seam.db"
+    _keep_db = DB_PATH
+    try:
+        _sconn = open_db(_seam_db)
+        try:
+            _sconn.executescript(SCHEMA)
+            _sconn.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           (1.0, "focused", "code.exe", "t", 0.0, 0.0, 0.3,
+                            1.0, 1.0, 1, 0.0))
+            _sconn.commit()
+        finally:
+            _sconn.close()
+        globals()["DB_PATH"] = _seam_db
+        try:
+            assert len(report.load()) == 1, (
+                "改了 focus.DB_PATH，report.load() 却没跟着换库 —— "
+                "它会继续读 import 时绑定的那份，于是样本和评分可能来自两个库，"
+                "算出一个看起来合理、其实毫无意义的相关系数")
+        finally:
+            globals()["DB_PATH"] = _keep_db
+    finally:
+        _seam_db.unlink(missing_ok=True)
+
     # ── 实时面板上同样不许出现「校准」──
     # 和上面同源：用户看到"校准中 37/60"会去找一个能点的校准按钮，
     # 而程序里没有这个功能。所以这条不是措辞偏好，是同一个缺陷的另一处。
@@ -2411,7 +2605,7 @@ def selftest() -> None:
     except Exception:
         _dash_live_mod = None
     if _dash_live_mod is not None:
-        _real_pref = report.DB_PATH
+        _real_pref = DB_PATH
         _pdb = ROOT / "_selftest_panel.db"
         try:
             _pc = open_db(_pdb)
@@ -2426,7 +2620,7 @@ def selftest() -> None:
                 _pc.commit()
             finally:
                 _pc.close()
-            report.DB_PATH = _pdb
+            globals()["DB_PATH"] = _pdb
             _panel = _dash_live_mod._live_html()
             assert "校准" not in _panel, (
                 "实时面板上出现了「校准」—— 用户会去找一个不存在的校准按钮"
@@ -2434,7 +2628,7 @@ def selftest() -> None:
             assert "学习中" in _panel, (
                 "面板没写出基线还在学习 —— 用户不知道那个 37/60 是什么")
         finally:
-            report.DB_PATH = _real_pref
+            globals()["DB_PATH"] = _real_pref
             _pdb.unlink(missing_ok=True)
 
     # 数据库往返。用临时库 —— 绝不能污染用户的真实 focus.db
@@ -2928,16 +3122,16 @@ def selftest() -> None:
     if not getattr(sys, "frozen", False) and (ROOT / ".venv").exists():
         assert PYW.exists(), f"找不到 {PYW} —— 开发机上桌面开关会失效"
 
-    # ── wait_and_open：服务等不到要退出、窗口开不了要退到浏览器 ──
+    # ── wait_and_open：服务等不到要退出、显示面板要**交给监视进程** ──
     #
-    # 原来这两件事挤在同一个 try 里：`import window` 失败会被当成"服务还没起来"，
-    # 于是一路重试到 120 秒超时、最后一声不吭地退出。发布包漏了 pywebview 时
-    # 就是这个表现。下面两条分别把这两条路径钉住。
+    # 原来这两件事挤在同一个 try 里：开窗口失败会被当成"服务还没起来"，
+    # 于是一路重试到 120 秒超时、最后一声不吭地退出。发布包漏了 pywebview
+    # 时就是这个表现。下面几条把这几条路径分别钉住。
     #
     # 这一段必须**压住日志**：wait_and_open 第一件事就是 setup_log()，于是下面
-    # 两条"故意制造失败"的调用会把假的 ModuleNotFoundError / 「应用窗口打不开」
-    # 写进用户真正的 focus.log。实测踩到过：用户日志里躺着几条这样的 ERROR，
-    # 看起来像"窗口层真的坏了"，其实是自检自己造的 —— 排查时会被带偏。
+    # 这些"故意制造失败"的调用会把假的 ERROR 写进用户真正的 focus.log。
+    # 实测踩到过：用户日志里躺着几条这样的 ERROR，看起来像"窗口层真的坏了"，
+    # 其实是自检自己造的 —— 排查时会被带偏。
     _keep_lvl_wa = log.level
     log.setLevel(logging.CRITICAL)
     _t0 = time.time()
@@ -2945,34 +3139,129 @@ def selftest() -> None:
     assert time.time() - _t0 < 10.0, "服务等不到时必须及时返回，不能一直转"
 
     _real_urlopen = urllib.request.urlopen
-    _win_mod = sys.modules.get("window", "__absent__")
     _real_open = webbrowser.open
+    _win_mod = sys.modules.get("window", "__absent__")
     _opened: list[str] = []
+    _asked: list[str] = []
 
     class _FakeResponse:
-        """只要能被 .close() 就行 —— wait_and_open 只用它判断"服务活了没"。"""
+        """要能当上下文管理器用、还要有 read() —— wait_and_open 会把响应体
+        读完再关（不读完就关，会在服务端留下 ConnectionAbortedError）。"""
+
+        def read(self, *a, **k):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
 
         def close(self):
             pass
 
+    def _run_wa(fail_show: bool) -> None:
+        """跑一次 wait_and_open，记下"请求了哪些地址、开了哪些网页"。"""
+        def _fake_urlopen(u, *a, **k):
+            _asked.append(u)
+            if fail_show and u.endswith("/show-panel"):
+                raise OSError("404")      # 模拟老版本进程没有这个路由
+            return _FakeResponse()
+
+        try:
+            urllib.request.urlopen = _fake_urlopen
+            # 让 `import window` 失败（等价于发布包里漏了 pywebview）：
+            # sys.modules 里放 None 会让 import 直接抛 ImportError。
+            sys.modules["window"] = None
+            webbrowser.open = lambda u, *a, **k: _opened.append(u)
+            wait_and_open(timeout=5.0)
+        finally:
+            urllib.request.urlopen = _real_urlopen
+            webbrowser.open = _real_open
+            log.setLevel(_keep_lvl_wa)   # 见上：故意制造的失败不该进日志
+            if _win_mod == "__absent__":
+                sys.modules.pop("window", None)
+            else:
+                sys.modules["window"] = _win_mod
+
+    # 正常路径：请求必须发给**监视进程**，而且成功时**绝不能**再开浏览器。
+    # 后者正是用户报的「双击开关不断弹出新网页」—— 子进程里没有窗口，
+    # 它自己调 open_page() 每次都退到浏览器。
+    _run_wa(fail_show=False)
+    assert any(u.endswith("/show-panel") for u in _asked), (
+        "wait_and_open 没有请监视进程显示面板 —— 它会自己调 open_page()，"
+        "而那个子进程里没有窗口，每次都会退到浏览器弹一个新网页")
+    assert not _opened, (
+        f"监视进程已经接管了显示面板，wait_and_open 还是自己开了浏览器："
+        f"{_opened} —— 用户看到的就是「双击开关不断弹出新网页」")
+
+    # 兜底路径：老版本监视进程没有 /show-panel 路由（用户刚更新了开关、
+    # 后台进程还是旧的）→ 必须退到本进程打开，哪怕落在浏览器里。
+    _opened.clear()
+    _asked.clear()
+    _run_wa(fail_show=True)
+    assert _opened, (
+        "连监视进程都请不动时，wait_and_open 必须退到系统浏览器 —— "
+        "否则用户看到的是「双击了没反应」")
+
+    # ── show_panel：窗口层在、GUI 却没起来 → 仍然要开出一个页面来 ──
+    #
+    # 这条钉两件事：
+    #   1. 必须**真的等**窗口对象。超时传 0（或者干脆不等）等于不等 ——
+    #      那时 _window 还是 None，open_page 会走"窗口层不可用"的兜底弹一个
+    #      浏览器网页，正是要修的那个 bug。所以这里验的是"等的时候带了
+    #      正的超时"，不是"等到了"。
+    #   2. 等不到之后不能干耗着，还是得把面板开出来。
+    #
+    # 浏览器兜底本身在 window.open_page 里面（那边才看得到 _window），
+    # 这里用一个假的 window 模块顶替，所以断言落在"交给它了"这一层。
+    _win_mod3 = sys.modules.get("window", "__absent__")
+    _real_open3 = webbrowser.open
+    _fake_win = type(sys)("window")
+    _fake_calls: list[str] = []
+    _wa_timeouts: list[float] = []
+
+    def _fake_wait(timeout=20.0):
+        _wa_timeouts.append(timeout)
+        return False                    # 模拟 GUI 循环一直没起来
+
+    _fake_win.open_page = lambda page="panel": _fake_calls.append(page)
+    _fake_win.wait_until_ready = _fake_wait
     try:
-        # 让"服务已就绪"成立
-        urllib.request.urlopen = lambda *a, **k: _FakeResponse()
-        # 让 `import window` 失败（等价于发布包里漏了 pywebview）：
-        # sys.modules 里放 None 会让 import 直接抛 ImportError。
-        sys.modules["window"] = None
-        webbrowser.open = lambda u, *a, **k: _opened.append(u)
-        wait_and_open(timeout=5.0)
+        sys.modules["window"] = _fake_win
+        log.setLevel(logging.CRITICAL)
+        show_panel(timeout=0.1)
     finally:
-        urllib.request.urlopen = _real_urlopen
-        webbrowser.open = _real_open
-        log.setLevel(_keep_lvl_wa)      # 见上：这一段故意制造的失败不该进日志
-        if _win_mod == "__absent__":
+        log.setLevel(_keep_lvl_wa)
+        if _win_mod3 == "__absent__":
             sys.modules.pop("window", None)
         else:
-            sys.modules["window"] = _win_mod
-    assert _opened, \
-        "窗口层 import 失败时没有退到系统浏览器 —— 用户会看到「双击了没反应」"
+            sys.modules["window"] = _win_mod3
+    assert _wa_timeouts and _wa_timeouts[0] > 0, (
+        f"show_panel 没有真的去等窗口对象（收到的超时是 {_wa_timeouts}）—— "
+        "_window 还没建出来就 show，open_page 会走「窗口层不可用」的兜底"
+        "弹一个浏览器网页，正是要修的那个 bug")
+    assert _fake_calls == ["panel"], (
+        f"窗口层在、但 GUI 一直没起来时，show_panel 还是得把面板开出来"
+        f"（实际调了 {_fake_calls}）—— 否则双击开关之后什么都不出现")
+
+    # 窗口层整个加载不了（发布包漏了 pywebview）→ 必须退到系统浏览器
+    _opened3: list[str] = []
+    try:
+        sys.modules["window"] = None
+        webbrowser.open = lambda u, *a, **k: _opened3.append(u)
+        log.setLevel(logging.CRITICAL)
+        show_panel(timeout=0.1)
+    finally:
+        log.setLevel(_keep_lvl_wa)
+        webbrowser.open = _real_open3
+        if _win_mod3 == "__absent__":
+            sys.modules.pop("window", None)
+        else:
+            sys.modules["window"] = _win_mod3
+    assert _opened3, (
+        "窗口层整个加载不了时，show_panel 必须退到系统浏览器 —— "
+        "否则用户双击开关之后什么都不出现")
 
     # ── open_page：窗口层坏了要退到浏览器，**而且托盘菜单必须都走它** ──
     #
@@ -3150,6 +3439,21 @@ def selftest() -> None:
             "闭眼计时的复位跑到读脸之后了 —— 暂停后恢复时它不会执行，" \
             "陈旧的起点会让「疲劳」在恢复的瞬间就误报"
 
+        # "来回切窗口"这个信号必须真的接上。它和上面那段视觉链路是同一类故障：
+        # 生产端（统计切换次数）被删了、消费端（decide 的 switch_rate）还在，
+        # 不会有任何报错 —— switch_rate 恒为 0.0，那条判据静默失效，而自检
+        # 全绿（它测的是 decide 本身，测不出"输入根本没接上"）。所以两头都钉。
+        for _needle in (
+            "switch_at.append(now)",
+            "switch_at.popleft()",
+            "switch_rate = len(switch_at)",
+            "switch_rate=switch_rate)",
+        ):
+            assert _needle in _loop_src, \
+                f"「来回切窗口」的信号断了：找不到 {_needle!r}" \
+                "（统计端被删了、decide 的 switch_rate 会退回默认值 0.0，" \
+                "那条判据静默失效而自检全绿）"
+
         # 桌面开关：绿点必须是**确认启动成功**的结果，不能是"用户按了开关"。
         #
         # 这条行为上测不到（toggle 要真的起进程、真的弹窗，还不能真的动用户的
@@ -3177,6 +3481,12 @@ def selftest() -> None:
         # 字面量**，用 index 会命中自己，切出一段从 selftest 中间开始的源码 ——
         # 那样下面几条断言会互相命中，全部变成永远为真的摆设（这个坑上面的
         # 注释警告过一次，我还是先踩了一遍）。真正的定义在 selftest 之后。
+        #
+        # 后来又踩了第二次，而且更隐蔽：新加一条"main 里必须有 X"的断言时
+        # 顺手又写了一遍 `_main_src = _src[_src.index(...):]`，把这里正确的
+        # 那份**覆盖掉**了 —— 于是那条新断言自己命中自己的字面量，恒为真。
+        # 变异测试当场抓到了它（"这条断言是摆设"）。所以：**这段切片只能有
+        # 一份，下面所有用到 _main_src 的断言都复用它，别再自己切一次。**
         _main_src = _src[_src.rindex("def main() -> None:"):]
         assert "def selftest" not in _main_src, \
             "切片起点取错了（命中了自检里的字面量），下面的顺序断言会全部失效"
@@ -3193,6 +3503,17 @@ def selftest() -> None:
         assert (_main_src.index("first_run = not DB_PATH.exists()")
                 < _main_src.index("ensure_wal()")), \
             "ensure_wal() 跑到 first_run 之前了 —— 首次运行的面板不会再弹"
+
+        # 监视进程必须把"显示面板"的实现注册给面板服务。漏了这一步，
+        # --wait-open 子进程发来的 /show-panel 会回 ok 但什么都不做 ——
+        # 用户双击开关后窗口永远不出现，而日志里一切正常（子进程那边看到的
+        # 是 200）。这属于"两个进程之间的接线"，要起真进程才测得到。
+        #
+        # 注意这里**复用上面的 _main_src**，不再自己切一次 —— 见上面那段
+        # 注释：自己切过一次，结果断言恒为真，被变异测试抓出来了。
+        assert "dashboard.set_panel_shower(show_panel)" in _main_src, \
+            "监视进程没把「显示面板」注册给面板服务 —— 子进程发来的 " \
+            "/show-panel 会回 ok 但什么都不做，窗口永远不出现"
 
         # 采集线程的退出清理必须在 **finally** 里。
         #
@@ -3429,6 +3750,10 @@ def main() -> None:
     # 只监听 127.0.0.1；起不来也不影响采集，所以异常只记日志。
     try:
         import dashboard
+        # 把"显示面板"的实现交给面板服务。桌面开关 fork 出来的 --wait-open
+        # 子进程碰不到本进程的窗口，只能发个请求过来让**我们**自己 show()
+        # —— 见 wait_and_open 的注释：不这么做，它每次都弹一个浏览器网页。
+        dashboard.set_panel_shower(show_panel)
         log.info("实时面板: %s", dashboard.serve_background(open_browser=False))
     except Exception:
         log.exception("实时面板启动失败，监视继续")
@@ -3437,12 +3762,13 @@ def main() -> None:
     mon.start()
 
     if first_run:
-        # 模型要下十几秒且窗口层要等主线程 GUI 循环起来，所以丢到子线程，
-        # 让它等面板就绪再导航，别卡住托盘启动。
+        # 模型要下十几秒、窗口层又要等主线程的 GUI 循环起来，所以丢到子线程，
+        # 别卡住托盘启动。show_panel 自己会等窗口对象建出来（等不到就降级到
+        # 系统浏览器，见该函数）。
         def _show_first_run() -> None:
             time.sleep(3.0)
             try:
-                open_page("panel")        # 带浏览器兜底，见 open_page 注释
+                show_panel()
             except Exception:
                 log.exception("首次运行打开面板失败")
 

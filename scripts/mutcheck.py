@@ -237,6 +237,73 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "",
         "dashboard.py",
     ),
+    (
+        "report.load 把默认库路径写进参数默认值（定义时就绑死，改 DB_PATH 不再生效）",
+        "def load(db_path: Path | None = None, since: float | None = None)"
+        " -> list[tuple]:\n",
+        "def load(db_path: Path | None = focus.DB_PATH,"
+        " since: float | None = None) -> list[tuple]:\n",
+        "report.py",
+    ),
+    (
+        "娱乐应用又直接判走神（用户报的原 bug：B 站看高数课被判走神）",
+        '            return "focused" if app_kind == "work" else "neutral"\n',
+        '            return {"work": "focused", "distract": "distracted"}'
+        '.get(app_kind, "neutral")\n',
+        "focus.py",
+    ),
+    (
+        "「来回切窗口」的阈值被抬高到够不着（判据静默失效，走神只剩头部动作）",
+        "    if switch_rate >= DISTRACT_SWITCH_RATE:\n",
+        "    if switch_rate >= DISTRACT_SWITCH_RATE * 1000:\n",
+        "focus.py",
+    ),
+    (
+        "采集循环没把切换频率喂给 decide（信号恒为 0，判据等于不存在）",
+        "                                    app_kind=kind, away_for=away_for,\n"
+        "                                    switch_rate=switch_rate)\n",
+        "                                    app_kind=kind, away_for=away_for)\n",
+        "focus.py",
+    ),
+    (
+        "采集循环根本不记窗口切换（消费端还在，生产端没了）",
+        "                        if (exe, title) != last_window:\n"
+        "                            last_window = (exe, title)\n"
+        "                            switch_at.append(now)\n",
+        "                        if (exe, title) != last_window:\n"
+        "                            last_window = (exe, title)\n",
+        "focus.py",
+    ),
+    (
+        "wait_and_open 把「显示面板」请求发到错的地址（监视进程收不到）",
+        '        with urllib.request.urlopen(url + "show-panel", timeout=10) as resp:\n',
+        '        with urllib.request.urlopen(url + "showpanl", timeout=10) as resp:\n',
+        "focus.py",
+    ),
+    (
+        "wait_and_open 又自己开浏览器（用户报的原 bug：双击开关不断弹新网页）",
+        '        log.info("已请求监视进程显示面板")\n'
+        '        return\n'
+        '    except Exception:\n'
+        '        log.exception("请求监视进程显示面板失败，退到本进程打开")\n',
+        '        log.info("已请求监视进程显示面板")\n'
+        '    except Exception:\n'
+        '        log.exception("请求监视进程显示面板失败，退到本进程打开")\n'
+        '    open_page("panel")\n',
+        "focus.py",
+    ),
+    (
+        "show_panel 用 0 秒超时去等窗口（等于不等，又退到浏览器弹网页）",
+        "    if not window.wait_until_ready(timeout):\n",
+        "    if not window.wait_until_ready(0.0):\n",
+        "focus.py",
+    ),
+    (
+        "监视进程没把「显示面板」注册给面板服务（/show-panel 回 ok 但没反应）",
+        "        dashboard.set_panel_shower(show_panel)\n",
+        "",
+        "focus.py",
+    ),
 ]
 
 

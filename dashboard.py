@@ -361,6 +361,9 @@ _FIELDS = [
         ("AWAY_FACE", "人脸消失判离开（秒）", ""),
         ("AWAY_IDLE", "键鼠空闲判离开（秒）", ""),
         ("TILT_WARN", "坐姿不良肩线倾角（度）", ""),
+        ("DISTRACT_SWITCH_RATE", "来回切窗口判走神（次/分钟）",
+         "一分钟内换这么多次前台窗口就算走神，不分是哪个应用。"
+         "调到 9999 等于关掉这条判据"),
     ]),
     ("性能", [
         ("FACE_FPS", "人脸检测频率（次/秒）", "越高越吃 CPU"),
@@ -373,13 +376,15 @@ _FIELDS = [
 
 _TEXTAREAS = [
     ("WORK_APPS", "工作应用（每行一个进程名）",
-     "必须是小写带 .exe，例如 code.exe。不在这里的应用一律算「中性」，"
-     "既不算专注也不算走神"),
-    ("DISTRACT_KEYWORDS", "分心关键词（每行一个）",
-     "匹配窗口标题，中文英文都行。游戏 exe 名和中文标题一定要加，"
-     "否则会被静默归到中性（绝区零踩过这个坑）"),
+     "必须是小写带 .exe，例如 code.exe。命中它 → 判「专注」"),
+    ("DISTRACT_KEYWORDS", "娱乐应用关键词（每行一个）",
+     "匹配窗口标题，中文英文都行。注意：命中它不再判走神，只是不硬说专注 "
+     "—— 看着屏幕也只算「中性」，而中性是算进投入时长的。"
+     "想让应用完全不参与判定，清空这一栏即可"),
     ("STUDY_KEYWORDS", "学习豁免关键词（每行一个）",
-     "本来要判分心的标题里含这些词 → 改判工作。用来救「B 站看 C++ 课」这类"),
+     "标题里含这些词 → 直接判「专注」，即使平台本身是娱乐的"
+     "（用来认出「B 站看 C++ 课」这类）。命不中也无所谓，"
+     "娱乐应用已经不再扣分了"),
 ]
 
 
@@ -684,6 +689,25 @@ def _origin_ok(origin: str, port: int) -> bool:
 
 # ─────────────────── HTTP ───────────────────
 
+# 「把面板显示出来」的实现，由 focus 在启动时注入（见 do_GET 的 /show-panel）。
+# dashboard 不认识窗口层，也不该认识：`--dashboard` 单独跑的时候根本没有窗口，
+# 而它仍然是一个合法的用法。
+_panel_shower = None
+
+
+def set_panel_shower(fn) -> None:
+    """注入"显示应用窗口"的实现（就是 focus.open_page）。
+
+    为什么要这么绕：窗口属于**监视进程**，而"请把面板显示出来"这个请求来自
+    桌面开关 fork 出来的另一个进程。子进程里 `window._window` 永远是 None，
+    它自己调 open_page() 只会走"窗口层不可用"的兜底、用系统浏览器弹一个新
+    网页 —— 用户报的「不断开新网页弹出面板」正是这个。所以改成由它发一个
+    HTTP 请求，让**持有窗口的那个进程**自己 show()。
+    """
+    global _panel_shower
+    _panel_shower = fn
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, body: str, code: int = 200) -> None:
         raw = body.encode("utf-8")
@@ -761,6 +785,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 # 以后加页面，报告页不会漏掉那个入口。
                 # 导出成 report.html 时不传 —— 独立文件里的链接是点不动的死链。
                 self._send(build_html(load(), nav_html=_NAV))
+            elif raw_path == "/show-panel":
+                # 「请把面板窗口显示出来」。先回包再 show：调用方（桌面开关
+                # fork 出来的 --wait-open 子进程）只想知道请求送到了，没必要
+                # 陪着一个 GUI 调用等。
+                #
+                # 没有注入实现时（`--dashboard` 单跑）就只回 ok —— 那条路上
+                # 本来就没有窗口可显示。
+                self._send("ok")
+                if _panel_shower is not None:
+                    threading.Thread(target=_panel_shower, daemon=True).start()
             elif raw_path == "/":
                 self._send(_shell(_live_html(), poll=True))
             else:
