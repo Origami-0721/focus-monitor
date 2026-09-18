@@ -304,6 +304,17 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "",
         "focus.py",
     ),
+    (
+        "自检的日志闸门被内层提前还回去（自己造的假故障写进用户真日志）",
+        "        finally:\n"
+        "            urllib.request.urlopen = _real_urlopen\n"
+        "            webbrowser.open = _real_open\n",
+        "        finally:\n"
+        "            urllib.request.urlopen = _real_urlopen\n"
+        "            webbrowser.open = _real_open\n"
+        "            log.setLevel(_keep_lvl_wa)\n",
+        "focus.py",
+    ),
 ]
 
 

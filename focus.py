@@ -3132,6 +3132,23 @@ def selftest() -> None:
     # 这些"故意制造失败"的调用会把假的 ERROR 写进用户真正的 focus.log。
     # 实测踩到过：用户日志里躺着几条这样的 ERROR，看起来像"窗口层真的坏了"，
     # 其实是自检自己造的 —— 排查时会被带偏。
+    #
+    # **只调 setLevel 不够。** 这一版就栽在这上面：级别是"谁改谁还"的全局状态，
+    # `_run_wa` 的 finally 里顺手把它还成了**进保护前**的值，于是第一次调用一
+    # 结束闸门就开了，紧接着那次故意失败的调用正好在裸奔 —— 用户日志里
+    # 10:17:58 那三条假 ERROR 就是这么来的。
+    # 所以除了设级别，还在**日志出口**上挂一个探针：这一段跑完断言它一条都没
+    # 收到。级别被谁改回去都逃不过它。（setup_log() 用的是
+    # `basicConfig(force=True)`，它只清理 root 上的 handler，挂在 focus 这个
+    # logger 上的探针不会被拆掉。）
+    _leaked: list[str] = []
+
+    class _LeakProbe(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            _leaked.append(f"{record.levelname} {record.getMessage()}")
+
+    _probe = _LeakProbe()
+    log.addHandler(_probe)
     _keep_lvl_wa = log.level
     log.setLevel(logging.CRITICAL)
     _t0 = time.time()
@@ -3178,7 +3195,9 @@ def selftest() -> None:
         finally:
             urllib.request.urlopen = _real_urlopen
             webbrowser.open = _real_open
-            log.setLevel(_keep_lvl_wa)   # 见上：故意制造的失败不该进日志
+            # **不要在这里还日志级别。** 闸门是这一段整体的，由这一段末尾统一还。
+            # 在这里还，还的是"进保护前"的值 —— 第一次调用一结束闸门就开了，
+            # 后面那次故意失败的调用就把假 ERROR 写进了用户真正的 focus.log。
             if _win_mod == "__absent__":
                 sys.modules.pop("window", None)
             else:
@@ -3229,10 +3248,8 @@ def selftest() -> None:
     _fake_win.wait_until_ready = _fake_wait
     try:
         sys.modules["window"] = _fake_win
-        log.setLevel(logging.CRITICAL)
         show_panel(timeout=0.1)
     finally:
-        log.setLevel(_keep_lvl_wa)
         if _win_mod3 == "__absent__":
             sys.modules.pop("window", None)
         else:
@@ -3250,10 +3267,8 @@ def selftest() -> None:
     try:
         sys.modules["window"] = None
         webbrowser.open = lambda u, *a, **k: _opened3.append(u)
-        log.setLevel(logging.CRITICAL)
         show_panel(timeout=0.1)
     finally:
-        log.setLevel(_keep_lvl_wa)
         webbrowser.open = _real_open3
         if _win_mod3 == "__absent__":
             sys.modules.pop("window", None)
@@ -3272,24 +3287,35 @@ def selftest() -> None:
     # 采集线程和托盘都不依赖窗口层，凭什么让它们陪葬。
     _win_mod2 = sys.modules.get("window", "__absent__")
     _real_open2 = webbrowser.open
-    _keep_lvl = log.level
     _urls: list[str] = []
     try:
         sys.modules["window"] = None          # import 直接抛 ImportError
         webbrowser.open = lambda u, *a, **k: _urls.append(u)
-        # 注入的故障栈是预期的，压住别刷控制台（和 WAL 那段同理）
-        log.setLevel(logging.CRITICAL)
+        # 注入的故障栈是预期的，日志级别由这一段开头那道闸门管着，这里不用再压
         open_page("rate")
         assert _urls, "窗口层不可用时 open_page 必须退到系统浏览器"
         assert _urls[-1].endswith("/rate"), \
             f"退到浏览器时页面路由错了：{_urls[-1]}（rate 不该落到首页）"
     finally:
-        log.setLevel(_keep_lvl)
         webbrowser.open = _real_open2
         if _win_mod2 == "__absent__":
             sys.modules.pop("window", None)
         else:
             sys.modules["window"] = _win_mod2
+
+    # 这一段到此结束：撤掉探针、还回日志级别，然后**结账**。
+    #
+    # 这条断言是这次真被咬出来的：自检往用户真正的 focus.log 里写了三条假
+    # ERROR（"请求监视进程显示面板失败"、"应用窗口打不开"、"已改用系统浏览器
+    # 打开"），看起来就像窗口层真的坏了。它钉的是**结果**（日志里到底漏没漏），
+    # 不是"级别变量等于几"，所以以后怎么重构闸门都还成立。
+    log.removeHandler(_probe)
+    log.setLevel(_keep_lvl_wa)
+    assert not _leaked, (
+        f"自检把日志写进了用户真正的 focus.log：{_leaked} —— "
+        "这些是自检**故意制造**的失败（模拟发布包漏了 pywebview、监视进程还是"
+        "旧版本），混进真日志里看起来就像窗口层真的坏了，排查时会被带偏。"
+        "多半是有人把这一段的日志闸门提前还回去了 —— 见这一段开头的注释。")
 
     # ── 桌面快捷方式的目标必须来自 relaunch_cmd() ──
     #
