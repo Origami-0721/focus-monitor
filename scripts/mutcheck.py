@@ -17,6 +17,14 @@
 未通过处理（打 `??`）。实测踩到过：把 `try:` 的函数体整行删掉，变异就只剩
 一个 `IndentationError`，看着像"抓住了"，其实什么都没证明。
 
+还有一个更隐蔽的：**子进程的输出可能根本拿不回来**。`subprocess` 不显式指定
+编码时，用的是**父进程的 locale 编码**去解码子进程的管道；而子进程
+（`focus.py --selftest`）在西文代码页下会自己切到 UTF-8。两边不一致，
+`_readerthread` 里 `fh.read()` 直接抛 `UnicodeDecodeError`，线程静默死掉，
+`capture_output` 拿回来的是**空字符串**。当时的闸门只看退出码，于是
+"拿不到输出"照样被算成「断言抓住了它」—— 一次 CI 运行里 49 条变异全是空的，
+还是报绿。现在基线那一跑会先检查"有没有输出"，空就直接退出（见 `run_selftest`）。
+
 用法（要能 import cv2/numpy/pillow，所以用装了依赖的解释器跑）：
 
     uv run python scripts/mutcheck.py
@@ -432,9 +440,22 @@ def copy_project(dst: Path) -> Path:
 
 def run_selftest(tree: Path) -> tuple[bool, str]:
     """在 tree 里跑自检。cp1252 是照抄 CI 的环境变量 —— 中文提示在西文
-    代码页下抛 UnicodeEncodeError 这个坑，本机的 GBK 控制台永远复现不了。"""
+    代码页下抛 UnicodeEncodeError 这个坑，本机的 GBK 控制台永远复现不了。
+
+    **必须显式 `encoding="utf-8"`。** 不写的话，`subprocess` 用**父进程的
+    locale 编码**去解码子进程的管道 —— CI runner 是西文代码页（cp1252），
+    而子进程那边 `use_safe_console()` 一看代码页表示不了中文就切成了 UTF-8。
+    两边不一致，`_readerthread` 里 `fh.read()` 直接抛 UnicodeDecodeError，
+    线程静默死掉，`capture_output` 拿回来的是**空字符串**。
+
+    这个坑特别阴：闸门当时只看退出码，于是"拿不到输出"照样被算成
+    「断言抓住了它」，一次运行里 49 条变异全是空的也照样报绿。
+    实测（CI 3.11/3.12 两个 job 同时红）：日志里 75 处
+    `UnicodeDecodeError: 'charmap' codec can't decode byte 0x8d`。
+    """
     r = subprocess.run([sys.executable, "focus.py", "--selftest"],
                        cwd=str(tree), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace",
                        timeout=300,
                        env={**os.environ, "PYTHONIOENCODING": "cp1252"})
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
@@ -454,6 +475,15 @@ def main() -> int:
         ok, out = run_selftest(base)
         if not ok:
             print("基线（未变异）就跑不过自检，先修这个：\n" + out[-3000:])
+            return 2
+        # 基线必须**有输出**。拿不到输出的原因多半是编解码不一致（见
+        # run_selftest 的注释），而那样一来下面每一条变异都会被误判成
+        # 「没抓住」—— 报出来的是 49 条假故障，真问题只有一个。
+        # 在这里拦住，比让人去数 49 条变异便宜得多。
+        if not out.strip():
+            print("基线自检**一点输出都没拿到** —— 子进程的输出没能解码"
+                  "（父子编码不一致？），先修 run_selftest，否则后面"
+                  "每条变异都会被误判成「没抓住」。")
             return 2
     print(f"基线（未变异）: 自检通过，共 {len(MUTATIONS)} 条变异待验\n")
 
@@ -499,7 +529,12 @@ def main() -> int:
             # （NameError / TypeError / 编译错误…）说明变异只是把代码弄坏了，
             # 而不是断言在起作用 —— 那同样证明不了这条断言有牙齿。
             # 用整个输出而不是最后一行：断言的提示语里可能带换行。
-            if "AssertionError" not in out:
+            if not out.strip():
+                print(f"?? {name}\n"
+                      f"     自检失败了，但**一点输出都没拿到** —— "
+                      f"这不能算「断言抓住了它」，先查子进程的输出为什么丢了")
+                escaped.append(name)
+            elif "AssertionError" not in out:
                 print(f"?? {name}\n     -> {line}\n"
                       f"     ↑ 不是被断言抓住的（代码直接崩了）—— 换个改法，"
                       f"让它撞在断言上")
