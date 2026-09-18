@@ -103,6 +103,21 @@ uv run focus.py                   # 开始监视（托盘图标）
 > ```powershell
 > uv run python scripts/mutcheck.py
 > ```
+>
+> 「判据回放」（`scripts/replay_decide.py`）补的是上面几步都覆盖不到的一类问题：
+> **阈值调错是静默的**。自检只能证明"函数本身符合预期"，证明不了"换到真实数据上
+> 分布会怎么偏"——没有任何报错，状态分布整体偏移，自检全绿。实测被抓过一次：
+> 旧的"按应用类型直接判走神"把 **68.5%** 的走神样本判错了（在 B 站看高数课被判成
+> 走神），而自检完全覆盖不到。改 `decide()` 或 `DISTRACT_SWITCH_RATE` / `YAW_TOL` /
+> `PITCH_TOL` 之后跑一遍，对着输出确认两件事：「由走神变回来的」是不是他真正在学的
+> 东西，「新判出来的走神」是不是确实像在走神：
+>
+> ```powershell
+> uv run python scripts/replay_decide.py --db <你的 focus.db>
+> ```
+>
+> **它只读。** 库先经 `sqlite3.backup()` 拷到临时目录再读 —— WAL 模式下直接复制
+> 主文件会丢掉最近的写入，拿一份"看起来正常"的旧数据算出错误结论。
 
 ## 使用
 
