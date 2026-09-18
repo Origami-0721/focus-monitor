@@ -430,6 +430,21 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "                                     keep_blank_values=True)\n",
         "dashboard.py",
     ),
+    (
+        "顺延改成只靠 bind 失败判断（Windows 上 SO_REUSEADDR 让它永不报错）",
+        # 这就是改之前的写法。Windows 的 SO_REUSEADDR 允许两个进程同时绑住
+        # 同一个 127.0.0.1:端口且两边都成功 → bind 永不抛 OSError →
+        # 顺延循环成了死代码，后绑的那个进程是个收不到请求的幽灵服务。
+        "    for p in range(port, port + 20):\n"
+        "        if _port_in_use(p):\n"
+        '            last = OSError(f"127.0.0.1:{p} 上已经有服务在监听")\n'
+        "            continue\n",
+        "    for p in range(port, port + 20):\n"
+        "        if False:\n"
+        '            last = OSError(f"127.0.0.1:{p} 上已经有服务在监听")\n'
+        "            continue\n",
+        "dashboard.py",
+    ),
 ]
 
 

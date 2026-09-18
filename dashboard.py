@@ -18,6 +18,7 @@ import http.server
 import logging
 import re
 import secrets
+import socket
 import threading
 import time
 import urllib.parse
@@ -893,10 +894,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass                                           # 别把控制台刷爆
 
 
+def _port_in_use(port: int) -> bool:
+    """127.0.0.1:port 上是不是已经有人在监听。
+
+    **不能靠 bind 失败来判断。** ThreadingHTTPServer 的类默认值是
+    ``allow_reuse_address = 1``（会设 SO_REUSEADDR），而 Windows 的
+    SO_REUSEADDR 允许**两个进程同时绑住同一个 127.0.0.1:端口、两边都成功**。
+    实测：先绑的那个接走全部连接，后绑的那个一个请求都收不到（幽灵服务）。
+    于是下面那段顺延就成了死代码 —— 端口明明被占着，循环一次都不会往后走。
+
+    用 connect 探测就没这个问题：有人在监听 → 连得上；只剩 TIME_WAIT 残留
+    → 连不上（正是想要的语义，重启时不会平白顺延一个端口）。
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def _make_server(port: int) -> http.server.ThreadingHTTPServer:
     """只绑 127.0.0.1 —— 这些是摄像头推出来的数据，不能对外网开放。"""
     last: Exception | None = None
     for p in range(port, port + 20):
+        if _port_in_use(p):
+            last = OSError(f"127.0.0.1:{p} 上已经有服务在监听")
+            continue
         try:
             return http.server.ThreadingHTTPServer(("127.0.0.1", p), _Handler)
         except OSError as exc:

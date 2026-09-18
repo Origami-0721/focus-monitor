@@ -2947,6 +2947,31 @@ def selftest() -> None:
         import urllib.error as _urlerr
         import urllib.parse as _urlparse
 
+        # 端口顺延必须**真的**会顺延。不能靠 bind 失败来判断"端口被占用"：
+        # ThreadingHTTPServer 的类默认值是 allow_reuse_address = 1
+        # → 会设 SO_REUSEADDR，而 Windows 的 SO_REUSEADDR 允许**两个进程
+        # 同时绑住同一个 127.0.0.1:端口、两边都成功**（实测）。
+        # 后果不是"谁接走"这么轻：后绑的那个一个请求都收不到，是个幽灵服务，
+        # 而顺延循环因为 bind 永远不报错，成了死代码 —— 端口被占着也照绑不误。
+        # 所以这里真起一个监听，看 _make_server 会不会绕开它。
+        import dashboard as _dashmod
+        _hold = _httpsrv.ThreadingHTTPServer(("127.0.0.1", 0), _dashmod._Handler)
+        _hold_port = _hold.server_address[1]
+        threading.Thread(target=_hold.serve_forever, daemon=True).start()
+        try:
+            _shifted = _dashmod._make_server(_hold_port)
+            try:
+                assert _shifted.server_address[1] != _hold_port, (
+                    f"127.0.0.1:{_hold_port} 上已经有服务在监听，_make_server "
+                    "却还是绑了同一个端口 —— 顺延是死代码：它以为自己拥有"
+                    "这个端口，实际一个请求都收不到（连接全被先绑的接走），"
+                    "面板会打到别人身上")
+            finally:
+                _shifted.server_close()
+        finally:
+            _hold.shutdown()
+            _hold.server_close()
+
         class _Capture(logging.Handler):
             def __init__(self) -> None:
                 super().__init__()
