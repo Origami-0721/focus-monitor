@@ -2923,6 +2923,36 @@ def selftest() -> None:
             }).encode("utf-8")
             _check("POST /rate", *_hit("/rate", data=_form))
 
+            # ③ /show-panel：跨进程"请监视进程显示面板"这条路的**服务端**那一半。
+            #
+            # 为什么必须真打一次：客户端那半边自检已经验过"请求发到了
+            # /show-panel"（用假的 urlopen），注册那行也有结构断言 —— 但**路由
+            # 本身**在 dashboard.do_GET 里，中间还隔着"路径比对 → 起线程 →
+            # 调注入的实现"三步。路由名打错、或者忘了起线程，客户端照样收到
+            # 200、子进程日志里一切正常，而窗口永远不出现 —— 用户看到的就是
+            # "双击开关没反应"，正好是这条链路要修的那个症状。
+            # 上面那两条断言都抓不到它，所以这里把中间那段真跑一遍。
+            _shown: list[int] = []
+            _keep_shower = _dash._panel_shower
+            try:
+                _dash._panel_shower = lambda: _shown.append(1)
+                _sp_code, _sp_body = _hit("/show-panel")
+                assert _sp_code == 200, \
+                    f"/show-panel 应该回 200（客户端只认这个），实际 {_sp_code}"
+                assert _sp_body.strip() == "ok", \
+                    f"/show-panel 的响应体应该是 ok，实际 {_sp_body[:80]!r}"
+                # 注入的实现是**另起线程**调的，给它一点时间落地
+                for _ in range(100):
+                    if _shown:
+                        break
+                    time.sleep(0.02)
+                assert _shown == [1], (
+                    "/show-panel 回了 200，但**没有调用**注入的「显示面板」实现"
+                    " —— 子进程会以为一切正常，而监视进程的窗口永远不出现"
+                    "（用户看到的就是「双击开关没反应」）")
+            finally:
+                _dash._panel_shower = _keep_shower
+
             # _ensure_log 的补配分支：面板被**单独**跑起来（python dashboard.py）
             # 时没人调过 setup_log，而 pythonw 没有 stderr —— 不补就什么都留不下。
             # 把 setup_log 换掉再验，避免真去动用户的 focus.log。

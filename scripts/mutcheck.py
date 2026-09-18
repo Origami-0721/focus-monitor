@@ -315,6 +315,21 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "            log.setLevel(_keep_lvl_wa)\n",
         "focus.py",
     ),
+    (
+        "面板服务的 /show-panel 路由名写错（客户端收到 404，窗口永不出现）",
+        '            elif raw_path == "/show-panel":\n',
+        '            elif raw_path == "/showpanl":\n',
+        "dashboard.py",
+    ),
+    (
+        "/show-panel 只回 ok 不起线程（子进程以为成功，窗口永不出现）",
+        "                if _panel_shower is not None:\n"
+        "                    threading.Thread(target=_panel_shower,"
+        " daemon=True).start()\n",
+        "                if _panel_shower is not None:\n"
+        "                    pass\n",
+        "dashboard.py",
+    ),
 ]
 
 
