@@ -33,6 +33,11 @@ DEFAULT_PORT = 8787
 LIVE_WINDOW = 30 * 3600   # 实时面板只看最近 30 小时，够覆盖"今天"且不必全表扫
 STALE_AFTER = 90.0        # 超过这么久没新样本，就认为记录程序挂了
 
+# 表单请求体的读取上限。面板的表单只有几十字节，1 MB 足够任何正常提交；
+# 设上限是为了不让一个跨源页面用一个巨大的 Content-Length 把我们拖住。
+# （超限的请求直接按"没读"处理 —— 它本来也会被来源守卫拒掉。）
+MAX_POST_BODY = 1 << 20
+
 log = logging.getLogger("focus.dashboard")
 
 _log_ready = False
@@ -810,12 +815,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                        "<p>完整栈已写进 focus.log。</p>", 500)
 
     def do_POST(self) -> None:  # noqa: N802
+        # **先把请求体读出来，再判来源。**
+        #
+        # 顺序反过来会踩一个只在 Windows 上、而且**偶发**的坑：被拒的 POST
+        # （跨源 Origin、Host 不对）如果还带着一段**没人读的请求体**就关连接，
+        # 系统会回一个 RST，客户端在读 403 响应的中途直接炸：
+        #     ConnectionAbortedError: [WinError 10053]
+        # 实测（探针反复发跨源 POST）：body 400 KB 时 200 次里炸 23 次；
+        # body 只有几十字节时 200 次一次不炸。所以它在自检里表现为
+        # **约 1% 的偶发红**，看起来像网络抖动 —— 而 CI 每次要跑几十遍自检，
+        # 迟早随机变红。自检里有一条结构断言钉住这个顺序（见 focus.py）。
+        #
+        # 上限见 MAX_POST_BODY：不能让跨源页面用超大 Content-Length 拖住我们。
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(min(n, MAX_POST_BODY)) if n > 0 else b""
         if not self._guard():
             return
         path = self.path.split("?")[0]
-        n = int(self.headers.get("Content-Length") or 0)
-        form = urllib.parse.parse_qs(
-            self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"),
+                                     keep_blank_values=True)
         # CSRF token：表单里必须带上本次进程生成的那个。
         # 恶意页面构造得出同样的字段名，但猜不到 token 值 ——
         # 它读不到我们页面的内容（跨源），所以拿不到。

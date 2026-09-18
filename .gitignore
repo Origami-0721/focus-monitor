@@ -6,6 +6,8 @@ config.json
 focus.log
 focus.log.*
 focus.pid
+# 面板的实时地址（端口被占用时会顺延，所以是运行时才知道的值）。
+focus.url
 
 # --backup 产出的备份：内容和 focus.db 一模一样，同样敏感。
 # 上面那两条通配（focus.db / focus.db-*）**盖不住** focus-backup-*.db —— 
@@ -20,8 +22,9 @@ demo-report.html
 # 每次生成报告都会自动写出，不排除的话一次 git add -A 就全进仓库了。
 focus-*.csv
 
-# 自检用的临时库。正常路径会删掉，中途崩了会残留。
-# 用通配前缀而不是逐个列 —— 后面加新的自检库时最容易忘记补这一行。
+# 自检用的临时库。**现在不再往仓库目录丢了** —— 自检全程用一个
+# tempfile.TemporaryDirectory()，退出即删（早先是 6 个固定文件名 + 手工清理，
+# 残留会污染下一次自检，表现成偶发失败）。这两条留着只为兜住旧版本留下的残渣。
 _selftest*.db
 _selftest*.db-*
 

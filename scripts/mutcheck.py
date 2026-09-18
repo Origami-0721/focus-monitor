@@ -12,6 +12,11 @@
 本脚本自动做这件事：复制一份工程 → 注入一处变异 → 跑 `--selftest`
 → 必须失败。全绿就说明那条断言是摆设。
 
+而且**失败必须是断言失败**（`AssertionError`）。变异后语法不合法、或者代码
+直接崩在别的异常上，都只说明"改坏了"，不说明那条断言有牙齿 —— 这两种按
+未通过处理（打 `??`）。实测踩到过：把 `try:` 的函数体整行删掉，变异就只剩
+一个 `IndentationError`，看着像"抓住了"，其实什么都没证明。
+
 用法（要能 import cv2/numpy/pillow，所以用装了依赖的解释器跑）：
 
     uv run python scripts/mutcheck.py
@@ -31,13 +36,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 # 复制时排除的东西分两类：
 #   1. 大的 / 环境相关的（.venv、models）—— 复制它们纯属浪费；
-#   2. **个人数据和它的派生物**（focus.db*、focus.log*、icons、_selftest*.db*）。
+#   2. **个人数据和它的派生物**（focus.db*、focus.log*、icons、focus.pid、
+#      focus.url、_selftest*.db*）。
 #      第二类必须排掉：在 CI 里前面的步骤已经跑过自检，目录里躺着 focus.db，
 #      带进副本会让自检的数据库那几步跑在"已有历史"上 —— 那是一种谁也没
 #      在测的第三种环境，本机更是永远复现不了（本机 focus.db 内容不一样）。
 SKIP = (".venv", "__pycache__", ".git", "icons", "models", "build", "dist",
         "focus.db", "focus.db-*", "focus.log", "focus.log.*", "focus.pid",
-        "focus-backup-*.db*", "_selftest*.db*", "report.html", "focus-*.csv")
+        "focus.url", "focus-backup-*.db*", "_selftest*.db*", "report.html",
+        "focus-*.csv")
 
 # (说明, 原片段, 改坏后的片段[, 目标文件])
 # 原片段必须在源码里**只出现一次**，否则拒绝变异（改错了地方会给出假结果）。
@@ -330,6 +337,91 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "                    pass\n",
         "dashboard.py",
     ),
+    (
+        "wait_and_open 又硬编码 8787（端口顺延过就永远等不到面板）",
+        "        url = _persisted_panel_url()\n",
+        '        url = "http://127.0.0.1:8787/"\n',
+        "focus.py",
+    ),
+    (
+        "_panel_url 又硬编码 8787（托盘打开 / 浏览器兜底落到连不上的地址）",
+        '    return base.rstrip("/") + path\n',
+        '    return f"http://127.0.0.1:8787{path}"\n',
+        "focus.py",
+    ),
+    (
+        "地址不补结尾斜杠（拼出来是 ...:8801show-panel，服务端只会回 404）",
+        '    return url if url.endswith("/") else url + "/"\n',
+        "    return url\n",
+        "focus.py",
+    ),
+    (
+        "子进程取地址时把面板服务起起来（自己回自己，窗口永不出现）",
+        "    if not url:\n"
+        "        try:\n"
+        "            from dashboard import DEFAULT_PORT as port\n",
+        "    if not url:\n"
+        "        import dashboard\n"
+        "        dashboard.serve_background(open_browser=False)\n"
+        "        try:\n"
+        "            from dashboard import DEFAULT_PORT as port\n",
+        "focus.py",
+    ),
+    (
+        "main() 没把面板实际地址落盘（子进程只能猜端口）",
+        '            URL_PATH.write_text(_panel, encoding="utf-8")\n',
+        "            pass    # 变异：地址没落盘\n",
+        "focus.py",
+    ),
+    (
+        "顶层多出一个重名定义（后者静默覆盖前者，症状出现在别处）",
+        # 故意让这个重名定义**和原版逐字相同** —— 行为一点没变，
+        # 所以只有 ast 那条重名检查能抓住它。要是行为也变了，
+        # 抓住它的可能是别的断言，就证明不了这条检查有牙齿。
+        'if __name__ == "__main__":\n    main()\n',
+        'def is_paused() -> bool:                  # 变异：顶层重名定义\n'
+        '    return _runtime["paused"]\n'
+        '\n'
+        '\n'
+        'if __name__ == "__main__":\n    main()\n',
+        "focus.py",
+    ),
+    (
+        "_panel_url 顺手把面板服务备好（自检因此占端口，断言跟着环境变）",
+        # 逻辑上像是无害的"提前把服务备好"，测试也照样全绿 —— 但自检从此
+        # 会真的起一个面板服务，占哪个端口取决于用户机器上 8787 有没有被占。
+        "    if not base:\n"
+        "        import dashboard\n"
+        "        dashboard.serve_background(open_browser=False)\n"
+        "        base = dashboard.base_url()\n"
+        '    return base.rstrip("/") + path\n',
+        "    import dashboard\n"
+        "    dashboard.serve_background(open_browser=False)\n"
+        "    if not base:\n"
+        "        base = dashboard.base_url()\n"
+        '    return base.rstrip("/") + path\n',
+        "focus.py",
+    ),
+    (
+        "do_POST 先判来源、后读请求体（被拒的 POST 会 RST，自检偶发变红）",
+        # 这就是本来的写法。它只在 Windows 上、而且偶发地表现为
+        # ConnectionAbortedError（约 1%）—— 行为上撞不稳，所以钉的是顺序。
+        '        n = int(self.headers.get("Content-Length") or 0)\n'
+        "        raw = self.rfile.read(min(n, MAX_POST_BODY)) if n > 0 else b\"\"\n"
+        "        if not self._guard():\n"
+        "            return\n"
+        '        path = self.path.split("?")[0]\n'
+        "        form = urllib.parse.parse_qs(raw.decode(\"utf-8\", \"replace\"),\n"
+        "                                     keep_blank_values=True)\n",
+        "        if not self._guard():\n"
+        "            return\n"
+        '        path = self.path.split("?")[0]\n'
+        '        n = int(self.headers.get("Content-Length") or 0)\n'
+        "        raw = self.rfile.read(min(n, MAX_POST_BODY)) if n > 0 else b\"\"\n"
+        "        form = urllib.parse.parse_qs(raw.decode(\"utf-8\", \"replace\"),\n"
+        "                                     keep_blank_values=True)\n",
+        "dashboard.py",
+    ),
 ]
 
 
@@ -377,18 +469,50 @@ def main() -> int:
                 print(f"?? {name}\n     在 {rel} 里出现 {src.count(old)} 次，无法变异")
                 escaped.append(name)
                 continue
-            f.write_text(src.replace(old, new), encoding="utf-8")
+            mutated = src.replace(old, new)
+            f.write_text(mutated, encoding="utf-8")
+            # 变异后的文件**必须仍然语法合法**。否则"自检红了"只是因为编译
+            # 不过，而不是那条断言真的抓住了它 —— 断言是摆设也照样显示 OK。
+            # 实测踩到过：把 `try:` 的函数体整行删掉，变异就只剩
+            # IndentationError，看着像"抓住了"，其实什么都没证明。
+            #
+            # 只对 .py 检查：目标文件也可能是 uv.lock（TOML）之类，
+            # 拿 compile() 去编译它必然报语法错 —— 那是检查本身错了。
+            if f.suffix == ".py":
+                try:
+                    compile(mutated, str(f), "exec")
+                except SyntaxError as exc:
+                    print(f"?? {name}\n"
+                          f"     变异后语法不合法（{type(exc).__name__}: "
+                          f"{exc.msg}，第 {exc.lineno} 行）—— "
+                          f"换个能通过编译的改法，否则这条变异什么都证明不了")
+                    escaped.append(name)
+                    continue
             ok, out = run_selftest(tree)
         if ok:
             print(f"XX {name}\n     自检仍然全绿 —— 这条断言是摆设")
             escaped.append(name)
         else:
             last = [ln for ln in out.strip().splitlines() if ln.strip()][-1:]
-            print(f"OK {name}\n     -> {last[0][:140] if last else '(无输出)'}")
+            line = last[0][:140] if last else "(无输出)"
+            # 只有 **AssertionError** 才算"断言抓住了它"。别的异常
+            # （NameError / TypeError / 编译错误…）说明变异只是把代码弄坏了，
+            # 而不是断言在起作用 —— 那同样证明不了这条断言有牙齿。
+            # 用整个输出而不是最后一行：断言的提示语里可能带换行。
+            if "AssertionError" not in out:
+                print(f"?? {name}\n     -> {line}\n"
+                      f"     ↑ 不是被断言抓住的（代码直接崩了）—— 换个改法，"
+                      f"让它撞在断言上")
+                escaped.append(name)
+            else:
+                print(f"OK {name}\n     -> {line}")
 
     print()
     if escaped:
-        print(f"有 {len(escaped)} 条变异逃逸了，对应的断言需要重写：")
+        print(f"有 {len(escaped)} 条变异没通过：")
+        print("  XX = 自检仍然全绿（断言是摆设）")
+        print("  ?? = 变异本身无效：语法不合法、或代码直接崩掉，"
+              "证明不了任何事")
         for n in escaped:
             print("  -", n)
         return 1

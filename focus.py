@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -69,6 +70,16 @@ MODELS = ROOT / "models"
 DB_PATH = ROOT / "focus.db"
 LOG_PATH = ROOT / "focus.log"
 PID_PATH = ROOT / "focus.pid"      # 运行中实例的 PID，供 --stop 用
+# 面板的**真实**地址，由监视进程起好服务之后写进来。
+#
+# 为什么非要有这个文件：8787 被占用时服务会往后顺延（8788…8806，见
+# dashboard._make_server），而桌面开关 fork 出来的 `--wait-open` 子进程是
+# **另一个进程** —— 它拿不到 `dashboard.base_url()`，那个函数读的是本进程的
+# `_server`，在子进程里是 None。硬编码 DEFAULT_PORT 的话，端口一顺延，
+# 子进程就一直敲一个没人监听的地址，等满 120 秒然后放弃，用户看到的还是
+# "双击了没反应"。（使用教程里早就写了"被占了会自动往后顺延"，
+# 只有 wait_and_open 那一处没跟上。）
+URL_PATH = ROOT / "focus.url"
 
 log = logging.getLogger("focus")
 
@@ -1423,13 +1434,28 @@ def _icon_image(color: str, shape: str = "solid"):
 
 
 def _panel_url(path: str = "") -> str:
-    """面板地址。端口可能不是默认的，所以问 dashboard 要，别硬编码。
+    """面板地址。**端口可能不是默认的，所以别硬编码 8787。**
 
-    托盘/菜单打开页面走 open_page()；这里保留是给浏览器回退等场合用。
+    优先读监视进程写下的 URL_PATH —— 8787 被占用时服务会顺延到 8788…8806，
+    而**别的进程**（浏览器兜底、桌面开关 fork 的 --wait-open）拿不到
+    `dashboard.base_url()` 的权威值：那个函数读的是本进程的 `_server`，
+    在子进程里是 None，只会退回默认端口，于是等一个没人监听的地址。
+
+    URL_PATH 还没有时才问 dashboard。注意那条路会**顺带把服务起起来**
+    （`serve_background` 的语义），所以它只适合本进程/浏览器兜底用 ——
+    子进程要走 `_persisted_panel_url()`，见那个函数的注释。
+
+    path 拼在根地址后面（如 "/rate"）。
     """
-    import dashboard
-    dashboard.serve_background(open_browser=False)
-    return dashboard.base_url().rstrip("/") + path
+    try:
+        base = URL_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        base = ""
+    if not base:
+        import dashboard
+        dashboard.serve_background(open_browser=False)
+        base = dashboard.base_url()
+    return base.rstrip("/") + path
 
 
 def _pending_ratings() -> int:
@@ -1990,11 +2016,13 @@ def stop_running() -> None:
     pid = running_pid()
     if pid is None:
         PID_PATH.unlink(missing_ok=True)
+        URL_PATH.unlink(missing_ok=True)   # 没实例了，地址也不该留着
         print("没有找到运行中的实例。")
         return
     subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                    capture_output=True, creationflags=_NO_WINDOW)
     PID_PATH.unlink(missing_ok=True)     # 强杀不会走对方的 finally
+    URL_PATH.unlink(missing_ok=True)     # 同上：留着会让下次的开关读到旧端口
     print(f"已停止专注监视（PID {pid}）。")
 
 
@@ -2025,6 +2053,32 @@ def show_panel(timeout: float = 20.0) -> None:
     open_page("panel")
 
 
+def _persisted_panel_url() -> str:
+    """监视进程写下的面板根地址（末尾带 /）；没有就退回默认端口。
+
+    **只读，绝不起服务。** 这是给 --wait-open 子进程用的，而子进程里
+    `dashboard._server` 是 None —— 一旦走 `_panel_url()`，`serve_background`
+    就会**在子进程里另起一个面板服务**。那之后子进程是在自己回自己的请求：
+    `/show-panel` 会回 200 ok 却什么都不做（它自己的 `_panel_shower` 没注册），
+    窗口永远不出现，**而日志里一切正常**。这种静默失败必须避开，所以这里
+    只读文件、只做地址拼装，不碰任何服务。
+
+    文件还没写（监视进程刚起来，PID 文件比地址先落盘）时退回默认端口 ——
+    调用方是轮询，下一轮就读到真值了。
+    """
+    try:
+        url = URL_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        url = ""
+    if not url:
+        try:
+            from dashboard import DEFAULT_PORT as port
+        except Exception:
+            port = 8787
+        url = f"http://127.0.0.1:{port}/"
+    return url if url.endswith("/") else url + "/"
+
+
 def wait_and_open(timeout: float = 120.0) -> None:
     """等面板就绪，再请**监视进程**把它的窗口显示出来。
 
@@ -2042,17 +2096,22 @@ def wait_and_open(timeout: float = 120.0) -> None:
     就多一个浏览器标签页。
     """
     setup_log()
-    try:
-        from dashboard import DEFAULT_PORT as port
-    except Exception:
-        port = 8787
-    url = f"http://127.0.0.1:{port}/"
 
     # 第一段：只负责"等服务就绪"。**不要**把"显示面板"塞进同一个 try ——
     # 塞在一起的话，那一步失败会被当成"服务还没起来"，于是一路重试到
     # 超时、最后一声不吭地退出。这两个失败的原因完全不同，必须分开处理。
+    #
+    # 地址**每轮重读**（_persisted_panel_url 会读 URL_PATH）：端口是监视进程
+    # 起好服务之后才知道的，而它可能比我们晚一步写（PID 文件比地址先落盘）。
+    # 轮询里重读就自然收敛了，不用在启动顺序上加约定。
+    #
+    # 用 _persisted_panel_url 而**不是** _panel_url：后者会顺手在子进程里
+    # 把面板服务起起来，于是我们请求的是自己 —— /show-panel 回 200 ok 却
+    # 什么都不做，窗口永远不出现，而日志里一切正常。见那个函数的注释。
     deadline = time.time() + timeout
+    url = ""
     while time.time() < deadline:
+        url = _persisted_panel_url()
         try:
             # 必须把响应体读掉再关。只调 .close() 等于中途掐断连接，服务端
             # 写响应时会抛 ConnectionAbortedError，在用户日志里留下一串
@@ -2563,13 +2622,30 @@ def selftest() -> None:
                 f"verdict({_r}, {_nn}) 里出现了「校准」：{_v!r} —— "
                 "程序没有校准功能，用户会照着去找（实测反馈过）")
 
+    # ── 下面四段都用**临时目录里的库**，不再往仓库目录丢 `_selftest_*.db` ──
+    #
+    # 原来每段都是 `ROOT / "_selftest_xxx.db"` 这种固定名字，靠各自的 finally 删。
+    # 实测踩到过：某次运行之后 `_selftest_seam.db` 留在了仓库目录里，下一次自检
+    # 读到它 —— 库里已经有一条样本，再插一条就成了 2 条，
+    # `assert len(report.load()) == 1` 于是失败。表现是**偶发失败**：30 次里红
+    # 一次、下一次又好了；而 CI 每次要跑几十遍，迟早随机变红。
+    #
+    # 具体是哪一次运行没删掉，我没能复现出来。但这不重要 ——
+    # **"依赖上一次干净退出"本身就是 bug**：路径固定 + 手工清理，任何一次异常
+    # 退出都会留下污染源，而污染的表现是**另一次无关的测试失败**，查起来极绕。
+    #
+    # 临时目录一次解决两件事：路径每次都不同（不可能读到别人的数据），
+    # 目录由 TemporaryDirectory 负责删（不用维护清理清单，异常退出也不留）。
+    _st_td = tempfile.TemporaryDirectory()
+    _st_tmp = Path(_st_td.name)
+
     # ── report.load() 必须跟着 focus.DB_PATH 走 ──
     # 这是"多库对照"的唯一开关：ratings 一直是动态读的，report 原来读的是
     # `from focus import DB_PATH` 在 import 那一刻的副本，改了 focus.DB_PATH
     # 对它**完全不起作用** —— 而它自己的 docstring 恰好写着这个开关是有效的。
     # 后果不是报错而是**静默混库**：样本来自 A 库、评分来自 B 库，算出一个
     # 看起来合理、其实毫无意义的相关系数。（做真机验证时就是这么中招的。）
-    _seam_db = ROOT / "_selftest_seam.db"
+    _seam_db = _st_tmp / "seam.db"
     _keep_db = DB_PATH
     try:
         _sconn = open_db(_seam_db)
@@ -2582,15 +2658,12 @@ def selftest() -> None:
         finally:
             _sconn.close()
         globals()["DB_PATH"] = _seam_db
-        try:
-            assert len(report.load()) == 1, (
-                "改了 focus.DB_PATH，report.load() 却没跟着换库 —— "
-                "它会继续读 import 时绑定的那份，于是样本和评分可能来自两个库，"
-                "算出一个看起来合理、其实毫无意义的相关系数")
-        finally:
-            globals()["DB_PATH"] = _keep_db
+        assert len(report.load()) == 1, (
+            "改了 focus.DB_PATH，report.load() 却没跟着换库 —— "
+            "它会继续读 import 时绑定的那份，于是样本和评分可能来自两个库，"
+            "算出一个看起来合理、其实毫无意义的相关系数")
     finally:
-        _seam_db.unlink(missing_ok=True)
+        globals()["DB_PATH"] = _keep_db
 
     # ── 实时面板上同样不许出现「校准」──
     # 和上面同源：用户看到"校准中 37/60"会去找一个能点的校准按钮，
@@ -2606,7 +2679,7 @@ def selftest() -> None:
         _dash_live_mod = None
     if _dash_live_mod is not None:
         _real_pref = DB_PATH
-        _pdb = ROOT / "_selftest_panel.db"
+        _pdb = _st_tmp / "panel.db"
         try:
             _pc = open_db(_pdb)
             try:
@@ -2629,11 +2702,10 @@ def selftest() -> None:
                 "面板没写出基线还在学习 —— 用户不知道那个 37/60 是什么")
         finally:
             globals()["DB_PATH"] = _real_pref
-            _pdb.unlink(missing_ok=True)
 
     # 数据库往返。用临时库 —— 绝不能污染用户的真实 focus.db
     real_db = globals()["DB_PATH"]
-    tmp_db = ROOT / "_selftest_ratings.db"
+    tmp_db = _st_tmp / "ratings.db"
     globals()["DB_PATH"] = tmp_db
     try:
         ratings.save(0.0, 4)
@@ -2649,13 +2721,12 @@ def selftest() -> None:
         assert [p for p in ratings.pending(thin, 1900.0)] == []
     finally:
         globals()["DB_PATH"] = real_db
-        tmp_db.unlink(missing_ok=True)
 
     # ── 备份与保留策略 ──
     # backup_db / compact_db 是全项目唯一会碰用户数据文件的路径，必须有断言兜着：
     # "备份少拷了一截"和"没先备份就删"都是不可逆的事故，靠人工检查是查不出来的。
     real_db = globals()["DB_PATH"]
-    tmp_db = ROOT / "_selftest_compact.db"
+    tmp_db = _st_tmp / "compact.db"
     globals()["DB_PATH"] = tmp_db
     try:
         def _count(path: Path) -> int:
@@ -2684,7 +2755,7 @@ def selftest() -> None:
 
         # 备份出来的必须是**完整**的一份。WAL 下如果只拷 focus.db 主文件，
         # 还没 checkpoint 的样本会全部丢掉 —— 库能打开、能查，只是少一截。
-        bk = backup_db(ROOT / "_selftest_bk.db")
+        bk = backup_db(_st_tmp / "bk.db")
         assert bk.exists(), "备份文件没生成"
         assert _count(bk) == 5, f"备份不完整：{_count(bk)} != 5"
 
@@ -2695,8 +2766,9 @@ def selftest() -> None:
         # 真删：旧的清掉、新的留着
         compact_db(90, assume_yes=True)
         assert _count(tmp_db) == 2, f"应剩 2 条新样本，实际 {_count(tmp_db)}"
-        # 真删之前必须留下备份 —— 目录里应该多出一个 backup 文件
-        assert list(ROOT.glob("_selftest_compact-backup-*.db")), \
+        # 真删之前必须留下备份 —— 库所在目录里应该多出一个 backup 文件
+        # （备份落在 DB_PATH 旁边，名字是 `<库名>-backup-<时间戳>.db`）
+        assert list(_st_tmp.glob("compact-backup-*.db")), \
             "删数据前没有自动备份"
 
         # 保留天数非正 → 什么都不动（这是"想保留全部"的表达方式）
@@ -2711,16 +2783,15 @@ def selftest() -> None:
                 "备份文件没被 .gitignore 排除，一次 git add -A 就泄露个人数据"
 
         # 库存在但没有 samples 表（老版本残留）时不能抛异常
-        empty_db = ROOT / "_selftest_notable.db"
+        empty_db = _st_tmp / "notable.db"
         sqlite3.connect(empty_db).close()
         globals()["DB_PATH"] = empty_db
         compact_db(90, assume_yes=True)           # 只该打印一句提示
     finally:
+        # 不用手工清理了：_st_td 是临时目录，退出时整个删掉。
+        # 早先这里是 `ROOT.glob("_selftest_*.db*")` 的清理清单 —— 清单漏一个
+        # 就留下污染源，而 `-wal`/`-shm` 比主文件更容易被漏掉。
         globals()["DB_PATH"] = real_db
-        for p in list(ROOT.glob("_selftest_compact*.db*")) + \
-                list(ROOT.glob("_selftest_bk.db*")) + \
-                list(ROOT.glob("_selftest_notable.db*")):
-            p.unlink(missing_ok=True)
 
     # ── WAL：切不过去必须被**看见**，绝不能假定成功 ──
     #
@@ -2850,6 +2921,28 @@ def selftest() -> None:
         print(f"  (跳过面板日志自检：dashboard 导入失败 {_imp_exc!r})")
 
     if _dash is not None:
+        # ── do_POST 必须**先读请求体、再判来源** ──
+        #
+        # 顺序反过来会踩一个只在 Windows 上、而且**偶发**的坑：被拒的 POST
+        # （跨源 Origin、Host 不对）如果带着一段**没人读的请求体**就关连接，
+        # 系统会回一个 RST，客户端读 403 响应的中途直接炸：
+        #     ConnectionAbortedError: [WinError 10053]
+        # 实测探针：body 400 KB 时 200 次里炸 23 次，body 只有几十字节时
+        # 200 次一次不炸 —— 所以它在自检里表现为**约 1% 的偶发红**，
+        # 看起来像网络抖动，而 CI 每次要跑几十遍自检，迟早随机变红。
+        #
+        # 行为上抓不稳（要撞运气，撞不到就是假绿），所以这里钉**顺序**这个
+        # 确定性的事实。放在这段 HTTP 测试**之前**：断言要跑在会偶发崩溃的
+        # 代码前面，否则变异可能先崩在 ConnectionAbortedError 上，
+        # 变异闸门只会打一个 `??`（不是被断言抓住的）。
+        _dash_src = (ROOT / "dashboard.py").read_text(encoding="utf-8")
+        _post_src = _dash_src[_dash_src.index("def do_POST"):]
+        assert (_post_src.index("self.rfile.read")
+                < _post_src.index("self._guard()")), (
+            "do_POST 先判来源、后读请求体 —— 被拒的 POST（跨源 / Host 不对）"
+            "会带着没读完的请求体关连接，Windows 回 RST，客户端读 403 响应的"
+            "中途就炸（ConnectionAbortedError 10053，自检约 1% 偶发变红）")
+
         import http.server as _httpsrv
         import urllib.error as _urlerr
         import urllib.parse as _urlparse
@@ -3191,6 +3284,23 @@ def selftest() -> None:
     _opened: list[str] = []
     _asked: list[str] = []
 
+    # 面板地址必须是**监视进程写下的实际值**，不能猜端口。
+    # 8787 被占用时服务会顺延到 8788…8806（dashboard._make_server），而
+    # wait_and_open 跑在另一个进程里、拿不到 base_url()。硬编码默认端口的
+    # 写法在那种机器上会让子进程一直敲一个没人监听的地址、等满 120 秒然后
+    # 放弃 —— 用户看到的还是"双击了没反应"。
+    # 下面把 URL_PATH 指到临时文件，并且**故意用非默认端口**：这样
+    # "到底有没有读文件"就成了一个能被变异抓到的差别，而不是"反正都通"。
+    global URL_PATH
+    _keep_urlpath = URL_PATH
+    _wa_td = tempfile.TemporaryDirectory()
+    _wa_url = Path(_wa_td.name) / "focus.url"
+    URL_PATH = _wa_url
+    try:
+        from dashboard import DEFAULT_PORT as _dport
+    except Exception:
+        _dport = 8787
+
     class _FakeResponse:
         """要能当上下文管理器用、还要有 read() —— wait_and_open 会把响应体
         读完再关（不读完就关，会在服务端留下 ConnectionAbortedError）。"""
@@ -3207,8 +3317,14 @@ def selftest() -> None:
         def close(self):
             pass
 
-    def _run_wa(fail_show: bool) -> None:
-        """跑一次 wait_and_open，记下"请求了哪些地址、开了哪些网页"。"""
+    def _run_wa(fail_show: bool,
+                url_text: str = "http://127.0.0.1:8801/") -> None:
+        """跑一次 wait_and_open，记下"请求了哪些地址、开了哪些网页"。
+
+        每次都先把 URL_PATH 写成**非默认端口**的地址：这样"wait_and_open
+        有没有真的去读监视进程写下的地址"就成了一个可观测的差别。
+        url_text 传空串表示"文件还不存在"（监视进程刚起来那种时刻）。
+        """
         def _fake_urlopen(u, *a, **k):
             _asked.append(u)
             if fail_show and u.endswith("/show-panel"):
@@ -3221,6 +3337,10 @@ def selftest() -> None:
             # sys.modules 里放 None 会让 import 直接抛 ImportError。
             sys.modules["window"] = None
             webbrowser.open = lambda u, *a, **k: _opened.append(u)
+            if url_text:
+                _wa_url.write_text(url_text, encoding="utf-8")
+            else:
+                _wa_url.unlink(missing_ok=True)
             wait_and_open(timeout=5.0)
         finally:
             urllib.request.urlopen = _real_urlopen
@@ -3243,6 +3363,13 @@ def selftest() -> None:
     assert not _opened, (
         f"监视进程已经接管了显示面板，wait_and_open 还是自己开了浏览器："
         f"{_opened} —— 用户看到的就是「双击开关不断弹出新网页」")
+    # 而且必须是**监视进程写下的那个地址**（上面故意用了非默认端口 8801）。
+    # 硬编码 DEFAULT_PORT 的写法在"8787 被占用、服务顺延到 8788"的机器上
+    # 会让子进程一直敲一个没人监听的地址，等满 120 秒然后放弃。
+    assert _asked and _asked[0].startswith("http://127.0.0.1:8801/"), (
+        f"wait_and_open 没用监视进程写下的面板地址，实际请求了 {_asked[:2]} —— "
+        "8787 被占用时服务会顺延端口，硬编码默认端口会让子进程等一个"
+        "没人监听的地址，等满 120 秒然后放弃（用户看到的是「双击了没反应」）")
 
     # 兜底路径：老版本监视进程没有 /show-panel 路由（用户刚更新了开关、
     # 后台进程还是旧的）→ 必须退到本进程打开，哪怕落在浏览器里。
@@ -3252,6 +3379,57 @@ def selftest() -> None:
     assert _opened, (
         "连监视进程都请不动时，wait_and_open 必须退到系统浏览器 —— "
         "否则用户看到的是「双击了没反应」")
+
+    # ── 地址文件缺失 / 写得不规范时，取地址的两个函数各自要兜住 ──
+    #
+    # ① 监视进程刚起来、地址还没落盘（PID 文件比地址先写）→ 退回默认端口，
+    #    不能抛异常，也不能拿空串去请求。调用方是轮询，下一轮就读到真值了。
+    _wa_url.unlink(missing_ok=True)
+    _fb = _persisted_panel_url()
+    assert _fb.endswith("/"), f"面板地址必须以 / 结尾，实际 {_fb!r}"
+    assert f":{_dport}/" in _fb, \
+        f"地址文件缺失时应该退回默认端口，实际 {_fb!r}"
+
+    # ② 文件里没有结尾斜杠时要补上 —— 否则拼出来的是 `...:8801show-panel`，
+    #    服务端只认 `/show-panel`，会静默 404（看起来又像"窗口层坏了"）。
+    _wa_url.write_text("http://127.0.0.1:8801", encoding="utf-8")
+    assert _persisted_panel_url() == "http://127.0.0.1:8801/", (
+        f"地址没有结尾斜杠时没补上，实际 {_persisted_panel_url()!r}"
+        " —— 拼出来的会是 ...:8801show-panel，服务端只会回 404")
+
+    # ③ _panel_url（托盘菜单 / 浏览器兜底那条路）也必须认 URL_PATH：
+    #    子进程里 `dashboard._server` 是 None，`base_url()` 只会退回默认端口。
+    assert _panel_url("/rate") == "http://127.0.0.1:8801/rate", (
+        f"_panel_url 没认监视进程写下的地址，实际 {_panel_url('/rate')!r}"
+        " —— 端口顺延过时，托盘打开 / 浏览器兜底都会落到一个连不上的地址")
+
+    # ④ **子进程取地址时绝不能把服务起起来。** `_panel_url` 会调
+    #    `serve_background`（那是它的正常语义），子进程里 `_server` 是 None，
+    #    于是它真的会在子进程里另起一个面板服务 —— 之后子进程是在自己回
+    #    自己的请求：/show-panel 回 200 ok 却什么都不做，窗口永远不出现，
+    #    **而日志里一切正常**。所以 wait_and_open 走的是只读的那个。
+    if _dash is not None:
+        _sb_calls: list[int] = []
+        _orig_sb = _dash.serve_background
+        try:
+            _dash.serve_background = (
+                lambda *a, **k: _sb_calls.append(1) or "http://127.0.0.1:9/")
+            _wa_url.unlink(missing_ok=True)
+            _persisted_panel_url()
+            assert not _sb_calls, (
+                "子进程取面板地址时把服务**又起了一遍** —— 它会自己回自己的"
+                "请求：/show-panel 回 200 ok 却什么都不做，窗口永远不出现，"
+                "而且日志里一切正常（这种静默失败最难查）")
+        finally:
+            _dash.serve_background = _orig_sb
+
+    # 地址文件在上面那条用例里被删掉了，这里写回来 —— 后面几个用例
+    # （show_panel 的浏览器兜底、open_page 的浏览器兜底）都会走
+    # `_panel_url()`，而它在**地址文件缺失**时会真的起一个面板服务
+    # （那是它的正常语义）。自检不该顺手占一个端口；更要紧的是"占哪个端口"
+    # 取决于用户机器上 8787 有没有被应用自己占着 —— 断言跟着环境变，
+    # 是最难查的那类偶发失败。
+    _wa_url.write_text("http://127.0.0.1:8801", encoding="utf-8")
 
     # ── show_panel：窗口层在、GUI 却没起来 → 仍然要开出一个页面来 ──
     #
@@ -3324,14 +3502,26 @@ def selftest() -> None:
         # 注入的故障栈是预期的，日志级别由这一段开头那道闸门管着，这里不用再压
         open_page("rate")
         assert _urls, "窗口层不可用时 open_page 必须退到系统浏览器"
-        assert _urls[-1].endswith("/rate"), \
-            f"退到浏览器时页面路由错了：{_urls[-1]}（rate 不该落到首页）"
+        assert _urls[-1] == "http://127.0.0.1:8801/rate", (
+            f"退到浏览器时地址错了：{_urls[-1]} —— 要么页面路由不对"
+            "（rate 不该落到首页），要么没认监视进程写下的端口")
     finally:
         webbrowser.open = _real_open2
         if _win_mod2 == "__absent__":
             sys.modules.pop("window", None)
         else:
             sys.modules["window"] = _win_mod2
+
+    # 结账：上面那一串**不该真的起一个面板服务**。
+    #
+    # 这是个很容易被"简化"掉的性质：把 `serve_background` 从 `_panel_url` 的
+    # `if not base:` 分支里提到外面，逻辑上像是"顺手把服务备好"，测试也照样
+    # 全绿 —— 但自检从此会真的占一个端口，而且占哪个端口取决于用户机器上
+    # 8787 有没有被应用自己占着。断言跟着环境变，是最难查的那类偶发。
+    URL_PATH = _keep_urlpath
+    assert _dash is None or _dash._server is None, (
+        "自检过程中真的起了一个面板服务 —— 它不该有这个副作用："
+        "用户正开着应用时 8787 被占、服务会顺延，断言就跟着环境变了")
 
     # 这一段到此结束：撤掉探针、还回日志级别，然后**结账**。
     #
@@ -3469,6 +3659,24 @@ def selftest() -> None:
     _self_src = ROOT / "focus.py"
     if _self_src.exists():                 # 冻结成 exe 后源码不在旁边，跳过
         _src = _self_src.read_text(encoding="utf-8")
+
+        # 顶层不许有重名定义 —— Python **不报错**，后面的会静默覆盖前面的。
+        #
+        # 实测踩到过（就在这一轮）：想加一个"读监视进程写下的面板地址"的函数，
+        # 起名 `_panel_url` —— 而这个名字**早就有了**（open_page 一直在用，
+        # 还带一个 path 参数）。新定义把它整个覆盖掉，于是 open_page 传参时
+        # 报 TypeError，而报错信息出现在完全无关的地方（"浏览器兜底打不开
+        # 页面"），要绕一圈才查得到。用 ast 数一遍只要几行。
+        #
+        # 只看模块顶层（tree.body）：嵌套函数同名是正常的（自检里一堆辅助函数）。
+        _names = [n.name for n in ast.parse(_src).body
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                    ast.ClassDef))]
+        _dupes = sorted({n for n in _names if _names.count(n) > 1})
+        assert not _dupes, (
+            f"顶层有重名定义：{_dupes} —— Python 不报错，后面的会**静默覆盖**"
+            "前面的，症状会出现在完全无关的地方（实测踩到过）")
+
         _loop_src = _src[:_src.index("def selftest")]
         for _needle in (
             "vision.read_face(proc)", "vision.read_posture(proc)",
@@ -3570,6 +3778,19 @@ def selftest() -> None:
         assert "dashboard.set_panel_shower(show_panel)" in _main_src, \
             "监视进程没把「显示面板」注册给面板服务 —— 子进程发来的 " \
             "/show-panel 会回 ok 但什么都不做，窗口永远不出现"
+
+        # 面板的**实际地址**必须落盘给子进程读（见 URL_PATH / _panel_url）。
+        #
+        # 端口在 8787 被占用时会顺延到 8788…8806，而子进程是另一个进程、
+        # 拿不到 dashboard.base_url()。不写这个文件，子进程就只能猜端口，
+        # 顺延过的那次就会一直敲一个没人监听的地址、等满 120 秒然后放弃 ——
+        # 用户看到的是"双击了没反应"，日志里只有一句"等面板就绪超时"。
+        assert "URL_PATH.write_text(_panel" in _main_src, \
+            "main() 没把面板的实际地址落盘 —— --wait-open 子进程只能猜端口，" \
+            "端口顺延过（8787 被占用）时它会一直等一个没人监听的地址"
+        assert (_main_src.index("serve_background")
+                < _main_src.index("URL_PATH.write_text(_panel")), \
+            "地址是在 serve_background 之前写的 —— 那时还不知道实际端口，写的是错的"
 
         # 采集线程的退出清理必须在 **finally** 里。
         #
@@ -3810,7 +4031,15 @@ def main() -> None:
         # 子进程碰不到本进程的窗口，只能发个请求过来让**我们**自己 show()
         # —— 见 wait_and_open 的注释：不这么做，它每次都弹一个浏览器网页。
         dashboard.set_panel_shower(show_panel)
-        log.info("实时面板: %s", dashboard.serve_background(open_browser=False))
+        _panel = dashboard.serve_background(open_browser=False)
+        log.info("实时面板: %s", _panel)
+        # 把**实际**地址落盘给 --wait-open 子进程用（见 URL_PATH 的注释）。
+        # 端口可能不是默认那个，所以必须写实际值，不能让它去猜。
+        try:
+            URL_PATH.write_text(_panel, encoding="utf-8")
+        except OSError:
+            log.exception("写面板地址失败 —— 桌面开关可能等不到面板"
+                          "（端口顺延过时尤其会）")
     except Exception:
         log.exception("实时面板启动失败，监视继续")
 
@@ -3842,6 +4071,9 @@ def main() -> None:
     finally:
         mon.stop()
         PID_PATH.unlink(missing_ok=True)
+        # 地址也要清掉：端口是这次运行实际用的那个，留着下次的桌面开关
+        # 会先读到旧端口（多轮之后才收敛，白等）。
+        URL_PATH.unlink(missing_ok=True)
         # 退出兜底：进程都走了，桌面开关不能还挂着绿点。走的是同一条
         # 观测逻辑（running=False → 灰杠），所以退出路径不止这一条也没关系。
         sync_shortcut_icon(force=True, running=False)
