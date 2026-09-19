@@ -341,6 +341,18 @@ ENGAGED = frozenset({"focused", "neutral", "deskwork"} if DESKWORK_IS_ENGAGED
 # （见 run_tray 的 on_progress），不需要再拿一个窗口去顶。
 AUTO_OPEN_PANEL = False
 
+# 到点提醒打分（托盘气泡「专注监视 · 该打个分了」）。默认**开**。
+#
+# 为什么默认开：自述评分是唯一能验证数据准不准的东西，而气泡是唯一能让人想起
+# 来去打分的方式 —— 关掉它等于把训练数据断掉（`should_prompt_rating` 已经做了
+# "心流中不打扰、只在自然断点问"）。但它确实是一种打扰，所以留个开关。
+#
+# 关掉之后**只是不弹气泡**：待评时段照样在攒，托盘图标左键照样进评分页，
+# 面板和报告也照常。想静音又不想丢数据，放心关。
+# 它**不管**「眼睛该歇会儿了」那条 —— 那条的全部意义就是打断你抬头看远处，
+# 是另一回事（见 run_tray 的 on_eye_break）。
+RATE_REMIND = True
+
 # ───────────────── 配置覆盖（config.json）─────────────────
 # 上面这些常量就是默认值。config.json 里出现的键会覆盖它们。
 # 改完不需要重启进程：监视循环、报告、实时面板都会定期调用
@@ -375,7 +387,7 @@ _LIST_KEYS = ("WORK_APPS", "DISTRACT_KEYWORDS", "STUDY_KEYWORDS")
 # `key in form` 取值，页面上没有那个框就恒为 False —— 而界面上你还看得见它、
 # 还勾得上、勾完还提示"已保存"。所以自检里另有一条专门核对每个 _FLAGS
 # 都真的被渲染成了 checkbox（见 selftest 的"设置页"一节）。
-_FLAGS = ("DESKWORK_IS_ENGAGED", "AUTO_OPEN_PANEL")
+_FLAGS = ("DESKWORK_IS_ENGAGED", "AUTO_OPEN_PANEL", "RATE_REMIND")
 
 # 导入时的快照，供"恢复默认"用 —— apply_config 之后 globals() 就不是默认值了
 _DEFAULTS: dict = {k: globals()[k] for k in _SCALARS}
@@ -1930,7 +1942,17 @@ def run_tray(mon: Monitor) -> None:
         气泡是点不出反应的 —— pystray 的 _on_notify 只处理左键和右键，
         没有接 NIN_BALLOONUSERCLICK。所以文案里直接写清楚该点哪，
         别让用户去点那个气泡。
+
+        受 `RATE_REMIND` 管（设置页「行为 → 到点提醒打分」）。
+        门放在**这一层**（通知），不是放在 `Monitor._prompt_rating` 那一层
+        （判定）：这个开关管的是"弹不弹气泡"，不是"要不要检测该打分了" ——
+        判定那层还兼着推进 `_last_prompted`，掐掉它会让"关一阵再打开"变成
+        一次性补一堆提醒。待评时段也照样在攒，只是不吵你。
         """
+        # 放在最前面：`_pending_ratings()` 会开一次库、读两天的数据，
+        # 静音的时候连这一步都不必跑。
+        if not RATE_REMIND:
+            return
         try:
             n = _pending_ratings()
             tip = (f"刚才那 30 分钟你觉得自己专注吗？"
@@ -4632,6 +4654,24 @@ def selftest() -> None:
             "托盘菜单绕过了 open_page() —— 窗口层坏掉时那些菜单项会失灵"
         assert _tray_src.count("open_page(") >= 4, \
             "托盘里打开页面的入口都要走 open_page()（面板/评分/报告/失败提示）"
+
+        # 到点提醒打分的气泡要受 RATE_REMIND 管。
+        #
+        # 行为测不到（要起真托盘，还要等一个 30 分钟的块走完），只能钉结构 ——
+        # 但它对应的是"用户嫌吵"这件事：门一旦丢了，设置页那个开关还看得见、
+        # 还勾得上，勾了没用，气泡照弹。**这正是这个项目反复踩的那一类**。
+        #
+        # 断言写成"门 + return"**一整段**，而不是只找 `if not RATE_REMIND:`
+        # 那半句：只找半句的话，把 `return` 换成 `pass`（门成了摆设、
+        # 气泡照弹）照样是绿的。下面两条变异分别打这两半。
+        #
+        # 切片要**只包 on_block_end 这一支**：在整个 `_tray_src` 里找的话，
+        # 把门挪到 on_eye_break（管错地方了）也照样绿。
+        _obe_src = _tray_src[_tray_src.index("def on_block_end("):
+                             _tray_src.index("mon.on_block_end = on_block_end")]
+        assert "if not RATE_REMIND:\n            return" in _obe_src, (
+            "托盘里的「到点提醒打分」没接 RATE_REMIND，或者门是空的（没有 return）"
+            " —— 设置页那个开关会变成勾了没用的装饰，用户关不掉那个气泡")
 
         # 面板两条 500 分支都得既补日志配置、又记栈。
         #

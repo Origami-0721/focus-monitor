@@ -645,6 +645,19 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "",
         "dashboard.py",
     ),
+    # ── RATE_REMIND：用户嫌那个气泡吵 ──
+    # 两条各打一半：一条打"门丢了"，一条打"门还在但是空的"。
+    # 只断言 `if not RATE_REMIND:` 那半句的话，第二条能溜过去（气泡照弹）。
+    (
+        "到点提醒打分不接 RATE_REMIND（用户关不掉那个气泡）",
+        "        if not RATE_REMIND:\n            return\n",
+        "        if False:\n            return\n",
+    ),
+    (
+        "RATE_REMIND 的门是空的（气泡照弹，开关成了摆设）",
+        "        if not RATE_REMIND:\n            return\n",
+        "        if not RATE_REMIND:\n            pass\n",
+    ),
 ]
 
 
