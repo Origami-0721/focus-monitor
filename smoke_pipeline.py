@@ -364,13 +364,27 @@ def _check_resume_after_pause() -> str:
 #
 # 这三段的断言由 `scripts/smoke_mutcheck.py` 变异验证过（改了这里就回去跑一遍）：
 # 其中"阈值写死成 0.4 秒"那条**只有 C 抓得住** —— 没有那条变异的话，C 就是个
-# 从来没起过作用的安全网。
+# 从来没起过作用的安全网。也正因为只有它抓得住，**C 的时长抠不得**：
+# 见下面 `_EYE_BREAK_QUIET_DURATION` 的注释，抠到 2 秒以内那条变异就会逃逸。
 #
 _EYE_BREAK_AFTER_TEST = 0.5
 # 7 秒 ≈ 6 次结算，足够 A 弹多次、B 弹一次。
 _EYE_BREAK_DURATION = 7.0
-# C 只要跑到第二次结算之后就够：无条件触发的话那时候早就弹了。
-_EYE_BREAK_QUIET_DURATION = 3.0
+# C 的时长**必须留足余量**，不能"够跑到第二次结算就行"。
+#
+# 原因：采集循环的**第一次结算 `eye_run` 恒为 0** —— `eyes_since` 是在那一拍
+# 才被设成 `now` 的（见 focus.py 里 `elif st != "away" and eyes_since is None`），
+# 而 `eye_run = now - eyes_since`。所以要"弹"至少得跑到**第二次**结算。
+#
+# 原先这里写 3.0 秒：本机节拍 1.0 秒，正好只弹 1 次、勉强抓住那条变异；
+# CI 的 3.12 runner 稍慢一点就只跑到一次结算 —— 实测时长与弹的次数是
+# `fired ≈ duration - 2`（1.0/1.5/2.0 秒 → 0 次，2.5 秒起才有 1 次），
+# 于是 `smoke_mutcheck.py` 的第 5 条变异（阈值写死成 0.4）**逃逸**，
+# CI #36 因此变红，而同一个提交的 3.11 job 是绿的 —— "只在一边红"最难查。
+#
+# 6.0 秒在本机是 4 次；CI 上就算慢一倍也还有 2 次。
+# 基线（阈值 1e9）不受影响：那段本来一次都不该弹，跑多久都一样。
+_EYE_BREAK_QUIET_DURATION = 6.0
 
 
 def _collect_eye_breaks(db: Path, after: float, every: float,
