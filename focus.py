@@ -1384,6 +1384,11 @@ class Monitor(threading.Thread):
         super().__init__(daemon=True)
         self.camera = camera
         self.running = False
+        # 停止请求单独记一笔，不能只用 `running` —— `run()` 是在初始化**之后**
+        # 才把 `running` 置 True 的，两者之间的窗口里 `running` 还表示"还没开始"。
+        # 只置 `running = False` 的话，那个停止请求会被 `self.running = True`
+        # 覆盖掉（见 run() 里的注释和 stop() 的说明）。
+        self._stop_requested = False
         self.paused = False
         self.state = "away"
         self.on_state = lambda s: None      # 托盘在这里挂回调更新图标
@@ -1426,6 +1431,21 @@ class Monitor(threading.Thread):
             log.info("数据库补列：%s", "、".join(_added))
         conn.commit()
 
+        # 停止请求可能比这一行先到。上面那段初始化里 `ensure_models()` 在
+        # **首次运行**要下载模型，几分钟很正常 —— 用户完全可能在这期间点退出。
+        #
+        # 旧代码在这里直接 `self.running = True`，等于把那个停止请求**覆盖掉**：
+        # 采集循环随后照样起来。生产上的表现是"退出时卡一下、摄像头闪一下"
+        # （on_quit 里 `mon.join(timeout=3)` 等不到它，进程随后退出把它带走）；
+        # 但在**采集循环跑在调用线程上**的地方（`smoke_pipeline._run`）就是
+        # 直接挂死 —— CI #40 的 3.12 job 正是这么红的：一条本该立刻断言失败的
+        # 变异，把子进程挂满 300 秒超时。
+        #
+        # 所以这里要显式认账，而不是当成"还没开始"无视掉。
+        if self._stop_requested:
+            log.info("初始化期间已收到停止请求，采集不启动")
+            conn.close()
+            return
         self.running = True
         self._seq = 0
         last_face = last_pose = last_flush = time.time()
@@ -1726,6 +1746,13 @@ class Monitor(threading.Thread):
             log.info("采集线程已停止")
 
     def stop(self) -> None:
+        """请求停止。
+
+        `_stop_requested` 必须单独置位：`running` 只表示"循环正在跑"，而
+        `run()` 是做完初始化才把它置 True 的。只置 `running = False` 的话，
+        初始化期间到的停止请求会被那一行覆盖掉（见 run() 里的注释）。
+        """
+        self._stop_requested = True
         self.running = False
 
     @property
@@ -2077,6 +2104,10 @@ def run_tray(mon: Monitor) -> None:
         # （conn.commit() 尾部样本）根本没机会执行 —— 最后 ≤15 条样本
         # （约半分钟）白采。join 只等它在循环里看到 running=False，
         # 正常时瞬时返回；摄像头阻塞等极端情况靠超时兜底。
+        #
+        # 这个 join 还有另一种"等不到"：采集线程**还没初始化完**的时候点退出。
+        # 首次运行 `ensure_models()` 要下载模型（几分钟很正常），正好落进
+        # `run()` 里那个窗口 —— 靠 `_stop_requested` 才拦得住，见那里的注释。
         try:
             mon.join(timeout=3)
         except Exception:

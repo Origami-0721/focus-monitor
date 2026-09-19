@@ -13,7 +13,7 @@ distracted / away —— 专注、中性、伏案、疲劳四种状态一个都�
 所以这里用**假摄像头 + 假 Vision** 真跑一遍 `Monitor.run()`，然后查库里
 到底出现了哪些状态。不需要摄像头、不需要下载模型、不联网。
 
-四个场景：
+五个场景：
 
   ① 恒定输入 —— 永远"看到一张正对屏幕的脸"，状态必须判成「专注」。
      盯的是"数据到底有没有流进 decide()"。
@@ -34,6 +34,10 @@ distracted / away —— 专注、中性、伏案、疲劳四种状态一个都�
      功能会静默消失（照算、照显示、不报错、不提醒）。
      同一条测试里带反例：阈值调到永远达不到时，一次都不能弹。
 
+  ⑤ 停表不能被初始化吃掉 —— 停止请求落在 `run()` 的初始化窗口里时，
+     循环**必须**照样停得下来。前四条问"接得对不对"，这一条问"停不停得下来"：
+     同属静默接线故障（不报错，只是永远不结束）。CI #40 就是被它挂红的。
+
 用法:
     python smoke_pipeline.py
 """
@@ -53,13 +57,22 @@ import focus
 
 # 场景①的采集窗口。它要证明的是"循环真的跑起来了、落了样本"（`len(rows) >= 2`）。
 #
-# 结算节拍是 1 秒一次，而且**第一次结算在 t≈0**（先结算、后 sleep），
-# 所以 4.0 秒落 4 条 —— 但最后一次结算正好卡在窗口边界上（t=3.0 对停表 4.0），
-# 每轮开销一变就掉到 3 条（冒烟里打出来的就是 3）。余量只有 1 格，而且它自己在抖：
-# 这和场景④ 那条"反例时长抠太紧"是同一个毛病（CI #36 就是被那个坑红的）。
+# 结算节拍是 1 秒一次，但**第一次结算不在起点**：`last_flush` 被初始化成循环
+# 开始的那一刻，要等满 1 秒才结算第一拍。实测（以 `_T0` 为原点）：
 #
-# 实测：4.0 → 3~4 条；6.0 → 5~6 条。余量从 1 格变成 3~4 格，慢一倍也还有 2~3 条。
-# 代价只有 2 秒。
+#     duration=1.5 → 1 条（1.01）
+#     duration=2.5 → 2 条（1.01, 2.01）
+#     duration=4.0 → 3~4 条（3.01 之后那一拍是掷硬币）
+#     duration=6.0 → 5~6 条
+#
+# 也就是 `len(rows) ≈ duration - 1`，**而正好落在整秒上的那一拍是掷硬币**：
+# 采集循环没有 sleep、是在空转，它握着 GIL，于是 `threading.Timer` 里那个
+# `mon.stop()` 回调可能被推迟几十毫秒 —— 足够让边界那一拍（4.01 / 6.01）
+# 结算完。所以 4.0 秒的余量有时是 2 格、有时只有 1 格，而且**不是稳定的**。
+#
+# 这和场景④ 那条"反例时长抠太紧"是同一个毛病（CI #36 就是被那个坑红的），
+# 而且更隐蔽：慢机器上每轮开销一大，结算次数会真的掉。6.0 秒余量 3~4 格。
+# 代价 2 秒。
 DURATION = 6.0
 
 
@@ -456,6 +469,68 @@ def _check_eye_break_reminder() -> str:
             f"（第一次在 {first_run:.1f} 秒）；阈值不可达时 0 次")
 
 
+# ────────────────────── 场景⑤：停表不能被初始化吃掉 ──────────────────────
+#
+# 前四条问的都是"数据流得对不对、状态判得准不准"。这一条问的是
+# **循环停不停得下来** —— 它和"接没接上"是一类问题：都是静默的接线故障。
+#
+# 为什么要专门测：`_run` 是"先起停表、再调 `run()`"，而 `run()` 在初始化
+# **之后**才 `self.running = True`。停止请求要是落在两者中间，旧代码会把它
+# 覆盖掉，`while self.running` 就永远为真。生产上 `ensure_models()` 首次运行
+# 要下载模型（几分钟很正常），用户在这期间点退出，正好落进这个窗口 ——
+# 表现是"退出卡一下、摄像头闪一下"（`on_quit` 里 `mon.join(timeout=3)` 等不到）。
+#
+# 这个洞是被 CI 打出来的：CI #40 的 3.12 job 里，场景①那条"采集窗口砍到
+# 0.5 秒"的变异本该**立刻**断言失败（只落 0 条样本），却把子进程挂满
+# 300 秒超时 —— 因为 0.5 秒比初始化还短，停表先到、随后被 `running = True`
+# 覆盖，循环再也停不下来。**测试脚手架自己踩了产品代码的坑。**
+#
+# 本机初始化只要 10 毫秒，所以"跑得短"是复现不出来的（0.1 秒的停表照样赢）。
+# 这里**把初始化人为拖慢**：假的 `open_db` 先睡 0.4 秒，再配 0.1 秒的停表。
+#
+# 判定用"自己给自己上闹钟"，而不是"跑完再掐秒表"：循环真停不下来的话，
+# 断言永远执行不到，测试会退化成**挂死** —— 那正是它要防的那个症状，
+# 而且在 CI 上只表现为"某个步骤超时"，极难查（#40 就是这样）。
+# 所以把 `_run` 放进线程里跑，等不到就直接判失败。
+_STOP_INIT_DELAY = 0.4
+_STOP_DURATION = 0.1
+_STOP_DEADLINE = 5.0
+
+
+def _check_stop_is_not_lost() -> str:
+    """场景⑤：初始化还没走完就到的停止请求，不能被 `self.running = True` 吃掉。"""
+    db = Path(tempfile.mkdtemp()) / "pipeline-stop.db"
+    real_open_db = focus.open_db
+
+    def slow_open_db(*a, **kw):
+        time.sleep(_STOP_INIT_DELAY)
+        return real_open_db(*a, **kw)
+
+    done = threading.Event()
+
+    def body() -> None:
+        try:
+            _run(_FakeVision, db, _STOP_DURATION)
+        finally:
+            done.set()
+
+    focus.open_db = slow_open_db
+    t0 = time.time()
+    try:
+        threading.Thread(target=body, daemon=True).start()
+        finished = done.wait(_STOP_DEADLINE)
+    finally:
+        focus.open_db = real_open_db
+
+    took = time.time() - t0
+    assert finished, (
+        f"停表 {_STOP_DURATION} 秒 + 初始化 {_STOP_INIT_DELAY} 秒，采集循环"
+        f"却跑了 {took:.1f} 秒还没停 —— 初始化期间到的停止请求被"
+        "`self.running = True` 覆盖掉了，循环永远不会退出"
+        "（CI #40 就是这么挂满 300 秒超时的）")
+    return f"{took:.2f} 秒就返回了（初始化人为拖到 {_STOP_INIT_DELAY} 秒）"
+
+
 def main() -> int:
     focus.use_safe_console()
 
@@ -463,12 +538,14 @@ def main() -> int:
     summary2 = _check_face_loss_timeline()
     summary3 = _check_resume_after_pause()
     summary4 = _check_eye_break_reminder()
+    summary5 = _check_stop_is_not_lost()
 
     print(f"管线冒烟通过\n"
           f"  ① 恒定输入：{summary1}\n"
           f"  ② 丢脸时间线：{summary2}\n"
           f"  ③ 暂停恢复：{summary3}\n"
-          f"  ④ 眼睛该歇会儿了：{summary4}")
+          f"  ④ 眼睛该歇会儿了：{summary4}\n"
+          f"  ⑤ 停表不能被初始化吃掉：{summary5}")
     return 0
 
 
