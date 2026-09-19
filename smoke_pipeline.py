@@ -13,7 +13,7 @@ distracted / away —— 专注、中性、伏案、疲劳四种状态一个都�
 所以这里用**假摄像头 + 假 Vision** 真跑一遍 `Monitor.run()`，然后查库里
 到底出现了哪些状态。不需要摄像头、不需要下载模型、不联网。
 
-两个场景：
+四个场景：
 
   ① 恒定输入 —— 永远"看到一张正对屏幕的脸"，状态必须判成「专注」。
      盯的是"数据到底有没有流进 decide()"。
@@ -27,6 +27,12 @@ distracted / away —— 专注、中性、伏案、疲劳四种状态一个都�
   ③ 暂停 → 恢复 —— 暂停时循环在开头就 continue，根本走不到视觉那一段，
      所以"只在丢脸时复位"救不了它。恢复时那个陈旧的起点会直接命中。
      ②③ 一起才能钉住"复位要放在重新开始观察的那一侧"。
+
+  ④ 眼睛该歇会儿了 —— 连续用眼超过阈值后，提醒**必须真的弹出来**。
+     ①②③ 都在问"状态判得对不对"，这一条问的是"提醒到底接上了没有"：
+     阈值函数、眨眼计数全对，但循环里那个 if 没接 on_eye_break 的话，
+     功能会静默消失（照算、照显示、不报错、不提醒）。
+     同一条测试里带反例：阈值调到永远达不到时，一次都不能弹。
 
 用法:
     python smoke_pipeline.py
@@ -188,6 +194,12 @@ def _run(vision_cls, db: Path, duration: float, arm=None) -> None:
     """把外部依赖全部换掉（摄像头、模型、前台窗口、键鼠空闲）后真跑一遍采集循环。
 
     `arm(mon)` 用来在 run() 之前挂上定时器（暂停/恢复这类按时间轴驱动的动作）。
+
+    **这里不换 `maybe_reload_config`，也不需要换。** 它在 `import focus` 的
+    最后一行就已经跑过一次（那时 `_config_mtime` 从 `0.0` 变成 `(0.0, 0)`），
+    之后每次调用都是"戳没变 → 立刻返回 False"。所以调用方在 import 之后
+    patch 的常量不会被配置热重载冲掉 —— 这一点是实测过的：曾经怀疑
+    `EYE_BREAK_AFTER` 会在第一次结算被打回默认，写探针验证，结论是不会。
     """
     global _T0
     focus.DB_PATH = db
@@ -320,17 +332,121 @@ def _check_resume_after_pause() -> str:
             f"第一条在恢复之后 {offset:.1f} 秒")
 
 
+# ────────────────────── 场景④：眼睛该歇会儿了 ──────────────────────
+#
+# 前三个场景盯的都是"状态判得对不对"。这一条盯的是**提醒会不会真的弹出来**。
+#
+# 为什么非要有它：`--selftest` 能测 `eye_break_threshold()`、
+# `eye_break_message()`、`BlinkTracker`、`RubTracker` 这些纯逻辑，但测不到
+# "采集循环里那个 if 到底有没有把 on_eye_break 接上"。而这恰好是这个项目
+# 反复踩的故障形态（视觉链路断过、切换窗口的统计断过）：函数全对、计数全对、
+# 面板照显示、库里照落数，**就是永远不弹提醒**，且没有任何报错 ——
+# 而用户要的就是那一条提醒。断线只能靠"真跑一遍循环"发现。
+#
+# 做法：把阈值调小到 0.5 秒，走的是**真的** `eye_break_threshold()`
+# （不替换函数本身 —— 换掉就等于没测它）。假视觉恒定 ear=0.30、从不眨眼，
+# 所以眨眼率必然是 0.0（观测时长也不够），走的是 EYE_BREAK_AFTER 那一支。
+#
+# 三段，每段只盯一件事：
+#
+#   A 正例（间隔设 0 = 不限）—— 用眼时长判据满足就该弹，必须弹 ≥ 2 次。
+#     这一段同时是 B 的前提：它证明"这几秒里确实有好几个结算时刻满足条件"，
+#     否则 B 只弹一次可能只是没机会弹，而不是间隔起了作用。
+#
+#   B 最小间隔（间隔设 1 小时）—— 必须**正好弹 1 次**。
+#     间隔那条守卫没了的话，它会和 A 一样弹五次。
+#     用"正好 1 次"而不是"比较两次提醒的秒数"，是因为它不依赖结算节拍：
+#     节拍是 1 秒还是 1.5 秒都成立。写"间隔 ≥ 2 秒"的话，慢机器上节拍一拉长，
+#     就算守卫被删掉间隔也照样 ≥ 2 秒 —— 断言会变成摆设，而且没人会发现。
+#
+#   C 反例（阈值 1e9，永远达不到）—— 必须弹 0 次。
+#     只测正例的话，把 on_eye_break 写成无条件调用照样能变绿。
+#
+# 这三段的断言由 `scripts/smoke_mutcheck.py` 变异验证过（改了这里就回去跑一遍）：
+# 其中"阈值写死成 0.4 秒"那条**只有 C 抓得住** —— 没有那条变异的话，C 就是个
+# 从来没起过作用的安全网。
+#
+_EYE_BREAK_AFTER_TEST = 0.5
+# 7 秒 ≈ 6 次结算，足够 A 弹多次、B 弹一次。
+_EYE_BREAK_DURATION = 7.0
+# C 只要跑到第二次结算之后就够：无条件触发的话那时候早就弹了。
+_EYE_BREAK_QUIET_DURATION = 3.0
+
+
+def _collect_eye_breaks(db: Path, after: float, every: float,
+                        duration: float) -> list[tuple[float, float]]:
+    """跑一段采集，返回 on_eye_break 收到的 (eye_run, blink_rate) 列表。"""
+    fired: list[tuple[float, float]] = []
+    saved = (focus.EYE_BREAK_AFTER, focus.EYE_BREAK_SOON, focus.EYE_REMIND_EVERY)
+    # 两个阈值都设成同一个值：本场景的假视觉不眨眼，眨眼率是 0.0，
+    # eye_break_threshold() 必然走 EYE_BREAK_AFTER 那一支。SOON 一起设是为了
+    # C —— 不设的话它停在 25 分钟，而"阈值不可达"那条断言就拦不住
+    # "判定走了 SOON 那一支"这种情况了。
+    focus.EYE_BREAK_AFTER = after
+    focus.EYE_BREAK_SOON = after
+    focus.EYE_REMIND_EVERY = every
+    try:
+        def arm(mon):
+            mon.on_eye_break = lambda run, blink: fired.append((run, blink))
+
+        _run(_FakeVision, db, duration, arm=arm)
+    finally:
+        (focus.EYE_BREAK_AFTER, focus.EYE_BREAK_SOON,
+         focus.EYE_REMIND_EVERY) = saved
+    return fired
+
+
+def _check_eye_break_reminder() -> str:
+    """场景④：连续用眼超时后，「眼睛该歇会儿了」必须真的弹出来。"""
+    tmp = Path(tempfile.mkdtemp())
+
+    # A 正例：不限间隔，该弹就弹
+    loose = _collect_eye_breaks(tmp / "a.db", _EYE_BREAK_AFTER_TEST, 0.0,
+                                _EYE_BREAK_DURATION)
+    assert len(loose) >= 2, (
+        f"连续用眼超过 {_EYE_BREAK_AFTER_TEST} 秒、又没限提醒间隔，"
+        f"{_EYE_BREAK_DURATION:.0f} 秒里却只弹了 {len(loose)} 次 —— "
+        "采集循环里的触发点没接上 on_eye_break"
+        "（眨眼率照算、面板照显示，就是永远不弹窗，而且不报错）")
+
+    # B 最小间隔：设成 1 小时，那就只该弹第一次
+    spaced = _collect_eye_breaks(tmp / "b.db", _EYE_BREAK_AFTER_TEST, 3600.0,
+                                 _EYE_BREAK_DURATION)
+    assert len(spaced) == 1, (
+        f"提醒间隔设成 1 小时，却在 {_EYE_BREAK_DURATION:.0f} 秒里弹了 "
+        f"{len(spaced)} 次（应该正好 1 次）—— 最小间隔没起作用，"
+        "会变成每秒弹一次，用户只能把提醒整个关掉")
+
+    first_run, first_blink = spaced[0]
+    assert first_run >= _EYE_BREAK_AFTER_TEST, (
+        f"用眼才 {first_run:.1f} 秒就提醒了（阈值 {_EYE_BREAK_AFTER_TEST} 秒）—— "
+        "判据没生效，人一坐下就会被念")
+    assert first_blink >= 0.0, f"提醒里带的眨眼率是负数：{first_blink}"
+
+    # C 反例：阈值调到一个不可能达到的值，必须一次都不弹。
+    quiet = _collect_eye_breaks(tmp / "c.db", 1e9, 0.0,
+                                _EYE_BREAK_QUIET_DURATION)
+    assert not quiet, (
+        f"阈值调到 1e9 秒（永远达不到）却仍然弹了 {len(quiet)} 次 —— "
+        "提醒是无条件触发的，那个判据等于形同虚设")
+
+    return (f"不限间隔 {len(loose)} 次；间隔 1 小时时 {len(spaced)} 次"
+            f"（第一次在 {first_run:.1f} 秒）；阈值不可达时 0 次")
+
+
 def main() -> int:
     focus.use_safe_console()
 
     summary1 = _check_constant_input()
     summary2 = _check_face_loss_timeline()
     summary3 = _check_resume_after_pause()
+    summary4 = _check_eye_break_reminder()
 
     print(f"管线冒烟通过\n"
           f"  ① 恒定输入：{summary1}\n"
           f"  ② 丢脸时间线：{summary2}\n"
-          f"  ③ 暂停恢复：{summary3}")
+          f"  ③ 暂停恢复：{summary3}\n"
+          f"  ④ 眼睛该歇会儿了：{summary4}")
     return 0
 
 

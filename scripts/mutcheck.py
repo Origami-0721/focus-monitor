@@ -30,6 +30,10 @@
     uv run python scripts/mutcheck.py
 
 退出码 0 = 所有变异都被抓住；1 = 有变异逃逸；2 = 基线自己就跑不过。
+
+**这个脚本只管 `--selftest`。** 采集循环里的接线（"提醒到底会不会弹出来"
+这类）自检测不到，那部分的断言由 `scripts/smoke_mutcheck.py` 守着 ——
+两个闸门各管一半，改了一边记得看另一边。
 """
 
 from __future__ import annotations
@@ -532,6 +536,26 @@ MUTATIONS: list[tuple[str, str, str]] = [
         " < HAND_EYE_RADIUS * eye_span * w\n",
         "    return math.hypot(wx - ex, wy - ey)"
         " < HAND_EYE_RADIUS * eye_span\n",
+        "focus.py",
+    ),
+    (
+        "视疲劳提醒不再触发（眨眼率照算、面板照显示，就是永远不弹窗）",
+        "                            self._announce_eye_break(eye_run, blink_rate)\n",
+        "                            pass\n",
+        "focus.py",
+    ),
+    (
+        "视疲劳提醒没有最小间隔（每秒弹一次，用户只能把提醒整个关掉）",
+        "                        if (eye_run >= eye_break_threshold(blink_rate)\n"
+        "                                and now - last_eye_remind >= EYE_REMIND_EVERY):\n",
+        "                        if (eye_run >= eye_break_threshold(blink_rate)):\n",
+        "focus.py",
+    ),
+    (
+        "面板读的实时视疲劳状态不写（面板永远显示「还没数据」）",
+        '                        _runtime["eye"] = {"run": eye_run, "blink": blink_rate,\n'
+        '                                           "rub": rub_rate, "at": now}\n',
+        "                        pass\n",
         "focus.py",
     ),
 ]
