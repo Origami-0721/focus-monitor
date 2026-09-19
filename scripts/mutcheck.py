@@ -658,6 +658,20 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "        if not RATE_REMIND:\n            return\n",
         "        if not RATE_REMIND:\n            pass\n",
     ),
+    # ── EYE_BREAK_REMIND：同一个毛病，另一条气泡 ──
+    # 这两条还有个额外作用：证明上面那条结构断言**切片切对了** ——
+    # 门要是被挪到 on_block_end（管错地方了），`_oeb_src` 里找不到它，
+    # 断言先红。
+    (
+        "眼睛该歇会儿了不接 EYE_BREAK_REMIND（用户关不掉那个气泡）",
+        "        if not EYE_BREAK_REMIND:\n            return\n",
+        "        if False:\n            return\n",
+    ),
+    (
+        "EYE_BREAK_REMIND 的门是空的（气泡照弹，开关成了摆设）",
+        "        if not EYE_BREAK_REMIND:\n            return\n",
+        "        if not EYE_BREAK_REMIND:\n            pass\n",
+    ),
 ]
 
 

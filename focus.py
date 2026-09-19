@@ -349,9 +349,20 @@ AUTO_OPEN_PANEL = False
 #
 # 关掉之后**只是不弹气泡**：待评时段照样在攒，托盘图标左键照样进评分页，
 # 面板和报告也照常。想静音又不想丢数据，放心关。
-# 它**不管**「眼睛该歇会儿了」那条 —— 那条的全部意义就是打断你抬头看远处，
-# 是另一回事（见 run_tray 的 on_eye_break）。
+# 它**不管**「眼睛该歇会儿了」那条 —— 那条有自己的开关（EYE_BREAK_REMIND）。
 RATE_REMIND = True
+
+# 「眼睛该歇会儿了」的托盘气泡（见 run_tray 的 on_eye_break）。默认**开**。
+#
+# 为什么不和 RATE_REMIND 合成一个"静音所有气泡"：两件事该不该响的判据不同。
+# 打分提醒的价值是"趁你还记得住"，关掉就真没了；眼睛提醒的价值是"打断你抬头
+# 看远处"，而这件事你自己也做得到。合成一个开关的话，想静音其中一个就得连
+# 另一个一起关掉。
+#
+# 关掉之后**只是不弹气泡**：面板里那条「该让眼睛歇会儿了」的横幅照旧
+# （它只在你自己打开面板时可见，不打扰人），日志里也照旧写 `视疲劳提醒：…`
+# —— 留着这行是为了让"没提醒"还能分清是眼睛不累还是这条链路坏了。
+EYE_BREAK_REMIND = True
 
 # ───────────────── 配置覆盖（config.json）─────────────────
 # 上面这些常量就是默认值。config.json 里出现的键会覆盖它们。
@@ -387,7 +398,8 @@ _LIST_KEYS = ("WORK_APPS", "DISTRACT_KEYWORDS", "STUDY_KEYWORDS")
 # `key in form` 取值，页面上没有那个框就恒为 False —— 而界面上你还看得见它、
 # 还勾得上、勾完还提示"已保存"。所以自检里另有一条专门核对每个 _FLAGS
 # 都真的被渲染成了 checkbox（见 selftest 的"设置页"一节）。
-_FLAGS = ("DESKWORK_IS_ENGAGED", "AUTO_OPEN_PANEL", "RATE_REMIND")
+_FLAGS = ("DESKWORK_IS_ENGAGED", "AUTO_OPEN_PANEL", "RATE_REMIND",
+          "EYE_BREAK_REMIND")
 
 # 导入时的快照，供"恢复默认"用 —— apply_config 之后 globals() 就不是默认值了
 _DEFAULTS: dict = {k: globals()[k] for k in _SCALARS}
@@ -1969,7 +1981,15 @@ def run_tray(mon: Monitor) -> None:
 
         和评分提醒不同，这条**就是要打断你**（让你抬头看远处），
         所以不等自然断点，只受 EYE_REMIND_EVERY 冷却约束。
+
+        受 `EYE_BREAK_REMIND` 管（设置页「行为 → 眼睛该歇会儿了」）。
+        门和 RATE_REMIND 一样放在**这一层**（通知），不放在
+        `Monitor._announce_eye_break` 那一层：那层还兼着写
+        `视疲劳提醒：…` 那行日志，静音之后它**必须继续写** ——
+        否则"没提醒"就分不清是眼睛不累、还是这条链路坏了。
         """
+        if not EYE_BREAK_REMIND:
+            return
         try:
             icon.notify(eye_break_message(eye_run, blink_rate),
                         "专注监视 · 眼睛该歇会儿了")
@@ -4672,6 +4692,17 @@ def selftest() -> None:
         assert "if not RATE_REMIND:\n            return" in _obe_src, (
             "托盘里的「到点提醒打分」没接 RATE_REMIND，或者门是空的（没有 return）"
             " —— 设置页那个开关会变成勾了没用的装饰，用户关不掉那个气泡")
+
+        # 「眼睛该歇会儿了」的气泡同理 —— 同一类毛病，另一条气泡。
+        # 切片同样只包 on_eye_break 这一支：两条门要是**互换了位置**
+        # （眼睛的门写进 on_block_end、打分的门写进 on_eye_break），
+        # 上面那条断言和这条会各红一个，跑不掉。
+        _oeb_src = _tray_src[_tray_src.index("def on_eye_break("):
+                             _tray_src.index("mon.on_eye_break = on_eye_break")]
+        assert "if not EYE_BREAK_REMIND:\n            return" in _oeb_src, (
+            "托盘里的「眼睛该歇会儿了」没接 EYE_BREAK_REMIND，或者门是空的"
+            "（没有 return）—— 设置页那个开关会变成勾了没用的装饰，"
+            "用户关不掉那个气泡")
 
         # 面板两条 500 分支都得既补日志配置、又记栈。
         #
