@@ -223,11 +223,19 @@ def _eye_stats(has_cols: bool, eye_rows: list[tuple]) -> str:
     if blinks:
         ordered = sorted(blinks)
         blink_txt = f"{ordered[len(ordered) // 2]:.0f} 次/分"
+        low_txt = f"{low_share:.0%}"
         blink_note = (f"中位数，只在<b>数得出</b>的 {len(blinks)} 秒上算；"
                       f"其余 {len(eye_rows) - len(blinks)} 秒观测时长不够"
                       f"（窗口里至少要有 30 秒正对屏幕）。")
     else:
+        # 一次都没数出来的时候，「占比」必须显示 "—" 而不是 "0%"。
+        # 0% 读起来是"你眨眼很正常"，真相是"还没测出来"，方向正好相反 ——
+        # 而这正是**重启之后头半分钟**的状态：采集端把"样本不足"落成 `0`
+        # 而不是 `NULL`（见 focus.py 的 _MIGRATIONS），所以 load_eye 会把这些行
+        # 捞回来，但它们表达的是"还不知道"。上一张卡片显示 "—"、这张显示 "0%"，
+        # 两张自相矛盾，而用户会信那个 0%。
         blink_txt = "—"
+        low_txt = "—"
         blink_note = ("一次都没数出来：要么观测时长一直不够，"
                       "要么这段时间人没正对过屏幕。")
 
@@ -237,7 +245,7 @@ def _eye_stats(has_cols: bool, eye_rows: list[tuple]) -> str:
         f'  <div class="card"><div class="k">眨眼率中位数</div>'
         f'<div class="v">{blink_txt}</div></div>\n'
         f'  <div class="card"><div class="k">眨眼偏低的占比</div>'
-        f'<div class="v">{low_share:.0%}</div></div>\n'
+        f'<div class="v">{low_txt}</div></div>\n'
         f'  <div class="card"><div class="k">揉眼次数</div>'
         f'<div class="v">{rub_events} 次</div></div>\n'
         '</div>\n'

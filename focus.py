@@ -2993,6 +2993,38 @@ def selftest() -> None:
             "揉眼次数不对。rub 是滚动 60 秒计数，**求和会放大 60 倍** ——"
             "这里必须按增量数事件")
         assert ">60 次</div>" not in _h, "揉眼次数被当成求和算了"
+
+        # (d) 新库、但 blink **全是 0**（"样本不足，还不知道"）——
+        #     这正是**重启之后头半分钟**的状态：列已经补上了、采集也在写，
+        #     但每个结算窗口都还没攒够"30 秒正对屏幕"的观测时长。
+        #     这时「眨眼偏低的占比」必须显示 "—"，**不能显示 0%**：
+        #     0% 读起来是"你眨眼很正常"，真相是"还没测出来"，方向正好相反。
+        #     同一节里两张卡片一张显示 "—"、一张显示 "0%"，用户会信那个 0%。
+        #
+        #     断言用**整段卡片 HTML** 而不是裸的 "0%"：报告别处也可能出现
+        #     0%（应用占比之类），裸字符串会误判。
+        _zero = _eye_tmp / "zero.db"
+        _c = sqlite3.connect(str(_zero))
+        _c.executescript(SCHEMA)
+        for _i in range(60):
+            _c.execute(_SAMPLE_INSERT,
+                       (_base + _i, "focused", "code.exe", "t", 0.0, 5.0, 0.30,
+                        3.0, 1.0, 1, 0.0, 0.0, 0))
+        _c.commit()
+        _c.close()
+        globals()["DB_PATH"] = _zero
+        _h0 = report.build_html(rows)
+        assert "视疲劳（眨眼" in _h0, \
+            "blink 全是 0（还没测出来）时，视疲劳那一节整节消失了"
+        assert ('<div class="k">眨眼偏低的占比</div><div class="v">—</div>'
+                in _h0), (
+            "blink 全是 0（还没测出来）时，「眨眼偏低的占比」没显示 '—'")
+        assert ('<div class="k">眨眼偏低的占比</div><div class="v">0%</div>'
+                not in _h0), (
+            "blink 全是 0（还没测出来）时，「眨眼偏低的占比」显示了 0% —— "
+            "0% 读起来是「你眨眼很正常」，而真相是「还没测出来」。"
+            "同一节里眨眼率那张卡片显示的是 '—'，两张自相矛盾，"
+            "而用户会信那个 0%")
     finally:
         globals()["DB_PATH"] = _keep_db
 
