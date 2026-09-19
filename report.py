@@ -145,6 +145,110 @@ def load(db_path: Path | None = None, since: float | None = None) -> list[tuple]
         conn.close()
 
 
+def load_eye(db_path: Path | None = None,
+             since: float | None = None) -> tuple[bool, list[tuple]]:
+    """读「视疲劳」那两列，返回 `(库里有没有这两列, [(ts, blink, rub)])`。
+
+    **为什么单独一个查询，而不是往 load() 的 SELECT 里加两列。**
+    `load()` 返回的是**位置元组**，而下游全部按位置解包：`_timed()` 把它投影成
+    固定 10 元组，`export_csv()` 解 11 元组。往那条 SELECT 里加两列，
+    `export_csv` 立刻 `ValueError` —— 而它是**导出到一半才抛**，用户拿到的是个
+    能打开、但少了一大半的 CSV，比明确报错更危险。报告里已经栽过一次同类的
+    跟头（位置参数写错列会静默错位）。所以新数据走新路，不去动那条老路。
+
+    **列不存在是正常状态，不是错误。** 报告可以跑在老库上（还没重启过新版本），
+    而 `ALTER TABLE` 只发生在采集循环启动时。所以先查列在不在，不在就返回
+    `(False, [])`，让报告显示"重启后开始记录"，而不是 500 —— 报告打不开是
+    用户最直接能感知的故障。
+
+    **`blink` 列是可信的，别和 `ear` 列混。** 它由采集循环在**帧级** EAR 上
+    实时算出（10 Hz）；而 `ear` 列存的是每秒 10 帧的**中位数**，0.1~0.4 秒的
+    眨眼早就被抹平了 —— 拿历史 `ear` 回放永远数不出眨眼。
+    """
+    db_path = focus.DB_PATH if db_path is None else db_path
+    conn = focus.open_db(db_path)
+    try:
+        if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='samples'").fetchone():
+            return False, []
+        have = {r[1] for r in conn.execute("PRAGMA table_info(samples)")}
+        if not {"blink", "rub"} <= have:
+            return False, []
+        sql = "SELECT ts, blink, rub FROM samples WHERE blink IS NOT NULL"
+        args: tuple = ()
+        if since is not None:
+            sql += " AND ts >= ?"
+            args = (since,)
+        return True, conn.execute(sql + " ORDER BY ts", args).fetchall()
+    finally:
+        conn.close()
+
+
+def _eye_stats(has_cols: bool, eye_rows: list[tuple]) -> str:
+    """「视疲劳」那几个数字，拼成 HTML 片段。
+
+    全部是**描述性**的，不含任何判定 —— 和采集端保持一致：眨眼率 / 揉眼
+    目前只记录、不参与状态机（见 `focus.py` 常量区「视疲劳」那一段）。
+
+    `rub` 列是「最近一分钟揉眼次数」的**滚动值**，所以**不能求和** ——
+    一次揉眼会在之后 60 条样本里都留下痕迹，求和会放大 60 倍。
+    正确做法是数**增量**：`rub` 每涨 1 就是新的一次。
+    """
+    if not has_cols:
+        return ('<p class="note">视疲劳（眨眼率 / 揉眼）<b>还没开始记录</b>：'
+                '这两列要等应用用新版本重启一次才会加进库，'
+                '重启后这里就会出现眨眼率和揉眼次数。</p>')
+    if not eye_rows:
+        return ('<p class="note">视疲劳（眨眼率 / 揉眼）已经开始记录，'
+                '但这段区间里还没有样本 —— 换一个时间范围看看。</p>')
+
+    blinks = [r[1] for r in eye_rows if r[1]]
+    low = focus.BLINK_LOW_RATE
+    low_share = (sum(1 for b in blinks if b < low) / len(blinks)
+                 if blinks else 0.0)
+
+    # 揉眼按增量数，不求和（见 docstring）
+    rub_events = 0
+    prev = 0
+    for _ts, _b, r in eye_rows:
+        cur = r or 0
+        if cur > prev:
+            rub_events += cur - prev
+        prev = cur
+
+    span = max(1.0, eye_rows[-1][0] - eye_rows[0][0])
+    per_hour = rub_events * 3600.0 / span
+
+    if blinks:
+        ordered = sorted(blinks)
+        blink_txt = f"{ordered[len(ordered) // 2]:.0f} 次/分"
+        blink_note = (f"中位数，只在<b>数得出</b>的 {len(blinks)} 秒上算；"
+                      f"其余 {len(eye_rows) - len(blinks)} 秒观测时长不够"
+                      f"（窗口里至少要有 30 秒正对屏幕）。")
+    else:
+        blink_txt = "—"
+        blink_note = ("一次都没数出来：要么观测时长一直不够，"
+                      "要么这段时间人没正对过屏幕。")
+
+    return (
+        '<h3>视疲劳（眨眼 / 揉眼）</h3>\n'
+        '<div class="cards">\n'
+        f'  <div class="card"><div class="k">眨眼率中位数</div>'
+        f'<div class="v">{blink_txt}</div></div>\n'
+        f'  <div class="card"><div class="k">眨眼偏低的占比</div>'
+        f'<div class="v">{low_share:.0%}</div></div>\n'
+        f'  <div class="card"><div class="k">揉眼次数</div>'
+        f'<div class="v">{rub_events} 次</div></div>\n'
+        '</div>\n'
+        f'<p class="note">{blink_note}'
+        f'「眨眼偏低」指低于 {low:.0f} 次/分 —— 正常是 15~20 次，'
+        f'盯屏幕时会掉到 5~7 次，是眼睛干的表现。<br>'
+        f'揉眼折合 {per_hour:.1f} 次/小时。这一项<b>只记录、不参与判定</b>：'
+        f'摄像头用的姿态模型只给手腕、没有手指，"手在脸附近"和托腮、扶眼镜、'
+        f'挠头分不开，所以它必然会多报，别拿它当准确次数看。</p>')
+
+
 def _dur(sec: float) -> str:
     sec = int(sec)
     if sec >= 3600:
@@ -491,7 +595,8 @@ def trust_banner(corr: float | None, n_pairs: int) -> str:
             f"动手前先读「使用教程 · {_FIX_DOC}」。</div>")
 
 
-def build_html(rows: list[tuple], nav_html: str = "") -> str:
+def build_html(rows: list[tuple], nav_html: str = "",
+               eye_rows: tuple[bool, list[tuple]] | None = None) -> str:
     focus.maybe_reload_config()          # 报告用当前设置，不是进程启动时的
     ENGAGED = focus.ENGAGED              # 局部绑定，下面所有引用都取最新值
     TILT_WARN = focus.TILT_WARN
@@ -509,6 +614,17 @@ def build_html(rows: list[tuple], nav_html: str = "") -> str:
 
     items = _timed(rows)
     sessions = _sessions(items)
+
+    # 视疲劳那两列单独取（见 load_eye 的说明）。
+    #
+    # 哨兵值必须是 None 而不是 `eye_rows=load_eye()`：默认参数在**函数定义时**
+    # 就求值了，那样会把 DB_PATH 绑死成 import 那一刻的库 —— `load()` 上面
+    # 那段注释记的就是这个坑（样本来自 A 库、评分来自 B 库，静默混库）。
+    #
+    # 放在 `if not rows` 之后：空数据页提前返回，就不该为它去碰数据库
+    # （smoke.py 正是拿空 rows 渲染所有页面的）。
+    if eye_rows is None:
+        eye_rows = load_eye()
 
     # ── 全局时长 ──
     dur: dict[str, float] = defaultdict(float)
@@ -1067,6 +1183,7 @@ focus.py 里的 DESKWORK_IS_ENGAGED 改成 False。</p>
 </div>
 <p class="note">坐姿由前置摄像头肩线倾角估算（&gt;{TILT_WARN:.0f}° 记为不良）。
 正面视角看不到驼背，这不是脊柱检测。状态切换 {switches} 次。</p>
+{_eye_stats(*eye_rows)}
 </div></details>
 
 </div></body></html>"""

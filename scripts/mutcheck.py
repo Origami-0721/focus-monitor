@@ -99,12 +99,15 @@ MUTATIONS: list[tuple[str, str, str]] = [
     ),
     (
         "toggle 先写绿点、再起进程（用户报的那个 bug 本身）",
+        # 片段要**最小**：只包住跟这条变异有关的两行。原来这里把下面那句
+        # print 也包进来了，结果那行文案一改（AUTO_OPEN_PANEL 那次），
+        # 片段就匹配不到、变异静默失效 —— 闸门报的是 ?? 而不是 OK。
+        # 它确实报了（没有蒙混过关），但每次改相邻的代码都要来修一次变异，
+        # 纯属自找的。
         '    if _start_engine():\n'
-        '        sync_shortcut_icon(force=True, running=True)\n'
-        '        print("已启动专注监视，面板就绪后会自动打开。")\n',
+        '        sync_shortcut_icon(force=True, running=True)\n',
         '    sync_shortcut_icon(force=True, running=True)\n'
-        '    if _start_engine():\n'
-        '        print("已启动专注监视，面板就绪后会自动打开。")\n',
+        '    if _start_engine():\n',
     ),
     (
         "_switch_wal 无条件返回 True（假定切成功，其实库还在 delete 模式）",
@@ -557,6 +560,90 @@ MUTATIONS: list[tuple[str, str, str]] = [
         '                                           "rub": rub_rate, "at": now}\n',
         "                        pass\n",
         "focus.py",
+    ),
+    (
+        "报告：老库（没有 blink/rub 两列）上谎报「已开始记录」",
+        # 报告可以跑在还没迁移过的库上（应用没重启），这时必须降级成
+        # "重启后开始记录"，而不是显示"这段区间没样本"（那是另一回事）。
+        '        if not {"blink", "rub"} <= have:\n            return False, []\n',
+        '        if not {"blink", "rub"} <= have:\n            return True, []\n',
+        "report.py",
+    ),
+    (
+        "报告：揉眼次数按滚动值求和（放大 60 倍，一次揉眼变成 60 次）",
+        "        if cur > prev:\n            rub_events += cur - prev\n",
+        "        rub_events += cur\n",
+        "report.py",
+    ),
+    (
+        "报告：眨眼率把「观测时长不够」的样本也算进去（0 被当成真的 0 次/分）",
+        "    blinks = [r[1] for r in eye_rows if r[1]]\n",
+        "    blinks = [r[1] for r in eye_rows]\n",
+        "report.py",
+    ),
+    (
+        "报告：「眨眼偏低的占比」方向写反（越高越好，正好反了）",
+        "    low_share = (sum(1 for b in blinks if b < low) / len(blinks)\n",
+        "    low_share = (sum(1 for b in blinks if b > low) / len(blinks)\n",
+        "report.py",
+    ),
+    (
+        "报告：视疲劳那一节没渲染（接线断了，整节消失）",
+        "{_eye_stats(*eye_rows)}\n",
+        "",
+        "report.py",
+    ),
+    # ── AUTO_OPEN_PANEL：用户报的"桌面一直弹「专注监视」窗口" ──
+    # 下面这四条各有一条**只有它能抓住**的断言，别当成重复：
+    #   第 1、2 条打的是"设置页 ↔ 配置"这条接线（渲染 / 取值各一条路），
+    #   第 3、4 条打的是 _start_engine 里那个门的两侧（该关的关、该开的开）。
+    (
+        "设置页少渲染一个开关（那个开关永远是关的：勾得上，但 `key in form` 恒为假）",
+        "    for _name in focus._FLAGS:\n"
+        "        _label, _hint = _FLAG_FIELDS[_name]\n",
+        "    for _name in (\"DESKWORK_IS_ENGAGED\",):\n"
+        "        _label, _hint = _FLAG_FIELDS[_name]\n",
+        "dashboard.py",
+    ),
+    (
+        "设置页少读一个开关（取消勾选没有任何效果：那个键压根不进 cfg）",
+        "    for key in focus._FLAGS:\n        cfg[key] = key in form\n",
+        "    for key in (\"DESKWORK_IS_ENGAGED\",):\n        cfg[key] = key in form\n",
+        "dashboard.py",
+    ),
+    (
+        "_start_engine 无视 AUTO_OPEN_PANEL（每次启动都弹一次面板窗口）",
+        "        if not AUTO_OPEN_PANEL:\n",
+        "        if False:\n",
+    ),
+    (
+        "_start_engine 永远不起 --wait-open（开关勾了也不弹，成了个装饰）",
+        "        if not AUTO_OPEN_PANEL:\n",
+        "        if True:\n",
+    ),
+    # ── 自检不许碰真网络 ──
+    # 用户报的"每次让你改点东西，窗口就弹到最顶层"就是下面第一条变异描述的
+    # 那个写法造成的：自检拿**真的 URL_PATH**（运行中的应用写下的 8787）去
+    # 请求 `/show-panel`，把用户正在用的窗口 `show()` 出来。两条各钉一半：
+    # 一条钉"地址有没有指走"，一条钉"网络有没有堵上 + 有没有记录"。
+    (
+        "自检里 wait_and_open 用回真 URL_PATH（会打到运行中的应用，弹他的窗口）",
+        "        globals()[\"URL_PATH\"] = _dead_url\n"
+        "        urllib.request.urlopen = _refuse_urlopen\n",
+        "        urllib.request.urlopen = _refuse_urlopen\n",
+    ),
+    (
+        "自检里没记下 wait_and_open 请求过谁（「只许敲死地址」就失去依据）",
+        "        _asked_real.append(str(u))\n",
+        "",
+    ),
+    (
+        "面板服务收到 /show-panel 不留日志（窗口自己弹出来了，查不出是谁弹的）",
+        "                log.info(\"面板请求：/show-panel（来自 %s）\",\n"
+        "                         self.client_address[0] if self.client_address"
+        " else \"?\")\n",
+        "",
+        "dashboard.py",
     ),
 ]
 

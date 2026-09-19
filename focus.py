@@ -323,6 +323,24 @@ DESKWORK_IS_ENGAGED = True
 ENGAGED = frozenset({"focused", "neutral", "deskwork"} if DESKWORK_IS_ENGAGED
                     else {"focused", "neutral"})
 
+# 启动时要不要自动把面板窗口弹出来。默认**关**。
+#
+# 这是**应用自己**唯一一处"每次启动都弹一个窗口"的地方：桌面开关 fork 出来的
+# --wait-open 子进程（见 _start_engine）。用户第一次报的就是它
+# （"桌面一直弹「专注监视」的窗口，会打扰我工作"）。
+#
+# 但要注意：他第二次带截图报的「**每次让你改一点东西**的时候就是这样一直弹出
+# 这个在最顶层」，**不是这一处** —— 那个是自检里的 wait_and_open 打到了正在
+# 运行的这个实例上，见 selftest 里那一段的注释。两个都要修，别把后者当成
+# "用户又抱怨了一遍"就跳过。
+#
+# "程序到底跑起来没有"不靠这个窗口回答 —— 桌面快捷方式的绿点回答（绿点只在
+# 进程真的起来之后才写，见 toggle()）。想看的时候点托盘图标，那一下**不受这个
+# 开关影响**：它管的是"自动"，不是"能不能看"。
+# 首次运行也不弹：那会儿"看起来像没反应"这件事已经有托盘气泡兜着
+# （见 run_tray 的 on_progress），不需要再拿一个窗口去顶。
+AUTO_OPEN_PANEL = False
+
 # ───────────────── 配置覆盖（config.json）─────────────────
 # 上面这些常量就是默认值。config.json 里出现的键会覆盖它们。
 # 改完不需要重启进程：监视循环、报告、实时面板都会定期调用
@@ -349,17 +367,27 @@ _SCALARS: dict[str, type] = {
 }
 _LIST_KEYS = ("WORK_APPS", "DISTRACT_KEYWORDS", "STUDY_KEYWORDS")
 
+# 布尔开关。**必须单独列出来**：设置页里标量是 number 输入框、开关是 checkbox，
+# 渲染和取值各走一条路，所以自检里那张"配置键 ⇔ 字段"的表（它只覆盖
+# _SCALARS / _LIST_KEYS）管不到它们。
+#
+# 少渲染一个 checkbox 的后果是这个开关**永远是关的**：_parse_form 靠
+# `key in form` 取值，页面上没有那个框就恒为 False —— 而界面上你还看得见它、
+# 还勾得上、勾完还提示"已保存"。所以自检里另有一条专门核对每个 _FLAGS
+# 都真的被渲染成了 checkbox（见 selftest 的"设置页"一节）。
+_FLAGS = ("DESKWORK_IS_ENGAGED", "AUTO_OPEN_PANEL")
+
 # 导入时的快照，供"恢复默认"用 —— apply_config 之后 globals() 就不是默认值了
 _DEFAULTS: dict = {k: globals()[k] for k in _SCALARS}
 _DEFAULTS.update({k: globals()[k] for k in _LIST_KEYS})
-_DEFAULTS["DESKWORK_IS_ENGAGED"] = DESKWORK_IS_ENGAGED
+_DEFAULTS.update({k: globals()[k] for k in _FLAGS})
 
 
 def current_config() -> dict:
     """当前生效的配置，用于渲染设置页。"""
     cfg = {k: globals()[k] for k in _SCALARS}
     cfg.update({k: sorted(globals()[k]) for k in _LIST_KEYS})
-    cfg["DESKWORK_IS_ENGAGED"] = DESKWORK_IS_ENGAGED
+    cfg.update({k: globals()[k] for k in _FLAGS})
     return cfg
 
 
@@ -399,7 +427,7 @@ def validate_config(cfg: dict) -> list[str]:
 
 
 def apply_config(cfg: dict) -> None:
-    global DESKWORK_IS_ENGAGED, ENGAGED
+    global ENGAGED
     for name, caster in _SCALARS.items():
         if name in cfg:
             globals()[name] = caster(cfg[name])
@@ -408,8 +436,9 @@ def apply_config(cfg: dict) -> None:
             vals = [str(v).strip() for v in cfg[name] if str(v).strip()]
             cur = globals()[name]
             globals()[name] = set(vals) if isinstance(cur, set) else tuple(vals)
-    if "DESKWORK_IS_ENGAGED" in cfg:
-        DESKWORK_IS_ENGAGED = bool(cfg["DESKWORK_IS_ENGAGED"])
+    for name in _FLAGS:
+        if name in cfg:
+            globals()[name] = bool(cfg[name])
     # ENGAGED 是由 DESKWORK_IS_ENGAGED 推出来的，必须跟着重算
     ENGAGED = frozenset({"focused", "neutral", "deskwork"} if DESKWORK_IS_ENGAGED
                         else {"focused", "neutral"})
@@ -2493,7 +2522,8 @@ def _start_engine(timeout: float = 15.0) -> bool:
 
     两个进程各司其职：本体负责采集和托盘（DETACHED，不随开关退出），
     `--wait-open` 那个只负责等面板就绪再开窗口（模型要下十几秒，
-    它得阻塞着等）。
+    它得阻塞着等）—— **但后者只在 AUTO_OPEN_PANEL 打开时才起**，
+    默认不起（用户报过"每次启动都弹一个窗口，打扰工作"）。
 
     **先确认本体活了，再起第二个。** 顺序反过来的话，本体压根没起来时，
     第二个进程会照旧去等 120 秒面板、最后放弃 —— 用户多等两分钟，
@@ -2510,6 +2540,23 @@ def _start_engine(timeout: float = 15.0) -> bool:
                          creationflags=_DETACHED, close_fds=True)
         if not _wait_until_running(timeout):
             return False
+        # ── 自动弹面板（AUTO_OPEN_PANEL）──
+        # 这是**应用自己**唯一一处"每次启动都弹一个窗口"的地方：只要双击一次
+        # 桌面开关，就有一个 --wait-open 子进程在等模型下完、然后把窗口
+        # show() 出来。起进程这件事本身不需要窗口作证，绿点已经作证了
+        # （toggle 里紧随其后的 sync_shortcut_icon）。
+        #
+        # **用户第二次报的「每次让你改点东西就弹窗」不是这一处** ——
+        # 那个是自检里裸奔的 wait_and_open 打到了正在运行的这个实例上
+        # （见 selftest 里那段的注释）。这一处是"他自己启动应用"时会看到的
+        # 那一个，也就是他最初描述的那个。两个都修了。
+        #
+        # 放在 _wait_until_running 之后：本体都没起来的时候，起这个子进程
+        # 只会让它白等 120 秒（见上面的 docstring）。
+        if not AUTO_OPEN_PANEL:
+            log.info("AUTO_OPEN_PANEL 关闭，不自动弹面板"
+                     "（要看的话点托盘图标，那条路不走这里）")
+            return True
         subprocess.Popen(relaunch_cmd() + ["--wait-open"], cwd=str(ROOT),
                          creationflags=_DETACHED, close_fds=True)
     except OSError:
@@ -2534,7 +2581,12 @@ def toggle() -> None:
 
     if _start_engine():
         sync_shortcut_icon(force=True, running=True)
-        print("已启动专注监视，面板就绪后会自动打开。")
+        # 文案必须跟着开关走。默认关着的时候还打"面板就绪后会自动打开"，
+        # 就是在告诉用户一件不会发生的事 —— 而他刚抱怨过弹窗，
+        # 会以为设置没生效、又去反复双击。
+        print("已启动专注监视，面板就绪后会自动打开。" if AUTO_OPEN_PANEL else
+              "已启动专注监视。面板没有自动弹出（设置里「启动时自动打开面板」"
+              "是关的），点托盘图标就能看。")
         return
 
     # 没起来。把开关置灰，并且**必须**告诉用户为什么 —— 双击开关的是个
@@ -2830,12 +2882,77 @@ def selftest() -> None:
              for t in range(1789000060, 1789000090)]
     rows += [(t, "away", "explorer.exe", "", 0.0, 0.0, 0.0, 0.0, 1.0, 0, 300.0)
              for t in range(1789000090, 1789000120)]
-    html = report.build_html(rows)
+    # eye_rows 显式传：不传的话 build_html 会自己去读 focus.DB_PATH ——
+    # 而自检跑到这里时那还指着**用户的真库**。自检不该碰它（只读也一样：
+    # 结果会随真库内容变，本机绿、CI 红）。真实那条路在下面单独测。
+    html = report.build_html(rows, eye_rows=(False, []))
     for needle in ("专注", "走神", "离开", "哔哩哔哩", "focus.py",
                    "<svg", "时间轴", "专注应用排行", "分心应用排行",
-                   "应用使用记录", "占活跃", "时段"):
+                   "应用使用记录", "占活跃", "时段", "视疲劳"):
         assert needle in html, f"报告缺少 {needle}"
     assert html.count("<html") == 1
+
+    # ── 报告的「视疲劳」一节 ──
+    #
+    # 这里**走真实那条路**（build_html 内部自己调 load_eye() 去读库），
+    # 而不是把数据直接喂进去 —— 最容易断的恰恰是那根接线
+    # （`{_eye_stats(*eye_rows)}`），喂数据等于把它绕过去了。
+    #
+    # 三种库都要试，因为"列不存在"是**正常状态**而不是错误：报告可以跑在
+    # 老库上（还没重启过新版本），而 ALTER TABLE 只发生在采集循环启动时。
+    # 报告打不开是用户最能直接感知的故障。
+    _keep_db = globals()["DB_PATH"]
+    _eye_tmp = Path(tempfile.mkdtemp())
+    try:
+        # (a) 老库：有 samples 表、但没有 blink/rub 两列
+        _old = _eye_tmp / "old.db"
+        _c = sqlite3.connect(str(_old))
+        _c.executescript("CREATE TABLE samples(ts REAL, state TEXT)")
+        _c.commit()
+        _c.close()
+        globals()["DB_PATH"] = _old
+        _h = report.build_html(rows)
+        assert "还没开始记录" in _h, (
+            "报告在老库（没有 blink/rub 两列）上没有降级成「还没开始记录」——"
+            "要么报错了，要么显示了别的东西。这会让报告整页打不开")
+
+        # (b) 空库：连 samples 表都没有（全新用户）
+        globals()["DB_PATH"] = _eye_tmp / "nothing.db"
+        assert "还没开始记录" in report.build_html(rows), \
+            "报告在空库（连 samples 表都没有）上报错了"
+
+        # (c) 新库 + 有数据：数字必须真的算出来
+        _new = _eye_tmp / "new.db"
+        _c = sqlite3.connect(str(_new))
+        _c.executescript(SCHEMA)
+        _base = 1789000000.0
+        for _i in range(120):
+            _c.execute(_SAMPLE_INSERT,
+                       (_base + _i, "focused", "code.exe", "t", 0.0, 5.0, 0.30,
+                        3.0, 1.0, 1, 0.0,
+                        # 前 60 秒 blink=0（观测时长不够，表示"还不知道"），
+                        # 不该被算进眨眼率里
+                        0.0 if _i < 60 else (12.0 if _i < 110 else 5.0),
+                        # rub 是"最近一分钟揉眼次数"的**滚动值**，
+                        # 一次揉眼会在之后 60 条样本里都留下 1 —— 求和会放大
+                        # 60 倍，所以只能按增量数事件。这里是 1 次。
+                        1 if 30 <= _i < 90 else 0))
+        _c.commit()
+        _c.close()
+        globals()["DB_PATH"] = _new
+        _h = report.build_html(rows)
+        # 眨眼率中位数：50 条 12.0 + 10 条 5.0 → 中位数 12
+        assert ">12 次/分</div>" in _h, (
+            "新库上有眨眼数据，报告里却没算出 12 次/分 —— 视疲劳那节没接上")
+        # 低于 BLINK_LOW_RATE(8) 的 10 条 / 60 条 = 17%
+        assert ">17%</div>" in _h, "「眨眼偏低的占比」没算对（应为 10/60）"
+        # 揉眼按增量数：0→1 只有一次
+        assert ">1 次</div>" in _h, (
+            "揉眼次数不对。rub 是滚动 60 秒计数，**求和会放大 60 倍** ——"
+            "这里必须按增量数事件")
+        assert ">60 次</div>" not in _h, "揉眼次数被当成求和算了"
+    finally:
+        globals()["DB_PATH"] = _keep_db
 
     # ── 报告给出的行动建议必须**能照着做** ──
     #
@@ -2888,6 +3005,37 @@ def selftest() -> None:
         assert not (set(_LIST_KEYS) - _rendered_txt), (
             f"配置里有这些列表，但设置页改不到："
             f"{sorted(set(_LIST_KEYS) - _rendered_txt)}")
+
+        # ── 布尔开关走的是另一条路（checkbox），上面那张表管不到它们 ──
+        # 单独钉一遍。漏渲染一个 checkbox 的后果是**这个开关永远是关的**：
+        # _parse_form 靠 `key in form` 取值，页面上没有那个框就恒为 False ——
+        # 而界面上你还看得见它、还勾得上、勾完还提示"已保存"。
+        # 反过来说也成立：想打开的人永远打不开。
+        # （AUTO_OPEN_PANEL 漏了的话，用户的原话会变成
+        #  "设置里明明写着不自动弹，它还是弹"。）
+        _page = _dash_chk._settings_page()
+        for _flag in _FLAGS:
+            assert f'name="{_flag}"' in _page, (
+                f"配置开关 {_flag} 没有在设置页渲染出来 —— _parse_form 靠"
+                " `key in form` 取值，没有那个 checkbox 就恒为 False，"
+                "这个开关会**永远是关的**，而界面上完全看不出来")
+
+        # 反向：_parse_form 必须真的能取到每一个开关。
+        # 漏掉一个的话，用户取消勾选 → 表单里没有那个名字 → cfg 里也没有
+        # 那个键 → apply_config 不认 → **取消勾选没有任何效果**，
+        # 值还停在上一次的状态上。
+        _cur_form = current_config()
+        _form_cfg, _form_errs = _dash_chk._parse_form(
+            {k: [str(_cur_form[k])] for k in _SCALARS})
+        assert not _form_errs, _form_errs
+        for _flag in _FLAGS:
+            assert _flag in _form_cfg, (
+                f"_parse_form 没有取到开关 {_flag} —— 用户取消勾选后那个键"
+                "压根不进 cfg，apply_config 就不会碰它，"
+                "于是**取消勾选没有任何效果**")
+            assert _form_cfg[_flag] is False, (
+                f"表单里没有 {_flag} 时应该解析成 False（checkbox 的语义），"
+                f"实际 {_form_cfg[_flag]!r}")
 
     # 指的文档小节也必须真的有这个标题
     _tut = (ROOT / "使用教程.md").read_text(encoding="utf-8")
@@ -3017,6 +3165,49 @@ def selftest() -> None:
     assert "deskwork" not in ENGAGED, "关掉开关后伏案不该算投入"
     assert decide(**{**base, "pitch": 45.0}) == "deskwork", "状态判定不受开关影响"
     assert MARK + "0%</b>" in report.build_html(dk), "报告的有效投入要跟着开关走"
+
+    # ── AUTO_OPEN_PANEL：默认不许自动弹面板 ──
+    # 这是用户报的"桌面一直弹「专注监视」窗口，打扰工作"的回归测试。
+    #
+    # _start_engine 会起真进程（DETACHED 的监视本体 + --wait-open），
+    # 所以把 Popen 和"等它起来"都换掉，只记下它到底还想不想再起第二个。
+    # 这条测的是**默认值**，也就是用户装完就生效的那份行为 ——
+    # 光在常量那儿写 AUTO_OPEN_PANEL = False 是不够的：
+    # 那个常量没人读的时候，它就是个注释。
+    _spawned: list[list[str]] = []
+    _keep_popen = subprocess.Popen
+    _keep_waitrun = globals()["_wait_until_running"]
+    _keep_auto = AUTO_OPEN_PANEL
+
+    class _FakePopen:
+        def __init__(self, cmd, *a, **kw):
+            _spawned.append(list(cmd))
+
+    try:
+        subprocess.Popen = _FakePopen
+        globals()["_wait_until_running"] = lambda _t: True
+
+        apply_config({"AUTO_OPEN_PANEL": False})
+        assert _start_engine(timeout=0.1) is True, (
+            "关掉自动弹面板不该让启动失败 —— 起进程和弹窗口是两件事，"
+            "把前者也一起关掉的话用户双击开关就没反应了")
+        assert len(_spawned) == 1, (
+            f"AUTO_OPEN_PANEL 关着，_start_engine 还是起了 {len(_spawned)} 个进程"
+            f"（{_spawned}）—— 多出来的那个就是 --wait-open，"
+            "它会等模型下完然后把面板窗口 show() 出来，正是用户抱怨的那个弹窗")
+        assert not any("--wait-open" in _c for _c in _spawned), (
+            "AUTO_OPEN_PANEL 关着，还是起了 --wait-open 子进程")
+
+        _spawned.clear()
+        apply_config({"AUTO_OPEN_PANEL": True})
+        assert _start_engine(timeout=0.1) is True
+        assert any("--wait-open" in _c for _c in _spawned), (
+            "打开 AUTO_OPEN_PANEL 之后没起 --wait-open —— "
+            "这个开关就成了个勾了也不起作用的装饰")
+    finally:
+        subprocess.Popen = _keep_popen
+        globals()["_wait_until_running"] = _keep_waitrun
+        apply_config({"AUTO_OPEN_PANEL": _keep_auto})
 
     # 关键词表是整体替换，不是往默认值里追加
     apply_config({"YAW_TOL": 40.0, "WORK_APPS": ["myapp.exe"]})
@@ -3555,6 +3746,7 @@ def selftest() -> None:
             # 上面那两条断言都抓不到它，所以这里把中间那段真跑一遍。
             _shown: list[int] = []
             _keep_shower = _dash._panel_shower
+            _cap.records.clear()          # 只留这次请求的记录，下面要按它断言
             try:
                 _dash._panel_shower = lambda: _shown.append(1)
                 _sp_code, _sp_body = _hit("/show-panel")
@@ -3571,6 +3763,18 @@ def selftest() -> None:
                     "/show-panel 回了 200，但**没有调用**注入的「显示面板」实现"
                     " —— 子进程会以为一切正常，而监视进程的窗口永远不出现"
                     "（用户看到的就是「双击开关没反应」）")
+                # 服务端还要**自己**留一条日志。
+                #
+                # 客户端那条 `已请求监视进程显示面板` 是另一个进程写的：它压日志、
+                # 或者发请求的压根不是我们的程序，服务端这边就一片安静 —— 而
+                # 窗口正在往最顶层弹。实测踩过：自检里一处裸奔的 wait_and_open
+                # 打到了用户正在跑的实例上，focus.log 里一条都没有，最后靠
+                # EnumWindows 反复试才定位到。有这条，下次就是一眼的事。
+                assert any(r.levelno == logging.INFO
+                           and "/show-panel" in r.getMessage()
+                           for r in _cap.records), (
+                    "/show-panel 服务端没写日志 —— 窗口自己弹出来了也查不出是谁弹的"
+                    "（客户端那条在另一个进程里，可能被压掉或压根不是我们发的）")
             finally:
                 _dash._panel_shower = _keep_shower
 
@@ -3802,11 +4006,54 @@ def selftest() -> None:
     log.addHandler(_probe)
     _keep_lvl_wa = log.level
     log.setLevel(logging.CRITICAL)
-    _t0 = time.time()
-    wait_and_open(timeout=0.1)          # 服务起不来 → 必须很快返回，不能卡住
-    assert time.time() - _t0 < 10.0, "服务等不到时必须及时返回，不能一直转"
 
+    # ── 服务等不到时必须及时返回，而且**绝不能碰真网络** ──
+    #
+    # ⚠️ 这条断言曾经一边绿着、一边把用户正在运行的那个窗口弹到最前面。
+    #
+    # 它原来是裸奔的：用**真的 URL_PATH**（用户机器上就是运行中的应用写下的
+    # `http://127.0.0.1:8787/`）+ **真的 urlopen**。于是"服务等不到"这个前提
+    # 在应用正在运行的机器上根本不成立 —— 服务就在那儿，wait_and_open 会一路
+    # 走到底、请求 `/show-panel`，把那个窗口 `show()` 出来。而断言只看
+    # "有没有超过 10 秒"，照样是绿的：它测的根本不是它想测的东西。
+    #
+    # 副作用正好是用户最烦的那件事。用户的原话是
+    # 「每次让你改一点东西的时候就是这样一直弹出这个在最顶层」——
+    # 因为"改一点东西"就要跑一遍自检，而**每跑一遍自检就弹一次他的窗口**。
+    # 实测（把窗口点 × 收起来，跑一次 `--selftest`，它立刻又可见了；再用
+    # urlopen 探针拦，看到的就是 `http://127.0.0.1:8787/` 和
+    # `.../show-panel` 这两条真实请求）。
+    #
+    # 所以现在两件事一起钉：地址指到**没人监听的端口**，urlopen 换成必定失败
+    # 的假货，并且把"它到底请求过谁"记下来 —— 只要出现任何一个不是那个死地址
+    # 的请求，就说明它又在碰真东西了。
+    global URL_PATH          # 下面几段都要临时改它，声明必须在**所有使用之前**
     _real_urlopen = urllib.request.urlopen
+    _dead_td = tempfile.TemporaryDirectory()
+    _dead_url = Path(_dead_td.name) / "focus.url"
+    _dead_url.write_text("http://127.0.0.1:1/", encoding="utf-8")
+    _asked_real: list[str] = []
+
+    def _refuse_urlopen(u, *a, **k):
+        _asked_real.append(str(u))
+        raise OSError("自检：不许碰真网络（会请求到正在运行的那个实例上）")
+
+    _keep_urlpath_early = URL_PATH
+    _t0 = time.time()
+    try:
+        globals()["URL_PATH"] = _dead_url
+        urllib.request.urlopen = _refuse_urlopen
+        wait_and_open(timeout=0.1)      # 服务起不来 → 必须很快返回，不能卡住
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        globals()["URL_PATH"] = _keep_urlpath_early
+    assert time.time() - _t0 < 10.0, "服务等不到时必须及时返回，不能一直转"
+    assert _asked_real and all(u.startswith("http://127.0.0.1:1/")
+                               for u in _asked_real), (
+        f"wait_and_open 请求了 {_asked_real} —— 自检里只许敲那个死地址。"
+        "打到真地址上就是打到了**用户正在运行的那个实例**，/show-panel 会把"
+        "他的窗口弹到最前面（用户报的「每次让你改点东西就弹窗」就是这么来的）")
+
     _real_open = webbrowser.open
     _win_mod = sys.modules.get("window", "__absent__")
     _opened: list[str] = []
@@ -3819,7 +4066,8 @@ def selftest() -> None:
     # 放弃 —— 用户看到的还是"双击了没反应"。
     # 下面把 URL_PATH 指到临时文件，并且**故意用非默认端口**：这样
     # "到底有没有读文件"就成了一个能被变异抓到的差别，而不是"反正都通"。
-    global URL_PATH
+    # （`global URL_PATH` 已经在上面那段声明过了，这里不要再写一遍 ——
+    #  写在"使用之后"会直接 SyntaxError。）
     _keep_urlpath = URL_PATH
     _wa_td = tempfile.TemporaryDirectory()
     _wa_url = Path(_wa_td.name) / "focus.url"
@@ -4562,6 +4810,11 @@ def main() -> None:
     # 窗口默认是隐藏的，托盘图标又常常藏在 ^ 折叠区里 —— 于是"双击了但
     # 什么都没发生"。开一次面板就把"在记录、状态是什么、摄像头通不通"
     # 一次全回答了，成本只是一个 if。
+    #
+    # 但它**受 AUTO_OPEN_PANEL 管**（默认关）。不这么做的话，那个开关就是个
+    # 半真的开关：写着"不自动弹"，删掉 focus.db 或换台机器就冷不丁弹一个。
+    # 首次运行的"像没反应"另有托盘气泡兜着（run_tray 的 on_progress），
+    # 所以关掉它并不会让新手对着空气发呆。
     first_run = not DB_PATH.exists()
 
     # 把库切到 WAL —— **必须在采集线程起来之前**，也必须在面板开始接请求之前。
@@ -4596,7 +4849,7 @@ def main() -> None:
     mon = Monitor(camera=args.camera)
     mon.start()
 
-    if first_run:
+    if first_run and AUTO_OPEN_PANEL:
         # 模型要下十几秒、窗口层又要等主线程的 GUI 循环起来，所以丢到子线程，
         # 别卡住托盘启动。show_panel 自己会等窗口对象建出来（等不到就降级到
         # 系统浏览器，见该函数）。

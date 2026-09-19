@@ -432,6 +432,21 @@ _TEXTAREAS = [
      "娱乐应用已经不再扣分了"),
 ]
 
+# 布尔开关的文案。键必须和 focus._FLAGS 一一对应 —— 渲染那边是按 _FLAGS
+# 遍历、再来这里查文案的，所以少写一个会 KeyError（响的，不是静默的），
+# 自检里还有一条正向核对。用 dict 而不是循环拼接：文案要人来写。
+_FLAG_FIELDS: dict[str, tuple[str, str]] = {
+    "DESKWORK_IS_ENGAGED": (
+        "伏案计入专注时长",
+        "低头看书/写作业算不算投入。前置摄像头分不清「低头看书」和"
+        "「低头玩手机」—— 发现伏案时长虚高就取消勾选"),
+    "AUTO_OPEN_PANEL": (
+        "启动时自动打开面板",
+        "启动后自动把面板窗口弹出来。默认关：开一次就是屏幕中央多一个窗口，"
+        "而「到底跑起来没有」看桌面快捷方式的绿点就知道。"
+        "想看的时候点托盘图标 —— 那一下不受这个开关影响"),
+}
+
 
 def _parse_form(form: dict) -> tuple[dict, list[str]]:
     """表单 → 配置。返回 (配置, 错误列表)。"""
@@ -448,7 +463,11 @@ def _parse_form(form: dict) -> tuple[dict, list[str]]:
     for key, _, _ in _TEXTAREAS:
         raw = (form.get(key) or [""])[0]
         cfg[key] = [s.strip() for s in re.split(r"[\n,，;；]", raw) if s.strip()]
-    cfg["DESKWORK_IS_ENGAGED"] = "DESKWORK_IS_ENGAGED" in form
+    # 开关：checkbox 只在**勾上**的时候才进表单，所以"不在表单里"就是"取消勾选"。
+    # 必须遍历 focus._FLAGS 而不是手写两个键 —— 手写漏一个的话，那个开关
+    # 压根不进 cfg，apply_config 就不会碰它，于是**取消勾选没有效果**。
+    for key in focus._FLAGS:
+        cfg[key] = key in form
     if not errors:
         errors.extend(focus.validate_config(cfg))
     return cfg, errors
@@ -469,14 +488,19 @@ def _settings_page(cfg: dict | None = None, errors: list[str] | None = None,
                      f'value="{cfg.get(key, "")}">{h}</label>')
         blocks.append(f'<h2>{html.escape(group)}</h2><div class="fields">{rows}</div>')
 
-    checked = " checked" if cfg.get("DESKWORK_IS_ENGAGED") else ""
-    blocks.append(
-        '<h2>行为</h2><div class="fields">'
-        f'<label class="fld chk"><input type="checkbox" '
-        f'name="DESKWORK_IS_ENGAGED"{checked}>'
-        '<span class="fl">伏案计入专注时长</span>'
-        '<span class="hint">低头看书/写作业算不算投入。前置摄像头分不清'
-        '「低头看书」和「低头玩手机」—— 发现伏案时长虚高就取消勾选</span></label></div>')
+    # 开关项。按 focus._FLAGS 遍历（不手写名字）：漏渲染一个的后果是那个开关
+    # **永远是关的** —— _parse_form 靠 `key in form` 取值，页面上没有那个框
+    # 就恒为 False，而界面上你还看得见它、还勾得上、勾完还提示"已保存"。
+    # 文案在 _FLAG_FIELDS 里，缺了会 KeyError（响的，不是静默的）。
+    _flag_rows = ""
+    for _name in focus._FLAGS:
+        _label, _hint = _FLAG_FIELDS[_name]
+        _checked = " checked" if cfg.get(_name) else ""
+        _flag_rows += (f'<label class="fld chk"><input type="checkbox" '
+                       f'name="{_name}"{_checked}>'
+                       f'<span class="fl">{html.escape(_label)}</span>'
+                       f'<span class="hint">{html.escape(_hint)}</span></label>')
+    blocks.append(f'<h2>行为</h2><div class="fields">{_flag_rows}</div>')
 
     for key, label, hint in _TEXTAREAS:
         val = html.escape("\n".join(cfg.get(key, [])))
@@ -835,8 +859,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 # fork 出来的 --wait-open 子进程）只想知道请求送到了，没必要
                 # 陪着一个 GUI 调用等。
                 #
+                # **服务端必须自己留一条日志。** 客户端那条
+                # `已请求监视进程显示面板` 是**另一个进程**写的 —— 它压日志、
+                # 或者发请求的压根不是我们的程序，这边就一片安静，而窗口正在
+                # 往最顶层弹。实测踩过：自检里一处裸奔的 wait_and_open 打到了
+                # 用户正在跑的实例上，focus.log 里一条都没有，最后靠
+                # EnumWindows 反复试才定位到。谁的请求，就在谁的日志里留痕。
+                #
                 # 没有注入实现时（`--dashboard` 单跑）就只回 ok —— 那条路上
                 # 本来就没有窗口可显示。
+                _ensure_log()
+                log.info("面板请求：/show-panel（来自 %s）",
+                         self.client_address[0] if self.client_address else "?")
                 self._send("ok")
                 if _panel_shower is not None:
                     threading.Thread(target=_panel_shower, daemon=True).start()
