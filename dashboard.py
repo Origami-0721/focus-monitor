@@ -241,6 +241,33 @@ def _live_html() -> str:
         health = (f'<span class="ok">记录中 · {lag:.0f} 秒前更新</span>'
                   f' · <span class="muted">{base_note}</span>')
 
+    # 视疲劳横幅。**和 is_paused() 同源**：只有 dashboard 与采集在同一进程时
+    # 才读得到，独立 `uv run dashboard.py` 时读不到 —— 那就干脆不显示，
+    # 而不是显示一个永远不更新的旧值（宁缺勿假）。
+    # 还要看时间戳：采集停了之后 _runtime 里那个值会一直冻着。
+    eye = focus.eye_status()
+    eye_banner = ""
+    eye_note = ""
+    if eye and time.time() - eye.get("at", 0.0) < 60.0:
+        blink = eye.get("blink") or 0.0
+        # 这一行**一直显示**，不只在提醒时显示：用户得能自己确认眨眼检测
+        # 到底有没有在工作（它是新加的，谁也没见过它触发）。藏起来的话，
+        # "没提醒"到底是"眼睛不累"还是"检测坏了"就分不出来。
+        eye_note = ('<p class="note">眼睛：'
+                    + (f'眨眼 {blink:.0f} 次/分' if blink > 0 else '眨眼统计中')
+                    + f' · 最近一分钟揉眼 {eye.get("rub", 0)} 次'
+                    + f' · 本轮连续用眼 {_dur(eye.get("run", 0.0))}'
+                    + '</p>')
+        if eye.get("run", 0.0) >= focus.eye_break_threshold(blink):
+            bits = [f'已经连续用眼 {_dur(eye["run"])}']
+            if blink > 0:
+                bits.append(f'眨眼 {blink:.0f} 次/分')
+            if eye.get("rub"):
+                bits.append(f'揉眼 {eye["rub"]} 次')
+            eye_banner = ('<div class="alert bad">该让眼睛歇会儿了 —— '
+                          + " · ".join(bits)
+                          + '。抬头看看 6 米外的东西 20 秒。</div>')
+
     # 当前这次连续投入（往回数）
     # 时间空档必须断开：睡眠/关机期间没有样本，但 _timed 已经给每条样本
     # 记了时长，不检查间隔会把睡眠前后的两段专注拼成一段"连续投入"。
@@ -331,7 +358,7 @@ def _live_html() -> str:
   </div>
   <div class="health">{health}</div>
 </div>
-
+{eye_banner}
 <div class="cards">
   <div class="card"><div class="k">当前连续投入</div>{flow}</div>
   <div class="card"><div class="k">本次会话</div>{sess_html}</div>
@@ -345,6 +372,7 @@ def _live_html() -> str:
 
 <h2>最近 60 分钟</h2>
 <div class="tape">{tape}</div>
+{eye_note}
 
 <h2>今天各小时</h2>
 <div class="hbars">{bars}</div>
@@ -377,6 +405,17 @@ _FIELDS = [
         ("PROC_WIDTH", "送进模型的画面宽度", "越小越快"),
         ("AWAY_WRITE_EVERY", "离开时落库间隔（秒）",
          "离开期间降频写库，避免整夜待机撑爆数据库"),
+    ]),
+    ("视疲劳提醒", [
+        ("EYE_BREAK_AFTER", "连续用眼多久提醒休息（秒）",
+         "这是主判据。默认 40 分钟"),
+        ("EYE_BREAK_SOON", "眨眼率偏低时提前到（秒）",
+         "眨眼率低于下面那个值时用这一档，默认 25 分钟。"
+         "必须不大于上面那个数，否则这条判据不起作用"),
+        ("BLINK_LOW_RATE", "眨眼率偏低（次/分钟）",
+         "屏幕阅读时普遍掉到 5~7 次/分，所以默认 8"),
+        ("EYE_REMIND_EVERY", "两次提醒的最小间隔（秒）",
+         "别把人念烦了，默认 20 分钟"),
     ]),
 ]
 

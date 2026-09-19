@@ -38,6 +38,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -220,6 +221,46 @@ DISTRACT_SWITCH_WINDOW = 60.0   # 回看窗口（秒）
 # 实测他的数据里这不构成问题（次数到 20 时，一分钟内确实见过 5 个以上
 # 不同窗口），但这是个已知的粗糙处。
 
+# ── 视疲劳：眼睛该歇会儿了 ──
+# **这一块判的是"视疲劳 / 干眼"，不是"困"，两者别混。**
+# 文献口径（PERCLOS 那套）：跟**困倦**对应的是单次闭眼变长、慢眨眼/半眨眼
+# 变多、PERCLOS（闭眼时间占比）升高；而眨眼**次数**受干眼、风吹、认知负荷
+# 干扰，屏幕阅读时普遍掉到 5~7 次/分，它反映的是"盯屏幕太久"。
+# 所以这里的产出**不进状态机**：状态描述的是"我在干什么"（专注/走神/…），
+# 而"眼睛该休息了"是关于生理负荷的**建议**。混进状态会把投入时长统计污染掉。
+#
+# 眨眼怎么数：EAR 跌破阈值 → 回升算一次闭合；闭合短于 BLINK_MAX_DUR 才算
+# 眨眼，更长的算眯眼/微睡眠，不重复计（那是 EAR_SUSTAIN 那条管的事）。
+# 只在**正对屏幕**时计入 —— 转头时眼区被压缩、EAR 假性变低，
+# 全算成眨眼的话眨眼率会凭空翻几倍。这不是理论担心：他库里 71544 条
+# 有脸样本里，ear 低于出厂闭眼线 0.19 的占 14.6%，远多于眨眼能解释的量。
+BLINK_WINDOW = 60.0      # 眨眼率 / 揉眼率的统计窗口（秒）
+BLINK_MAX_DUR = 0.6      # 单次闭合短于此算眨眼；更长算眯眼/微睡眠，不计
+BLINK_MIN_GAP = 0.5      # 两次眨眼的最小间隔。真人间隔 ≥ 0.5 秒（一次眨眼
+#                          0.1~0.4 秒 + 睁眼间隔），所以这个值不会吃掉真眨眼；
+#                          它同时挡住"EAR 在阈值附近来回穿越被数成一串"。
+#                          万一把眨眼率数高了也只是不提前提醒（见下面那条
+#                          "只提前不延后"），不会反过来误报，是失败安全的方向。
+BLINK_MIN_OBS = 30.0     # 窗口里至少观察到这么多秒才出数（不足则报 0 = 未知）
+BLINK_LOW_RATE = 8.0     # 低于此次/分视为盯屏幕过久（屏幕阅读常态是 5~7）
+BLINK_HIGH_RATE = 35.0   # 高于此次/分更像干眼/刺激；只用于文案，不单独触发
+#
+# 提醒的触发：**连续用眼时长**是主判据，眨眼率只能让提醒提前、不能让闭嘴 ——
+# 沿用这个项目里"弱证据只抬高、不贬低"的纪律（见 DISTRACT_SWITCH_RATE 那段）。
+# 理由很实在：眨眼检测依赖 EAR 阈值，比"坐了多久"脆弱得多；把它做成
+# 必要条件的话，检测一旦失灵就变成永远不提醒 —— 静默失效最难发现。
+EYE_BREAK_AFTER = 40 * 60.0   # 连续用眼这么久 → 提醒休息
+EYE_BREAK_SOON = 25 * 60.0    # 若同时眨眼率偏低 → 提前到这么久
+EYE_REMIND_EVERY = 20 * 60.0  # 两次提醒的最小间隔，别把人烦到关掉
+EYE_REST_RESET = 5 * 60.0     # 离开屏幕这么久才算真的休息过，用眼时长清零
+#
+# 揉眼：**只记录，不参与任何判定。** 原因见 read_posture 上方那段 ——
+# Pose 模型只给手腕、没有手指，"手在脸附近"和托腮/扶眼镜/挠头分不开。
+# 先攒够真实数据再决定阈值，跟当初标定走神阈值是同一个套路。
+HAND_EYE_RADIUS = 0.75   # 手腕到两眼中点的距离 < 此值 × 两眼外角距 → 手在眼周
+HAND_EYE_HOLD = 3        # 连续命中这么多次姿态采样才算一次揉眼（2Hz → 1.5 秒）
+RUB_MIN_GAP = 30.0       # 两次揉眼的最小间隔，防一次揉眼被拆成好几次
+
 WORK_APPS = {
     "code.exe", "code - insiders.exe", "cursor.exe", "devenv.exe", "idea64.exe",
     "pycharm64.exe", "sublime_text.exe", "notepad++.exe", "notepad.exe",
@@ -300,6 +341,11 @@ _SCALARS: dict[str, type] = {
     "TILT_WARN": float, "AWAY_WRITE_EVERY": float,
     # 走神的行为判据，也是最该按自己习惯调的一个数（见常量区注释）
     "DISTRACT_SWITCH_RATE": float,
+    # 视疲劳提醒。这三个直接决定"多久被念一次"，最该按自己习惯调；
+    # 眨眼/揉眼的检测细节（窗口、去抖、手腕半径）不进设置页 ——
+    # 它们是标定值，改错了只会让统计失真，用户没法判断好坏。
+    "EYE_BREAK_AFTER": float, "EYE_BREAK_SOON": float,
+    "EYE_REMIND_EVERY": float, "BLINK_LOW_RATE": float,
 }
 _LIST_KEYS = ("WORK_APPS", "DISTRACT_KEYWORDS", "STUDY_KEYWORDS")
 
@@ -339,6 +385,16 @@ def validate_config(cfg: dict) -> list[str]:
     # 直接把数据毁掉）；配太大则这条判据等于不存在。见常量区的标定说明。
     if cfg["DISTRACT_SWITCH_RATE"] <= 0:
         errs.append("「页面切换频率」必须为正数，否则每条样本都会判成走神")
+    # 视疲劳提醒：EYE_BREAK_SOON 是"眨眼率偏低时提前提醒"的那一档，
+    # 它不小于 EYE_BREAK_AFTER 的话那个提前量就是空的 —— 不报错，
+    # 只是眨眼这条判据**静默失效**，谁也不会发现。
+    if cfg["EYE_BREAK_SOON"] > cfg["EYE_BREAK_AFTER"]:
+        errs.append("「提前提醒的用眼时长」不能大于「常规提醒的用眼时长」，"
+                    "否则眨眼率偏低这条判据永远不起作用")
+    for k in ("EYE_BREAK_SOON", "EYE_BREAK_AFTER", "EYE_REMIND_EVERY",
+              "BLINK_LOW_RATE"):
+        if cfg[k] <= 0:
+            errs.append(f"{k} 必须为正数")
     return errs
 
 
@@ -546,6 +602,144 @@ def ear_threshold(history: list[float]) -> float:
     return max(0.05, ordered[idx] * EAR_RATIO)
 
 
+def hand_near_eye(eye_xy: tuple[float, float] | None, eye_span: float,
+                  wrist: tuple[float, float, float], w: int, h: int) -> bool:
+    """手腕是不是在眼周。wrist = (x, y, visibility)，归一化坐标。
+
+    抽成纯函数是为了能直接断言 —— 这段几何换算有三处最容易写错，而且写错
+    不会报错，只会**一直判 False**（揉眼次数永远是 0，看着像"你从不揉眼"）：
+      1. 归一化坐标是各向异性的（x 除以宽、y 除以高），不乘回像素就比距离，
+         画面越扁判得越歪；
+      2. 半径必须跟着**眼距**缩放，否则人往后一靠（脸变小）就再也判不出来；
+      3. 低 visibility 的手腕要丢掉，那是模型在瞎猜。
+
+    **它判的是"手在脸附近"，不是"在揉眼睛"。** Pose 只给手腕、没有手指，
+    托腮、扶眼镜、挠头全都会命中 —— 所以这个值只用于计数，不参与判定。
+    """
+    if eye_xy is None or eye_span <= 0:
+        return False
+    wx, wy, vis = wrist
+    if vis < 0.5:
+        return False
+    ex, ey = eye_xy
+    return math.hypot((wx - ex) * w, (wy - ey) * h) < HAND_EYE_RADIUS * eye_span * w
+
+
+class BlinkTracker:
+    """眨眼计数与眨眼率。纯逻辑，不碰视觉 —— 自检直接喂 EAR 序列就能测。
+
+    一次"眨眼" = EAR 跌破阈值后又回升，且闭合时长 ≤ BLINK_MAX_DUR。
+    更长的闭合不算眨眼（那是眯眼/微睡眠，归 EAR_SUSTAIN 那条管），
+    否则"困得睁不开眼"会被数成"眨眼很频繁"，方向正好反了。
+
+    `frontal` 是"这一帧正对屏幕"。只有正对屏幕时完成的眨眼才计入 ——
+    转头时眼区被压缩、EAR 假性变低，不排除掉的话眨眼率会凭空翻几倍。
+    但**每帧都要喂**（哪怕不正对）：状态机必须跟着走，不然转头期间的
+    闭合会在回来那一帧被当成一次超长闭合，把后面的计数全带歪。
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._open = True
+        self._start = 0.0
+        self._last = -1e9
+        # (时刻, 是否正对屏幕, 这一帧是否完成了一次眨眼)
+        self._win: deque[tuple[float, bool, bool]] = deque()
+
+    def feed(self, now: float, ear: float, thr: float, frontal: bool) -> None:
+        blink = False
+        if ear < thr:
+            if self._open:
+                self._open = False
+                self._start = now
+        elif not self._open:
+            self._open = True
+            if (now - self._start <= BLINK_MAX_DUR and frontal
+                    and now - self._last >= BLINK_MIN_GAP):
+                blink = True
+                self._last = now
+        self._win.append((now, frontal, blink))
+        while self._win and now - self._win[0][0] > BLINK_WINDOW:
+            self._win.popleft()
+
+    def rate(self) -> float:
+        """次/分钟。观察时长不足 BLINK_MIN_OBS 时返回 0.0，含义是"还不知道"。
+
+        分母是**窗口里真正观察到正脸的那些秒**，不是窗口长度。用窗口长度的话，
+        人中途走开五分钟、回来只看了十秒，会被算成"十秒里眨了 0 次"，
+        眨眼率虚低 → 立刻误报"眼睛该休息了"。
+        """
+        obs = sum(1 for _, frontal, _ in self._win if frontal) / float(FACE_FPS)
+        if obs < BLINK_MIN_OBS:
+            return 0.0
+        return sum(1 for _, _, b in self._win if b) * 60.0 / obs
+
+
+class RubTracker:
+    """揉眼计数。**只记录，不参与判定**（原因见常量区那一段）。
+
+    手腕在眼周连续命中 HAND_EYE_HOLD 次才算一次 —— 单帧命中太容易是
+    抬手路过、或者模型抖动。两次计数之间还要隔 RUB_MIN_GAP，免得
+    一次揉眼（手在眼周来回动）被拆成好几次。
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._run = 0
+        self._last = -1e9
+        self._win: deque[float] = deque()
+
+    def feed(self, now: float, hand_eye: bool) -> None:
+        if hand_eye:
+            self._run += 1
+            if self._run >= HAND_EYE_HOLD and now - self._last >= RUB_MIN_GAP:
+                self._last = now
+                self._win.append(now)
+                # 记完必须归零。不归零的话 _run 只增不减，冷却时间一过
+                # 单独一帧就凑够条件 —— "连续命中 N 次"形同虚设，
+                # 而且完全静默：计数看着在涨，没人会觉得它错了。
+                self._run = 0
+        else:
+            self._run = 0
+        while self._win and now - self._win[0] > BLINK_WINDOW:
+            self._win.popleft()
+
+    def count(self) -> int:
+        """最近一个窗口内揉了几次。"""
+        return len(self._win)
+
+
+def eye_break_threshold(blink_rate: float) -> float:
+    """连续用眼多久该提醒休息。
+
+    眨眼率只能让提醒**提前**，不能让它闭嘴 —— 它是弱证据（依赖 EAR 阈值，
+    比"坐了多久"脆弱得多），做成必要条件的话，检测一旦失灵就变成永远不提醒，
+    而静默失效最难发现。和"应用类型只抬高不贬低"是同一条纪律。
+
+    blink_rate == 0 表示样本不足、还不知道，此时按常规阈值处理。
+    """
+    if 0 < blink_rate < BLINK_LOW_RATE:
+        return EYE_BREAK_SOON
+    return EYE_BREAK_AFTER
+
+
+def eye_break_message(eye_run: float, blink_rate: float) -> str:
+    """提醒文案。眨眼率测出来了就把证据摆出来，没测出来就只讲时间。"""
+    mins = max(1, int(eye_run // 60))
+    if blink_rate <= 0:
+        why = f"已经连续盯着屏幕 {mins} 分钟"
+    elif blink_rate < BLINK_LOW_RATE:
+        why = (f"已经连续用眼 {mins} 分钟，"
+               f"这阵子眨眼只有 {blink_rate:.0f} 次/分（正常 15~20）")
+    else:
+        why = f"已经连续用眼 {mins} 分钟，眨眼 {blink_rate:.0f} 次/分"
+    return f"{why}。抬头看看 6 米外的东西 20 秒，让眼睛歇一下。"
+
+
 def should_prompt_rating(engaged_run: float, ratable: bool,
                          since_last: float = 0.0) -> bool:
     """要不要弹评分提醒。
@@ -708,6 +902,11 @@ class Vision:
         self._last_pitch = 0.0
         self.pnp_fail = 0           # solvePnP 失败计数，供诊断
         self.pnp_total = 0
+        # 揉眼检测要用：两眼中点 + 眼距，都归一化到画面。
+        # 必须存下来，因为姿态是 2Hz、人脸是 10Hz —— 揉眼那一次姿态采样
+        # 只能配上"最近一次人脸"的眼睛位置，不能指望同一帧里有脸有手。
+        self._eye_xy: tuple[float, float] | None = None
+        self._eye_span = 0.0
 
     def _ts(self) -> int:
         self._seq += 1
@@ -750,26 +949,63 @@ class Vision:
 
         ear = (ear_from([px(i) for i in L_EYE]) + ear_from([px(i) for i in R_EYE])) / 2.0
         scale = math.dist(px(33), px(263)) / w   # 两眼外角距 / 画面宽 → 离屏幕远近
+        # 两眼中点（归一化）+ 眼距，给 read_posture 判"手是不是在眼周"用。
+        # 存归一化值而不是像素：两个模型拿到的是同一张画面、同一套归一化，
+        # 但 read_posture 只知道自己那帧的 w/h，拿归一化值才能换算回去。
+        x1, y1 = px(33)
+        x2, y2 = px(263)
+        self._eye_xy = ((x1 + x2) / 2.0 / w, (y1 + y2) / 2.0 / h)
+        self._eye_span = scale
         return {"yaw": yaw, "pitch": pitch, "ear": ear, "scale": scale}
 
-    def read_posture(self, frame_bgr: np.ndarray) -> float | None:
-        """返回肩线倾角（度），看不到肩膀返回 None。"""
+    def read_posture(self, frame_bgr: np.ndarray) -> dict | None:
+        """返回 {"tilt": 肩线倾角或 None, "hand_eye": 手是否在眼周}。
+
+        **为什么把 tilt 拆出来允许为 None**：原来是"看不到肩膀就整条返回 None"。
+        但揉眼时手常常正好挡住肩膀 —— 合并返回的话，"手在眼周"这个观测
+        会在最需要它的时刻消失。两者互不依赖，就该分开报。
+
+        **hand_eye 只是"手在脸附近"，不是"在揉眼睛"。** MediaPipe 的 Pose
+        只给 33 个身体点，**没有手指**，只有手腕（15/16）。所以托腮、扶眼镜、
+        挠头、喝水全都会命中。要真分得清得上 HandLandmarker（第三个模型，
+        CPU 明显更高）。因此这个值**只用于计数**，先攒真实数据再定阈值 ——
+        跟当初标定走神阈值是同一个套路。
+        """
         h, w = frame_bgr.shape[:2]
         res = self.pose.detect_for_video(self._img(frame_bgr), self._ts())
         if not res.pose_landmarks:
             return None
         lm = res.pose_landmarks[0]
         ls, rs = lm[11], lm[12]
-        if ls.visibility < 0.5 or rs.visibility < 0.5:
-            return None
-        return shoulder_tilt(ls.x * w, ls.y * h, rs.x * w, rs.y * h)
+        tilt = (shoulder_tilt(ls.x * w, ls.y * h, rs.x * w, rs.y * h)
+                if ls.visibility >= 0.5 and rs.visibility >= 0.5 else None)
+
+        hand_eye = False
+        if self._eye_xy is not None and self._eye_span > 0:
+            for i in (15, 16):                      # 左手腕 / 右手腕
+                wr = lm[i]
+                if hand_near_eye(self._eye_xy, self._eye_span,
+                                 (wr.x, wr.y, wr.visibility), w, h):
+                    hand_eye = True
+                    break
+        return {"tilt": tilt, "hand_eye": hand_eye}
 
 
 # ══════════════════════ 采集线程 ══════════════════════
 
 # 运行时共享状态放模块级而不是 Monitor 实例上：dashboard 可能独立运行
 # （uv run dashboard.py）或作为托盘子进程被 import，不能依赖拿到 Monitor 对象。
-_runtime = {"paused": False, "heartbeat": 0.0}
+_runtime = {"paused": False, "heartbeat": 0.0, "eye": None}
+
+
+def eye_status() -> dict | None:
+    """视疲劳的实时状态，供面板渲染横幅。没采集过返回 None。
+
+    和 is_paused() 一样的取舍：只有"dashboard 与采集在同一进程"时才读得到，
+    独立 `uv run dashboard.py` 时读不到 —— 那就干脆不显示横幅，
+    而不是显示一个永远不更新的旧值。
+    """
+    return _runtime.get("eye")
 
 
 def set_paused(paused: bool) -> None:
@@ -804,10 +1040,44 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples(
     ts REAL, state TEXT, app TEXT, title TEXT,
     yaw REAL, pitch REAL, ear REAL, tilt REAL, scale REAL,
-    present INTEGER, idle REAL
+    present INTEGER, idle REAL,
+    blink REAL, rub INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ts ON samples(ts);
 """
+
+# 落库的列顺序**只写在这一处**。原来 5 个 INSERT 都写的是位置参数
+# `VALUES(?,?,?,…)`，加一列就得同时改 5 处，漏一处是"列数不匹配"报错，
+# 更糟的是改错顺序 —— 那种错不会报，只会静默把值塞进错误的列。
+SAMPLE_COLS = ("ts", "state", "app", "title", "yaw", "pitch", "ear",
+               "tilt", "scale", "present", "idle", "blink", "rub")
+_SAMPLE_INSERT = (f"INSERT INTO samples({','.join(SAMPLE_COLS)}) "
+                  f"VALUES({','.join('?' * len(SAMPLE_COLS))})")
+
+# 后加的列。CREATE TABLE IF NOT EXISTS 对**已存在**的表什么都不做，
+# 所以用户手上那份十几万行的 focus.db 必须靠 ALTER 补列。
+_MIGRATIONS = (
+    ("blink", "REAL"),      # 每分钟眨眼次数；0 = 样本不足，还不知道
+    ("rub", "INTEGER"),     # 最近一分钟揉眼次数（只记录，不参与判定）
+)
+
+
+def ensure_columns(conn: sqlite3.Connection) -> list[str]:
+    """给老的 samples 表补上后加的列，返回这次真正补了哪些。
+
+    没有它的话，升级后第一次落库就炸 —— 而且是运行一段时间才炸
+    （库是旧格式、代码以为有新列），日志里只有一句
+    `table samples has no column named blink`，很难联想到"该迁移了"。
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info(samples)")}
+    if not have:
+        return []              # 表还不存在，executescript(SCHEMA) 会一次建全
+    added = []
+    for name, decl in _MIGRATIONS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE samples ADD COLUMN {name} {decl}")
+            added.append(name)
+    return added
 
 
 def open_camera(preferred: int | None = None) -> cv2.VideoCapture:
@@ -1067,6 +1337,7 @@ class Monitor(threading.Thread):
         self.on_block_end = lambda bs: None  # 一个 30 分钟块结束且值得评时触发
         self.on_progress = lambda msg: None  # 首次下载模型等长任务，给用户一个提示
         self.on_fatal = lambda msg: None     # 启动致命失败：托盘弹气泡 + 打开面板
+        self.on_eye_break = lambda run, blink: None   # 视疲劳提醒（眼睛该歇会儿了）
         self._last_prompted = 0.0
         self._engaged_since: float | None = None   # 当前这段连续投入从何时开始
         self._engaged_run = 0.0
@@ -1096,6 +1367,10 @@ class Monitor(threading.Thread):
 
         conn = open_db()
         conn.executescript(SCHEMA)
+        # 老库要在这里补列，否则第一次落库才炸（见 ensure_columns 的说明）
+        _added = ensure_columns(conn)
+        if _added:
+            log.info("数据库补列：%s", "、".join(_added))
         conn.commit()
 
         self.running = True
@@ -1121,6 +1396,14 @@ class Monitor(threading.Thread):
         # 只留最近 DISTRACT_SWITCH_WINDOW 秒，窗口外的即时丢掉。
         switch_at: deque[float] = deque()
         last_window: tuple[str, str] | None = None
+        # ── 视疲劳（眼睛该歇会儿了）──
+        # 这三个都是纯统计，不参与状态判定（见常量区那一段）。
+        blinks = BlinkTracker()
+        rubs = RubTracker()
+        # 这一轮"连续用眼"从何时开始。只在真的离开过（away 持续够久）才清零，
+        # 否则起身倒杯水回来就重新计时，永远攒不到 40 分钟。
+        eyes_since: float | None = None
+        last_eye_remind = 0.0
 
         try:
             while self.running:
@@ -1222,6 +1505,12 @@ class Monitor(threading.Thread):
                             lean = got["scale"] / base if base > 1e-6 else 1.0
                             closed_since = (None if got["ear"] >= self._ear_thr
                                             else (closed_since or now))
+                            # 眨眼统计。**每一帧都要喂**（哪怕没正对屏幕）：
+                            # 状态机得跟着走，否则转头期间的那次闭合会在回来
+                            # 那一帧被当成一次超长闭合，把后面的计数带歪。
+                            # 是否计入由 tracker 内部按 frontal 决定。
+                            blinks.feed(now, got["ear"], self._ear_thr,
+                                        abs(got["yaw"]) <= YAW_TOL)
                             away_since = None
                             last_face_seen = now
                         else:
@@ -1229,9 +1518,13 @@ class Monitor(threading.Thread):
 
                     if now - last_pose >= 1.0 / POSE_FPS:
                         last_pose = now
-                        tilt = vision.read_posture(proc)
-                        if tilt is not None:
-                            tilt_buf.append(tilt)
+                        pose = vision.read_posture(proc)
+                        if pose is not None:
+                            # tilt 可能是 None（手挡住肩膀），那是正常的：
+                            # 看不到肩膀就沿用上一帧的中位数，别把整个观测丢掉。
+                            if pose["tilt"] is not None:
+                                tilt_buf.append(pose["tilt"])
+                            rubs.feed(now, pose["hand_eye"])
 
                     # 每秒结算一次
                     if now - last_flush >= 1.0:
@@ -1275,6 +1568,29 @@ class Monitor(threading.Thread):
                                     app_kind=kind, away_for=away_for,
                                     switch_rate=switch_rate)
 
+                        # ── 视疲劳：眼睛该歇会儿了 ──
+                        # **不参与 decide()**：状态描述的是"我在干什么"，
+                        # 而"眼睛该休息"是关于生理负荷的建议，混进状态会把
+                        # 投入时长统计污染掉（见常量区那一段）。
+                        if st == "away" and away_for >= EYE_REST_RESET:
+                            # 真的离开过这么久才算休息，用眼计时清零。
+                            # 不这么写的话，起身倒杯水回来就重新计时，
+                            # 40 分钟这条永远攒不满。
+                            eyes_since = None
+                        elif st != "away" and eyes_since is None:
+                            eyes_since = now
+                        eye_run = (now - eyes_since) if eyes_since else 0.0
+                        blink_rate = blinks.rate()
+                        rub_rate = rubs.count()
+                        if (eye_run >= eye_break_threshold(blink_rate)
+                                and now - last_eye_remind >= EYE_REMIND_EVERY):
+                            last_eye_remind = now
+                            self._announce_eye_break(eye_run, blink_rate)
+                        # 面板要读（同一进程时；独立跑 dashboard.py 时读不到，
+                        # 和 is_paused() 一样的取舍，见 _runtime 的注释）。
+                        _runtime["eye"] = {"run": eye_run, "blink": blink_rate,
+                                           "rub": rub_rate, "at": now}
+
                         # 离开期间降频落库。**判断必须在 INSERT 之前** ——
                         # 原来这段写在 commit() 之后，样本早就落库了，continue
                         # 只能跳过状态更新，等于降频从未生效（整夜待机照样每 2 秒
@@ -1290,9 +1606,10 @@ class Monitor(threading.Thread):
                             face_buf.clear()
                         else:
                             conn.execute(
-                                "INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                _SAMPLE_INSERT,
                                 (now, st, exe, title[:200], yaw, pitch, ear, tilt,
-                                 lean, 1 if present else 0, idle_seconds()))
+                                 lean, 1 if present else 0, idle_seconds(),
+                                 blink_rate, rub_rate))
                             n_rows += 1
                             last_away_write = now
                             # 攒批提交：每 SAMPLE_COMMIT_EVERY 条才 commit 一次。
@@ -1390,6 +1707,23 @@ class Monitor(threading.Thread):
             self.on_block_end(prev)
         except Exception:
             log.exception("评分提醒检查失败")
+
+    def _announce_eye_break(self, eye_run: float, blink_rate: float) -> None:
+        """视疲劳提醒。
+
+        和评分提醒不同，这条**不等自然断点** —— 它的全部意义就是打断你
+        （让你抬头看远处）。所以冷却时间（EYE_REMIND_EVERY）是唯一的约束。
+
+        回调抛异常不能连累采集：托盘没了、气泡弹不出来，都不该让采集线程死。
+        这里和 _prompt_rating 一样包一层，而且**失败也要算作已提醒** ——
+        否则通知坏掉之后会变成每转一圈重试一次，日志被刷爆。
+        """
+        msg = eye_break_message(eye_run, blink_rate)
+        log.info("视疲劳提醒：%s", msg)
+        try:
+            self.on_eye_break(eye_run, blink_rate)
+        except Exception:
+            log.exception("视疲劳提醒回调失败")
 
 
 # ══════════════════════ 托盘 ══════════════════════
@@ -1578,6 +1912,20 @@ def run_tray(mon: Monitor) -> None:
             log.exception("托盘通知失败")
 
     mon.on_block_end = on_block_end
+
+    def on_eye_break(eye_run: float, blink_rate: float) -> None:
+        """视疲劳提醒：眼睛该歇会儿了。
+
+        和评分提醒不同，这条**就是要打断你**（让你抬头看远处），
+        所以不等自然断点，只受 EYE_REMIND_EVERY 冷却约束。
+        """
+        try:
+            icon.notify(eye_break_message(eye_run, blink_rate),
+                        "专注监视 · 眼睛该歇会儿了")
+        except Exception:
+            log.exception("视疲劳提醒失败")
+
+    mon.on_eye_break = on_eye_break
 
     def on_progress(msg: str) -> None:
         """首次运行下载模型之类的事，冒个泡，别让程序看起来像没反应。"""
@@ -2288,6 +2636,114 @@ def selftest() -> None:
     assert ear_threshold(light_smp + [0.10] * 300) > t_light * 0.9, \
         "长时间低 EAR 不该把基线整体拉下去"
 
+    # ── 眨眼 / 视疲劳 ──
+    # 这些计数器是纯逻辑，直接喂 EAR 序列就能测，不需要摄像头。
+    # 时间轴按 FACE_FPS=10 走，一帧 = 0.1 秒。
+    _thr = 0.21
+    _bt = BlinkTracker()
+    _t = 0.0
+    for _i in range(300):                       # 30 秒 = BLINK_MIN_OBS，刚够出数
+        _bt.feed(_t, 0.10 if _i % 50 == 0 else 0.30, _thr, True)   # 每 5 秒眨一次
+        _t += 0.1
+    _r = _bt.rate()
+    assert abs(_r - 12.0) < 0.5, (
+        f"眨眼率算成 {_r:.1f}，应该是 12（30 秒里眨了 6 次）。分母必须是"
+        "**窗口里真正观察到正脸的秒数**，不是窗口长度 60 秒 —— 用窗口长度的话，"
+        "人走开一阵再回来只看了十秒，会被算成「十秒里眨了 0 次」，眨眼率虚低，"
+        "立刻误报「眼睛该休息了」")
+
+    # 长闭合不算眨眼：那是眯眼/微睡眠，归 EAR_SUSTAIN 那条管。
+    # 不排除的话"困得睁不开眼"会被数成"眨眼很频繁"，方向正好反了。
+    _bt2 = BlinkTracker()
+    _t = 0.0
+    for _i in range(300):
+        _bt2.feed(_t, 0.10 if (_i % 50) < 10 else 0.30, _thr, True)  # 1 秒的长闭合
+        _t += 0.1
+    assert not any(b for _, _, b in _bt2._win), (
+        "1 秒的长闭合被算成眨眼了 —— 那是眯眼/微睡眠。算成眨眼会让"
+        "「越困眨眼越多」，方向和事实正好相反")
+
+    # 非正对屏幕时完成的眨眼不计入：转头时眼区被压缩、EAR 假性变低。
+    # 实测他库里 71544 条有脸样本中 ear 低于 0.19 的占 14.6%，
+    # 远多于眨眼能解释的量 —— 不排除掉，眨眼率会凭空翻几倍。
+    _bt3 = BlinkTracker()
+    _t = 0.0
+    for _i in range(300):
+        _bt3.feed(_t, 0.10 if _i % 50 == 0 else 0.30, _thr, False)
+        _t += 0.1
+    assert not any(b for _, _, b in _bt3._win), \
+        "转头期间的假性低 EAR 被算成眨眼了"
+
+    # 观察时长不够时返回 0，含义是"还不知道"（不是"没眨眼"）
+    _bt4 = BlinkTracker()
+    for _i in range(10):                        # 只有 1 秒
+        _bt4.feed(_i * 0.1, 0.30, _thr, True)
+    assert _bt4.rate() == 0.0, "观察不足 BLINK_MIN_OBS 时不该给出一个具体的率"
+
+    # 去抖：两次眨眼挨得比 BLINK_MIN_GAP 还近时只记一次
+    _bt5 = BlinkTracker()
+    for _ts, _ear in ((0.0, 0.30), (0.1, 0.10), (0.2, 0.30),
+                      (0.3, 0.10), (0.4, 0.30),      # 距上次只 0.2 秒 → 不计
+                      (0.5, 0.10), (0.9, 0.30)):     # 距上次 0.7 秒 → 计
+        _bt5.feed(_ts, _ear, _thr, True)
+    _n5 = sum(1 for _, _, b in _bt5._win if b)
+    assert _n5 == 2, f"挨得比 BLINK_MIN_GAP 还近的两次眨眼被数成了 {_n5} 次"
+
+    # 「手在眼周」的几何换算。三处最容易写错，而且写错了不会报错，
+    # 只会**一直判 False**（揉眼次数永远是 0，看着像"你从不揉眼"）。
+    _eye = (0.5, 0.4)
+    assert hand_near_eye(_eye, 0.2, (0.5, 0.4, 1.0), 480, 270), "手就在眼睛上"
+    # 这一条专门钉各向异性：归一化坐标 y 除以高、x 除以宽，不乘回像素的话
+    # 竖直方向会被高估（h/w = 0.5625），这个位置会被误判成"手不在眼周"。
+    assert hand_near_eye(_eye, 0.2, (0.5, 0.6, 1.0), 480, 270), (
+        "同样的归一化距离，竖直方向没乘回像素 —— 画面越扁判得越歪")
+    assert not hand_near_eye(_eye, 0.2, (0.5, 0.8, 1.0), 480, 270), "太远了"
+    assert not hand_near_eye(_eye, 0.2, (0.5, 0.4, 0.3), 480, 270), \
+        "visibility 太低的手腕是模型在瞎猜，必须丢掉"
+    assert not hand_near_eye(None, 0.2, (0.5, 0.4, 1.0), 480, 270), \
+        "还没有眼睛位置时不该判出手在眼周"
+    # 半径必须跟着眼距缩放：同一个手腕位置，人往后一靠（脸变小）就不该再命中，
+    # 否则"离屏幕远"会被判成"一直在揉眼"。
+    assert hand_near_eye(_eye, 0.2, (0.5, 0.6, 1.0), 480, 270) is True
+    assert not hand_near_eye(_eye, 0.1, (0.5, 0.6, 1.0), 480, 270), \
+        "眼距缩小一半后半径没跟着缩 —— 离屏幕远会被判成一直在揉眼"
+
+    # 揉眼：连续命中 HAND_EYE_HOLD 次才算一次，断了要重新数
+    _rt = RubTracker()
+    for _i in range(HAND_EYE_HOLD):
+        _rt.feed(_i * 0.5, True)                    # 连续命中 → 记 1 次
+    assert _rt.count() == 1, "连续命中 HAND_EYE_HOLD 次应该记一次揉眼"
+
+    # 记完必须重新数：冷却过了之后，**单独一帧**不该立刻又记一次。
+    # 不归零的话 _run 只增不减，冷却一过随便来一帧就凑够条件，
+    # "连续命中 N 次"这个条件形同虚设 —— 而且完全静默，计数看着是涨的。
+    _rt.feed(10.0, True)
+    _rt.feed(10.0 + RUB_MIN_GAP, True)
+    assert _rt.count() == 1, (
+        "冷却一过，单独一帧就把揉眼数记上去了 —— 计数后 _run 没归零，"
+        "「连续命中 N 次」形同虚设")
+
+    # 真的又揉一次（连续命中 + 过了冷却）才该记第 2 次
+    for _i in range(HAND_EYE_HOLD):
+        _rt.feed(45.0 + _i * 0.5, True)
+    assert _rt.count() == 2, "过了冷却又连续命中，应该记第 2 次"
+
+    # 眨眼率只能让提醒**提前**，不能让它闭嘴
+    assert eye_break_threshold(0.0) == EYE_BREAK_AFTER, "没测出来时按常规阈值"
+    assert eye_break_threshold(18.0) == EYE_BREAK_AFTER, "眨眼正常时按常规阈值"
+    assert eye_break_threshold(5.0) == EYE_BREAK_SOON, "眨眼率偏低应该提前提醒"
+    for _rate in (0.0, 1.0, 5.0, 7.9, 8.0, 20.0, 60.0):
+        assert eye_break_threshold(_rate) <= EYE_BREAK_AFTER, (
+            f"眨眼率 {_rate} 把提醒**推后**了 —— 它是弱证据（依赖 EAR 阈值，"
+            "比「坐了多久」脆弱得多），做成必要条件的话检测一失灵就永远不提醒")
+
+    # 文案：测出来了就把数字摆出来，没测出来就别编一个
+    _m = eye_break_message(45 * 60, 5.0)
+    assert "45" in _m and "5" in _m, _m
+    _m0 = eye_break_message(45 * 60, 0.0)
+    assert "45" in _m0 and "次/分" not in _m0, \
+        f"没测出眨眼率时文案里不该出现次数：{_m0!r}"
+
     # 应用分类
     assert classify_app("code.exe", "focus.py - Visual Studio Code") == "work"
     assert classify_app("chrome.exe", "【4K】哔哩哔哩 直播") == "distract"
@@ -2425,7 +2881,10 @@ def selftest() -> None:
             f"{sorted(_rendered_txt - set(_LIST_KEYS))}")
         assert not (set(_SCALARS) - _rendered), (
             f"配置里有这些标量，但设置页改不到：{sorted(set(_SCALARS) - _rendered)}"
-            " —— 用户只能手改 config.json")
+            " —— 不只是「用户只能手改 config.json」这么轻：_parse_form 会遍历"
+            "_SCALARS 从表单取值，界面上没有输入框就取到空串，"
+            "float('') 抛异常 → **整个设置页保存永远失败**，"
+            "报的还是「XXX 不是有效数字：''」这种看不懂的错")
         assert not (set(_LIST_KEYS) - _rendered_txt), (
             f"配置里有这些列表，但设置页改不到："
             f"{sorted(set(_LIST_KEYS) - _rendered_txt)}")
@@ -2537,6 +2996,13 @@ def selftest() -> None:
     assert validate_config({**snapshot, "EAR_CLOSED": 1.5})
     assert validate_config({**snapshot, "FACE_FPS": 0})
     assert validate_config({**snapshot, "AWAY_FACE": 999.0})   # 比键鼠空闲还大
+    # 视疲劳：提前提醒那一档大于常规档时，眨眼这条判据会**静默失效**
+    # （永远取不到它），所以必须报错，而不是默默按常规档走。
+    assert any("提前" in e for e in validate_config(
+        {**snapshot, "EYE_BREAK_SOON": snapshot["EYE_BREAK_AFTER"] + 1})), \
+        "「提前提醒的用眼时长」大于常规时长时必须报错"
+    assert validate_config({**snapshot, "EYE_BREAK_SOON": 0.0}), \
+        "提前档必须为正数（0 会让它在每一次结算都命中）"
 
     # DESKWORK_IS_ENGAGED 只决定"算不算投入"，不改变状态判定本身
     assert decide(**{**base, "pitch": 45.0}) == "deskwork"
@@ -2639,6 +3105,43 @@ def selftest() -> None:
     _st_td = tempfile.TemporaryDirectory()
     _st_tmp = Path(_st_td.name)
 
+    # ── 落库的列名表与建表语句必须一致 ──
+    # 这两处分开写，改一处忘另一处不会报错，只会把值塞进错误的列
+    # （位置参数时代就是这个毛病，实测踩过）。所以钉死它们同源。
+    _schema_cols = re.findall(
+        r"(\w+)\s+(?:REAL|TEXT|INTEGER)",
+        SCHEMA[SCHEMA.index("CREATE TABLE"):SCHEMA.index(");")])
+    assert tuple(_schema_cols) == SAMPLE_COLS, (
+        f"建表语句的列 {_schema_cols} 和落库用的列 {list(SAMPLE_COLS)} 不一致 —— "
+        "插入会静默错位或直接报列数不匹配")
+
+    # ── 老库要能原地补列 ──
+    # SCHEMA 用的是 CREATE TABLE IF NOT EXISTS，对已存在的表**什么都不做**，
+    # 所以用户手上那份十几万行的 focus.db 只能靠 ALTER 补。没有这一步的话，
+    # 升级后要等采集线程第一次落库才炸，报的还是
+    # 「table samples has no column named blink」——很难联想到"该迁移了"。
+    _mig_db = _st_tmp / "old.db"
+    _mc = sqlite3.connect(_mig_db)
+    try:
+        _mc.execute("CREATE TABLE samples("
+                    "ts REAL, state TEXT, app TEXT, title TEXT,"
+                    "yaw REAL, pitch REAL, ear REAL, tilt REAL, scale REAL,"
+                    "present INTEGER, idle REAL)")     # 故意用旧版 11 列
+        _mc.execute("INSERT INTO samples VALUES(1.0,'focused','a.exe','t',"
+                    "0,0,0.3,0,1,1,0)")
+        _mc.commit()
+        assert ensure_columns(_mc) == ["blink", "rub"], "老表没补上后加的列"
+        assert ensure_columns(_mc) == [], "补列必须幂等 —— 每次启动都会调一遍"
+        _mc.execute(_SAMPLE_INSERT,
+                    (2.0, "focused", "a.exe", "t", 0, 0, 0.3, 0, 1, 1, 0, 9.5, 3))
+        _mc.commit()
+        assert _mc.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 2, \
+            "补列把老数据弄丢了"
+        assert _mc.execute(
+            "SELECT blink, rub FROM samples WHERE ts=2.0").fetchone() == (9.5, 3)
+    finally:
+        _mc.close()
+
     # ── report.load() 必须跟着 focus.DB_PATH 走 ──
     # 这是"多库对照"的唯一开关：ratings 一直是动态读的，report 原来读的是
     # `from focus import DB_PATH` 在 import 那一刻的副本，改了 focus.DB_PATH
@@ -2651,9 +3154,9 @@ def selftest() -> None:
         _sconn = open_db(_seam_db)
         try:
             _sconn.executescript(SCHEMA)
-            _sconn.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            _sconn.execute(_SAMPLE_INSERT,
                            (1.0, "focused", "code.exe", "t", 0.0, 0.0, 0.3,
-                            1.0, 1.0, 1, 0.0))
+                            1.0, 1.0, 1, 0.0, 0.0, 0))
             _sconn.commit()
         finally:
             _sconn.close()
@@ -2686,9 +3189,9 @@ def selftest() -> None:
                 _pc.executescript(SCHEMA)
                 _now = time.time()
                 _pc.executemany(
-                    "INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    _SAMPLE_INSERT,
                     [(_now - 60 + i, "focused", "code.exe", "t",
-                      0.0, 0.0, 0.30, 1.0, 1.0, 1, 0.0)
+                      0.0, 0.0, 0.30, 1.0, 1.0, 1, 0.0, 0.0, 0)
                      for i in range(5)])
                 _pc.commit()
             finally:
@@ -2742,13 +3245,13 @@ def selftest() -> None:
         conn.execute("DELETE FROM samples")
         # 3 条 400 天前的旧样本 + 2 条刚采的
         for i in range(3):
-            conn.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            conn.execute(_SAMPLE_INSERT,
                          (now - 400 * 86400 + i, "focused", "code.exe", "t",
-                          0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0))
+                          0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0, 0.0, 0))
         for i in range(2):
-            conn.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            conn.execute(_SAMPLE_INSERT,
                          (now - i, "focused", "code.exe", "t",
-                          0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0))
+                          0.0, 0.0, 0.3, 1.0, 1.0, 1, 0.0, 0.0, 0))
         conn.commit()
         conn.close()
         assert _count(tmp_db) == 5
@@ -3705,13 +4208,17 @@ def selftest() -> None:
         _loop_src = _src[:_src.index("def selftest")]
         for _needle in (
             "vision.read_face(proc)", "vision.read_posture(proc)",
-            "face_buf.append(got)", "tilt_buf.append(tilt)",
+            "face_buf.append(got)", 'tilt_buf.append(pose["tilt"])',
             'scale_hist.append(got["scale"])', 'self._ear_hist.append(got["ear"])',
             'closed_since = (None if got["ear"] >= self._ear_thr',
             # 丢脸超时作废闭眼计时。少了这一条不会报错，只会让人"闭眼 2 秒、
             # 转头出画 3 秒、回来还闭着眼"时一回来就被记一条「疲劳」。
             "now - last_face_seen > FACE_LOSS_GRACE",
             "last_face_seen = now",
+            # 眨眼统计的喂数据也必须在这里。掉了不会报错：眨眼率恒为 0，
+            # 而那被解释成"还不知道"，于是**永远不提醒**，静默失效。
+            "blinks.feed(now, got[\"ear\"], self._ear_thr",
+            "rubs.feed(now, pose[\"hand_eye\"])",
         ):
             assert _needle in _loop_src, \
                 f"采集循环的视觉链路断了：找不到 {_needle!r}" \

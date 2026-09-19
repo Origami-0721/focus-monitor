@@ -445,6 +445,95 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "            continue\n",
         "dashboard.py",
     ),
+    (
+        "眨眼率的分母改成窗口长度（人走开再回来会算成「十秒里眨了 0 次」）",
+        # 分母必须是"窗口里真正观察到正脸的秒数"。用窗口长度的话，眨眼率
+        # 在缺观察时会虚低 → 立刻误报「眼睛该休息了」。
+        "        obs = sum(1 for _, frontal, _ in self._win"
+        " if frontal) / float(FACE_FPS)\n",
+        "        obs = BLINK_WINDOW\n",
+        "focus.py",
+    ),
+    (
+        "眨眼不再要求正对屏幕（转头时眼区被压缩、EAR 假性变低）",
+        # 实测他库里 71544 条有脸样本中 ear 低于 0.19 的占 14.6%，
+        # 远多于眨眼能解释的量 —— 不排除掉，眨眼率会凭空翻几倍。
+        "            if (now - self._start <= BLINK_MAX_DUR and frontal\n",
+        "            if (now - self._start <= BLINK_MAX_DUR\n",
+        "focus.py",
+    ),
+    (
+        "长闭合也算眨眼（「困得睁不开眼」被数成「眨眼很频繁」，方向反了）",
+        # 长闭合是眯眼/微睡眠，归 EAR_SUSTAIN 那条管。
+        "            if (now - self._start <= BLINK_MAX_DUR and frontal\n",
+        "            if (now - self._start >= 0 and frontal\n",
+        "focus.py",
+    ),
+    (
+        "揉眼计数后不归零（冷却一过，单独一帧就凑够条件，判据形同虚设）",
+        # _run 只增不减的话，冷却时间一过随便来一帧就满足"连续命中 N 次"。
+        "                self._win.append(now)\n"
+        "                # 记完必须归零。不归零的话 _run 只增不减，冷却时间一过\n"
+        '                # 单独一帧就凑够条件 —— "连续命中 N 次"形同虚设，\n'
+        "                # 而且完全静默：计数看着在涨，没人会觉得它错了。\n"
+        "                self._run = 0\n",
+        "                self._win.append(now)\n",
+        "focus.py",
+    ),
+    (
+        "眨眼率偏低反而把提醒推后（弱证据被当成必要条件）",
+        # 眨眼检测依赖 EAR 阈值，比"坐了多久"脆弱得多。做成必要条件的话，
+        # 检测一失灵就变成永远不提醒 —— 静默失效最难发现。
+        "    if 0 < blink_rate < BLINK_LOW_RATE:\n"
+        "        return EYE_BREAK_SOON\n"
+        "    return EYE_BREAK_AFTER\n",
+        "    if 0 < blink_rate < BLINK_LOW_RATE:\n"
+        "        return EYE_BREAK_AFTER\n"
+        "    return EYE_BREAK_SOON\n",
+        "focus.py",
+    ),
+    (
+        "ensure_columns 不补列（老库升级后第一次落库才炸，很难联想到迁移）",
+        "    for name, decl in _MIGRATIONS:\n        if name not in have:\n",
+        "    for name, decl in _MIGRATIONS:\n        if False:\n",
+        "focus.py",
+    ),
+    (
+        "落库列名表和建表语句不一致（位置参数时代的老毛病，会静默错位）",
+        'SAMPLE_COLS = ("ts", "state", "app", "title", "yaw", "pitch", "ear",\n'
+        '               "tilt", "scale", "present", "idle", "blink", "rub")\n',
+        'SAMPLE_COLS = ("ts", "state", "app", "title", "yaw", "pitch", "ear",\n'
+        '               "tilt", "scale", "present", "blink", "idle", "rub")\n',
+        "focus.py",
+    ),
+    (
+        "采集循环不再喂眨眼（眨眼率恒为 0，被当成「还不知道」→ 永远不提醒）",
+        '                            blinks.feed(now, got["ear"], self._ear_thr,\n'
+        '                                        abs(got["yaw"]) <= YAW_TOL)\n',
+        "                            pass\n",
+        "focus.py",
+    ),
+    (
+        "采集循环不再喂揉眼（揉眼次数恒为 0，看着像「你从不揉眼」）",
+        '                            rubs.feed(now, pose["hand_eye"])\n',
+        "                            pass\n",
+        "focus.py",
+    ),
+    (
+        "手在眼周：不检查 visibility（低置信度的手腕是模型在瞎猜）",
+        "    if vis < 0.5:\n        return False\n",
+        "    if False:\n        return False\n",
+        "focus.py",
+    ),
+    (
+        "手在眼周：归一化距离不乘回像素（画面越扁判得越歪）",
+        # 归一化坐标 x 除以宽、y 除以高，直接比距离等于把竖直方向放大了 h/w。
+        "    return math.hypot((wx - ex) * w, (wy - ey) * h)"
+        " < HAND_EYE_RADIUS * eye_span * w\n",
+        "    return math.hypot(wx - ex, wy - ey)"
+        " < HAND_EYE_RADIUS * eye_span\n",
+        "focus.py",
+    ),
 ]
 
 

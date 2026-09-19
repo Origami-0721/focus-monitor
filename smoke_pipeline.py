@@ -81,7 +81,7 @@ class _FakeVision:
 
     def read_posture(self, frame):
         _FakeVision.pose_calls += 1
-        return 3.0
+        return {"tilt": 3.0, "hand_eye": False}
 
 
 # ────────────────────── 场景②：脚本化时间线 ──────────────────────
@@ -135,7 +135,7 @@ class _ScriptedVision:
         return {"yaw": 0.0, "pitch": 5.0, "ear": ear, "scale": 1.0}
 
     def read_posture(self, frame):
-        return 3.0
+        return {"tilt": 3.0, "hand_eye": False}
 
 
 # ────────────────────── 场景③：暂停 → 恢复 ──────────────────────
@@ -175,7 +175,7 @@ class _ClosedAfterPauseVision:
         return {"yaw": 0.0, "pitch": 5.0, "ear": ear, "scale": 1.0}
 
     def read_posture(self, frame):
-        return 3.0
+        return {"tilt": 3.0, "hand_eye": False}
 
 
 def _resume(mon) -> None:
