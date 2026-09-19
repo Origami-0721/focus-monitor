@@ -104,6 +104,14 @@ def run_scenario4(tree: Path) -> tuple[int, str]:
 
 
 def main() -> int:
+    # 复用 focus 自己的控制台兜底。CI 把 PYTHONIOENCODING 钉在 cp1252 上，
+    # 这个脚本要打中文 —— 不加这一步，它会**崩在最后一行**（前面的"抓住了"
+    # 全都打出来了，光看日志根本猜不到是编码问题），而且只把这一条 CI 步骤
+    # 判红，看起来像"场景④ 的断言出问题了"，其实是它自己先炸了。
+    sys.path.insert(0, str(ROOT))
+    import focus
+    focus.use_safe_console()
+
     tmp = Path(tempfile.mkdtemp(prefix="smoke-mutcheck-"))
     tree = copy_project(tmp / "fm")
     pristine = (tree / "focus.py").read_text(encoding="utf-8")
