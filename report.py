@@ -75,6 +75,29 @@ def _band(ts: float, gran: str = GRAN_COARSE) -> str:
     return table[0][0]
 
 
+def _band_labels(gran: str) -> dict[str, str]:
+    """时段**键** → 给人看的**时段名**。
+
+    **键和标签必须分开。** 键带 `3h` / `1h` 前缀是为了避免不同分档之间串味
+    （见 `_bands` 的说明），但那个前缀一旦直接印进表格，`3h12` 读起来就是
+    "3 小时 12 分" —— 用户会以为那一列显示的是时长。
+
+    实测就是这么发生的：截图里七行 `3h00 / 3h06 / 3h09 / 3h12 / 3h15 /
+    3h18 / 3h21`，正好是 3 小时档的八个桶（缺 `3h03` = 03:00–06:00，那段
+    **一条样本都没有** —— 不是"被 10 分钟门槛排除"：没有数据的桶压根不进
+    `band_active`，也就不会出现在"（已排除：…）"那句里），而他的第一反应是
+    「时段显示是不是出问题了」—— 这个反应是对的，那一列当时确实读不出
+    "几点到几点"。
+
+    粗档的键（凌晨/上午/下午/晚上）本身就是人话，原样返回。
+    """
+    if gran == GRAN_COARSE:
+        return {key: key for key, _start in _bands(gran)}
+    span = 3 if gran == GRAN_3H else 1
+    return {key: f"{start:02d}–{start + span:02d} 点"
+            for key, start in _bands(gran)}
+
+
 def pick_granularity(item_hours: dict[int, set[str]]) -> str:
     """按样本量挑最细的可用档位。
 
@@ -798,6 +821,7 @@ def build_html(rows: list[tuple], nav_html: str = "",
               if band_active[b] >= MIN_HOUR_DATA]
     ranked.sort(key=lambda kv: -band_engaged[kv[0]] / kv[1])
     skipped = [b for b in band_active if band_active[b] < MIN_HOUR_DATA]
+    band_label = _band_labels(gran)
     band_rows = []
     for i, (b, _) in enumerate(ranked):
         entries = band_entry.get(b, [])
@@ -811,7 +835,7 @@ def build_html(rows: list[tuple], nav_html: str = "",
                     if len(flows) >= MIN_BAND_SESSIONS
                     else f'<span class="muted">样本不足（{len(flows)}）</span>')
         band_rows.append(
-            f'<tr{cls}><td>{b}</td>'
+            f'<tr{cls}><td>{band_label[b]}</td>'
             f'<td class="num">{_dur(band_active[b])}</td>'
             f'<td>{_rate_cell(band_engaged[b] / band_active[b] * 100)}</td>'
             f'<td class="num">{band_sessions.get(b, 0)}</td>'
@@ -959,7 +983,10 @@ def build_html(rows: list[tuple], nav_html: str = "",
         # 样本太薄时投入占比本身也不稳（几个样本就能凑出 100%），
         # 所以只给它加分档提示，不吹成"最佳"。
         thin = band_active[b0] < 2 * MIN_HOUR_DATA
-        hero_k = ("最佳时段 · " if not thin else "投入占比最高 · ") + b0
+        # 卡片标题也是**印给人看的**，同样不能裸印那个带前缀的键 ——
+        # 表格那一列修好之后，「最佳时段 · 3h12」会变成同一页里唯一的
+        # 乱码（读起来还像"3 小时 12 分"）。同一个 bug 的两个出口，一起修。
+        hero_k = ("最佳时段 · " if not thin else "投入占比最高 · ") + band_label[b0]
         hero_v = f"投入占比 {rate0:.0f}%"
         hero_v_css = ("color:#22c55e;font-size:23px" if not thin
                       else "color:#38bdf8;font-size:22px")
@@ -1099,7 +1126,7 @@ def build_html(rows: list[tuple], nav_html: str = "",
 <p class="note">
 <b>排名依据是「有效投入占比」</b>（绿色那行 = 占比最高），不是「进入心流耗时」——
 后者受单次异常影响太大。{gran_note} 活跃不足 {_dur(MIN_HOUR_DATA)} 的时段不参与排名
-{f"（已排除：{', '.join(skipped)}）" if skipped else ""} —— 拿几秒样本编出"100% 专注"的假排名没有意义。<br>
+{f"（已排除：{', '.join(sorted(band_label[b] for b in skipped))}）" if skipped else ""} —— 拿几秒样本编出"100% 专注"的假排名没有意义。<br>
 「平均进入心流耗时」= 从坐下到第一段心流之间的间隔，<b>按"坐下"的时刻归属</b>；
 「平均心流时长」= 心流片段本身持续多久。<br>
 心流 = 连续投入 ≥{_dur(FLOW_MIN)}，<b>且其中「专注」（工作应用）占比 ≥{FLOW_FOCUS_RATIO:.0%}</b> ——

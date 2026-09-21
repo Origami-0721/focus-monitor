@@ -3229,6 +3229,66 @@ def selftest() -> None:
                       (18, "晚上"), (23, "晚上")):
         assert report._band(_at(_h)) == _want, f"{_h} 点应属{_want}"
 
+    # ── 时段那一列必须印**人话**，不能印内部的键 ──
+    #
+    # 键带 `3h` / `1h` 前缀是为了避免不同分档之间串味（见 report._bands 的
+    # 说明），可那个前缀一旦直接印给用户，`3h12` 读起来就是"3 小时 12 分" ——
+    # 他会以为那一列显示的是时长。实测就是这么被问的：「时段显示是不是出
+    # 问题了」，截图里正是 3h00/3h06/3h09/3h12/3h15/3h18/3h21 七行。
+    # 用 .get() 而不是 []：键名改了要报"标签不对"，不能变成一个 KeyError
+    # （变异闸门里非 AssertionError 算"没证明任何东西"，会打 ??）。
+    for _g, _k, _want in ((report.GRAN_3H, "3h12", "12–15 点"),
+                          (report.GRAN_HOUR, "1h03", "03–04 点"),
+                          (report.GRAN_COARSE, "上午", "上午")):
+        _got = report._band_labels(_g).get(_k)
+        assert _got == _want, (
+            f"{_g} 档的「{_k}」标签该是「{_want}」，实际是「{_got}」"
+            " —— 时段那列在印内部键（3h12 读起来像「3 小时 12 分」）")
+
+    # 光测那个函数证明不了**接线**通不通 —— 真正坏掉的是表格直接印了键。
+    # 造一份能把分档逼到 3 小时档的数据：同一个 3 小时桶里跨 3 天，但其中某个
+    # **小时**桶只有 1 天（`pick_granularity` 要求一档里**每个**有数据的桶都
+    # 至少 MIN_BAND_SESSIONS 天，于是小时档被否掉，退到 3 小时档）。
+    # 每块 60 条 × 10 秒，但 report.MAX_GAP=5.0 会把间隔砍到 5 秒
+    # → 每块算 300 秒，四块 1196 秒（卡在 2×MIN_HOUR_DATA=1200 之下，
+    # 所以卡片走的是"投入占比最高"那一支，不是"最佳时段"）。
+    _bd = time.mktime((2026, 3, 1, 9, 0, 0, 0, 0, -1))
+    _bday = 86400.0
+    _band_rows = (_mk(_bd, 60, "focused", 10.0)
+                  + _mk(_bd + _bday, 60, "focused", 10.0)
+                  + _mk(_bd + 2 * _bday, 60, "focused", 10.0)
+                  + _mk(_bd + 2 * _bday + 7200, 60, "focused", 10.0))
+    # 先确认这份数据真的落在 3 小时档。不然下面那条断言会以"标签不对"的面目
+    # 失败，而真正的原因是分档门槛或造数参数变了 —— 排查方向直接跑偏。
+    _ih: dict[int, set[str]] = {}
+    for _r in _band_rows:
+        _lt = time.localtime(_r[0])
+        _ih.setdefault(_lt.tm_hour, set()).add(time.strftime("%Y-%m-%d", _lt))
+    _bgr = report.pick_granularity(_ih)
+    assert _bgr == report.GRAN_3H, (
+        f"这份构造数据本该落在 3 小时档，实际是 {_bgr} —— "
+        "分档门槛（MIN_BAND_SESSIONS）或 _mk 的造数参数变了，"
+        "不是标签函数坏了")
+    _bh = report.build_html(_band_rows)
+    # 标题和表格都是**无条件**渲染的（模板里写死的），所以"报告里有黄金时段
+    # 这一节"恒为真 —— 那种断言是摆设，比没有更糟（会让人以为这块被覆盖了）。
+    # 这里直接把表格那一段切出来看**内容**，切不出来就让它 IndexError：
+    # 变异闸门会打 ??（"判不了"），比伪装成通过强。
+    _band_tbl = _bh.split("<h2>黄金时段</h2>", 1)[1].split("</table>", 1)[0]
+    assert "09–12 点" in _band_tbl, (
+        "黄金时段那一列没印成人话（该是「09–12 点」）—— 表格还在直接印时段键，"
+        "用户看到的是 3h09 这种读起来像「3 小时 9 分」的东西")
+
+    # 表格修好了卡片未必 —— 同一个 bug 有**两个出口**（实测：修完表格之后
+    # 「投入占比最高 · 3h12」成了同一页里唯一的乱码）。所以这里不逐处点名，
+    # 直接扫**整份报告**：带前缀的时段键一个都不许出现在给用户看的页面里。
+    # 这样新加出口也拦得住（只断言表格那一处就是打地鼠）。
+    _raw_keys = sorted(set(re.findall(r"\b[13]h\d{2}\b", _bh)))
+    assert not _raw_keys, (
+        f"报告里还有裸的时段键 {_raw_keys} —— 又有一处把内部键直接印给用户了"
+        "（`3h12` 读起来是「3 小时 12 分」）。这次漏的是「最佳时段」那张卡片："
+        "表格走的是 band_label，卡片拼的还是 b0。")
+
     def _sess(*blocks):
         return report._sessions(report._timed([r for b in blocks for r in _mk(*b)]))
 
