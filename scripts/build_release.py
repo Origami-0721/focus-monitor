@@ -104,14 +104,35 @@ def build() -> None:
         "--add-data", f"{ROOT / 'icons'};icons",
         # mediapipe 官方没有 hook, collect-all 补足 (剔除前先打过补丁)
         "--collect-all", "mediapipe",
-        # pywebview 同理: 它要靠包内的 js/ 资源把 Python 侧的桥接注入页面,
-        # 那些 .js 不是 import 进来的, 光靠静态分析收不到 —— 漏了的话
-        # 窗口能创建但页面里的 pywebview.api 是空的, 表现为"窗口一片空白"。
-        # pywebview 是主依赖(pyproject dependencies), 一定装得到, 不会因此报错。
-        # 注意: 这解决的是"窗口内容不对"; 窗口**根本打不开**(漏了 webview 模块
-        # 本身)是另一回事 —— 那条路径的兜底在 focus.wait_and_open() 里,
-        # 它会退到系统浏览器并把原因写进 focus.log。
-        "--collect-all", "pywebview",
+        # pywebview 的 js 桥接 + WebView2 的 DLL 必须显式收进来。
+        #
+        # **包名是 `webview`，不是 `pywebview`。** `pywebview` 是发行包名
+        # （PyPI 上那个、`pyproject.toml` 里写那个），导入名才叫 `webview`
+        # —— 磁盘上就是 `site-packages/webview/`。
+        #
+        # 这里原来写的是 `--collect-all pywebview`：PyInstaller 找不到那个模块，
+        # 只在构建输出里打一行
+        #     WARNING: collect_data_files - skipping data collection for module
+        #              'pywebview' as it is not a package.
+        # 然后**什么都不收**（实测 `collect_all('pywebview')` → datas=0、
+        # binaries=0、hidden=0），而构建照样"成功"。也就是说这道防线
+        # 从来没生效过，而它的注释还写着"漏了会表现为窗口一片空白"。
+        #
+        # 当时为什么没出事：pywebview **自带**一个 hook
+        # （`webview/__pyinstaller/hook-webview.py`，靠 dist-info 里的
+        # `[pyinstaller40] hook-dirs` 入口点被发现），它收的正好是
+        # `webview/js` 和 `webview/lib` —— 一直是**另一个机制**在顶。
+        # 不能靠它：入口点没被注册（包是被拷进来的时候）就静默失效，
+        # 症状是"窗口能创建、页面里 `pywebview.api` 是空的"= 面板一片空白，
+        # 而且没有任何报错。
+        #
+        # 用 `--collect-data` 而不是 `--collect-all`：要的只是**数据文件**
+        # （js + lib 里那几个 DLL）。平台模块靠静态分析就收得到 ——
+        # `webview/guilib.py` 里那些 `import webview.platforms.xxx` 虽然写在
+        # 嵌套函数里，但都是**静态** import，字节码分析扫得到；
+        # 而 `--collect-all` 会把 cocoa/gtk/qt/cef/android 一起塞成
+        # hiddenimports，白拉一堆根本没装的平台（构建时刷一屏 WARNING）。
+        "--collect-data", "webview",
         # matplotlib 全家: 无人使用, 纯打包负担 (mediapipe 绘图工具只会在被调用时才需要)
         "--exclude-module", "matplotlib",
         "--exclude-module", "mpl_toolkits",
@@ -130,6 +151,57 @@ def build() -> None:
 
 def clean_dist() -> None:
     shutil.rmtree(APP, ignore_errors=True)
+
+
+# 构建产物里**必须**存在这些文件。按文件名找（`rglob`），不写路径 ——
+# PyInstaller 6.x 把数据文件放在 `_internal/` 下，以后还可能再变，
+# 钉死路径的断言会在升级时莫名其妙地红。
+_MUST_BE_BUNDLED = (
+    # pywebview 的 js 桥接：页面里的 window.pywebview.api 靠它注入。
+    # 缺了 = 面板能开但一片空白。
+    "api.js", "customize.js", "finish.js", "state.js",
+    # WebView2 的 .NET 封装（edgechromium 后端）
+    "Microsoft.Web.WebView2.Core.dll",
+    "Microsoft.Web.WebView2.WinForms.dll",
+    # pythonnet 的运行时 —— **所有** Windows 后端（winforms / edgechromium /
+    # mshtml）都要 `import clr`，缺了窗口根本建不起来。
+    "Python.Runtime.dll",
+)
+
+
+def missing_bundle_assets(root: Path) -> list[str]:
+    """`root` 里缺哪些必须的运行资源。**纯函数** —— 抽出来是为了能被单独验：
+    "这个断言到底会不会红"不能靠"构建通过"来证明（构建通过只说明资源在，
+    证明不了缺了它会拦）。实测拿一个空目录喂进来，7 个名字全在返回里。
+    """
+    got = {p.name for p in root.rglob("*") if p.is_file()}
+    return [w for w in _MUST_BE_BUNDLED if w not in got]
+
+
+def verify_bundle() -> None:
+    """构建产物里必须真的有 pywebview / WebView2 / pythonnet 的运行资源。
+
+    **为什么在"产物"上验，而不是相信命令行旗标。** 旗标写错了 PyInstaller
+    只会打一行 WARNING，构建照样"成功"—— `--collect-all pywebview` 就是
+    这么空了整整几轮（包名该是 `webview`），而它的注释还在承诺"漏了会
+    表现为窗口一片空白"。产物里有没有，才是用户会不会看到一片空白的分界。
+
+    注意这里管的是"窗口内容不对"和"窗口建不起来"。**窗口层的整体兜底**是
+    另一条路：`focus.wait_and_open()` 在 `import window` 失败时会退到系统
+    浏览器，并把原因写进 `focus.log` —— 所以这一条断言失败时，发布包不是
+    "完全不能用"，而是"面板窗口没了、只剩浏览器"，同样得拦住。
+    """
+    missing = missing_bundle_assets(APP)
+    if missing:
+        sys.exit(
+            "构建产物里缺这些运行资源：" + "、".join(missing) + "\n"
+            "打出来的包会表现为「面板一片空白」（窗口能开，但页面里的\n"
+            "pywebview.api 是空的），或者窗口根本建不起来 —— 两种情况都\n"
+            "没有任何报错，用户只会觉得「这功能坏了」。\n"
+            "先检查 build() 里的 --collect-data webview（**包名是 webview，\n"
+            "不是 pywebview**），以及 pythonnet 有没有装。")
+    print(f"[verify] pywebview / WebView2 / pythonnet 的资源都在产物里"
+          f"（查了 {len(_MUST_BE_BUNDLED)} 个文件）")
 
 
 def make_zip(ver: str) -> Path:
@@ -171,6 +243,8 @@ if __name__ == "__main__":
     patch_drawing_utils()
     clean_dist()
     build()
+    # 先验产物再打包：缺了资源就不要出 zip，否则坏包直接发出去。
+    verify_bundle()
     z = make_zip(ver)
     print(f"[done] dist/focus-monitor/focus-monitor.exe 就位")
     print(f"[done] 发给用户的是 {z.name}（把 .sha256 一起贴上）")
