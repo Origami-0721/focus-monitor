@@ -48,3 +48,8 @@ dist/
 .idea/
 Thumbs.db
 desktop.ini
+
+# ── 提交时临时写的提交信息文件 ──
+# 用 `git commit -F _commitmsg.txt` 时，如果同一轮里还跑了 `git add -A`，
+# 这个文件会被一起提交进去（实测踩到过一次，已推到远端才发现）。
+_commitmsg*.txt
