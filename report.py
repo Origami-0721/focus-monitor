@@ -596,7 +596,44 @@ _NAV_CSS = (
 )
 
 
-def trust_banner(corr: float | None, n_pairs: int) -> str:
+def eff_note(n_pairs: int, n_eff: float, n_drop: int = 0) -> str:
+    """配对数量后面那个括注：「等效几条 / 另几条没计入」。
+
+    两个数都只在**和条数不一样**时才出现 —— 没有降权效果、也没有被舍弃的块时
+    返回空串，免得每份报告都挂一句"（等效 90 条，另 0 条未计入）"的废话。
+
+    放在一个函数里是因为它要在两处印出来（顶部横幅和"测量可信度"卡片）。
+    各写一遍的话，两处的口径迟早会不一致，而这两处恰好是用户唯一会看的两个数。
+    """
+    bits = []
+    if n_eff < n_pairs - 0.5:
+        bits.append(f"等效 {n_eff:.0f} 条")
+    if n_drop:
+        bits.append(f"另 {n_drop} 条未计入")
+    return f"（{'，'.join(bits)}）" if bits else ""
+
+
+def drop_note(drop: dict[str, list[float]]) -> str:
+    """没进对照的评分块怎么解释。没有的话返回空串。
+
+    必须解释 —— 用户打了 90 个分、报告只认 67 个，不吭声就是**静默丢数据**：
+    他会以为评分没保存成功，或者以为程序漏了。三个原因的措辞也刻意不一样，
+    因为该采取的动作不一样：`early`/`late` 是"下次早点评"，`thin` 是
+    "那个时段本来就没数据，不是你的问题"。
+    """
+    _why = (("early", "在时段结束前就评了"), ("late", "补分太晚（超过 3 小时）"),
+            ("thin", "那个时段有效数据不足 10 分钟"))
+    bits = [f"{len(drop[k])} 条{b}" for k, b in _why if drop.get(k)]
+    if not bits:
+        return ""
+    n = sum(len(drop[k]) for k, _b in _why)
+    return (f"另有 {n} 条评分没进这张表：{'、'.join(bits)} —— "
+            "它们的评分和实测不是同一段时间（或者那段本来就没数据），"
+            "硬算进去只会污染相关系数。")
+
+
+def trust_banner(corr: float | None, n_pairs: int,
+                 n_eff: float | None = None, n_drop: int = 0) -> str:
     """自述对照的可信度横幅 —— 全报告的信任基础，放在最上面。
 
     它同时是"这份报告能不能读"的开关：相关系数低的时候，下面所有结论都不该信。
@@ -606,19 +643,25 @@ def trust_banner(corr: float | None, n_pairs: int) -> str:
     因为程序里**根本没有校准这个功能**（EAR 基线是自动学的，没有任何校准界面），
     文档里的「校准」一节也只讲"什么时候该调"，不讲"怎么调"、更没说在哪个文档。
     一句话把人指到一个不存在的东西上，比什么都不说更浪费时间。
+
+    `n_pairs` 是配对**条数**（用户看得见的"我打了多少分"），`n_eff` 是**有效
+    样本量**（降权之后实际相当于多少条），`n_drop` 是**根本没进对照的条数**。
+    三个都打出来：只说条数会让人以为 90 条评分很扎实，而其中一部分可能只值
+    三分之一权重、另一部分压根没算进去。
     """
+    _eff = eff_note(n_pairs, n_eff if n_eff is not None else float(n_pairs), n_drop)
     if corr is None:
         return ("<div class='trust pending'><b>数据可信度尚未验证</b> · "
-                f"已配对 {n_pairs}/{ratings.MIN_PAIRS} 个自述评分 —— "
+                f"已配对 {n_pairs}/{ratings.MIN_PAIRS} 个自述评分{_eff} —— "
                 "先把这个凑够，再信下面的结论更有意义。</div>")
     if corr >= 0.7:
         return (f"<div class='trust good'><b>数据可信</b> · 自评和实测"
-                f"相关系数 r = {corr:.2f}，两者是一致的。</div>")
+                f"相关系数 r = {corr:.2f}{_eff}，两者是一致的。</div>")
     if corr >= 0.4:
-        return (f"<div class='trust mid'><b>大致对得上</b> · r = {corr:.2f}，"
+        return (f"<div class='trust mid'><b>大致对得上</b> · r = {corr:.2f}{_eff}，"
                 "大方向一致，但阈值还有调整空间。</div>")
     return (f"<div class='trust bad'><b>先别信其他结论</b> · "
-            f"r = {corr:.2f} 说明测量和你的感受对不上。"
+            f"r = {corr:.2f}{_eff} 说明测量和你的感受对不上。"
             f"要调阈值就去 <b>{_FIX_PATH}</b>（顺序：先 EAR、再姿态角），"
             "保存后 1 秒内生效。"
             "注意程序里<b>没有</b>单独的「校准」功能，EAR 基线是自动学的 —— "
@@ -936,19 +979,36 @@ def build_html(rows: list[tuple], nav_html: str = "",
         day_bars = ""
 
     # ── 自述对照：自评分 vs 实测投入率 ──
+    #
+    # 配对带权重（见 ratings._pair_weight）：块内数据越少、评分补得越晚，
+    # 这一对算的分量越小。所以下面每处统计都走加权，**包括这张逐档对照表** ——
+    # 表和 r 用的是同一批数，一个加权一个不加权的话，会出现"表里 5 分档明显
+    # 比 4 分档低、r 却是正的"这种自相矛盾的读法。
     pairs = ratings.paired(items)
     corr = ratings.correlation(pairs)
-    by_score: dict[int, list[float]] = defaultdict(list)
-    for _bs, sc, measured in pairs:
-        by_score[sc].append(measured)
+    n_eff = ratings.effective_n([p[3] for p in pairs])
+    # 被舍弃的块也要数出来，并且在下面解释清楚 —— 用户打了 90 个分、报告只认
+    # 67 个，中间那 23 个不吭声就是**静默丢数据**：他会以为评分没保存成功。
+    _drop = ratings.dropped(items)
+    _n_drop = sum(len(v) for v in _drop.values())
+    by_score: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    for _bs, sc, measured, w in pairs:
+        by_score[sc].append((measured, w))
     self_rows = "".join(
         f'<tr><td>{s} / 5</td><td class="num">{len(v)}</td>'
-        f'<td>{_rate_cell(sum(v) / len(v) * 100)}</td></tr>'
+        f'<td>{_rate_cell(sum(m * w for m, w in v) / (sum(w for _m, w in v) or 1) * 100)}</td></tr>'
         for s, v in sorted(by_score.items()))
     corr_txt = f"r = {corr:.2f}" if corr is not None else "样本不足"
+    eff_txt = eff_note(len(pairs), n_eff, _n_drop)
+    # 卡片里那句副标题：够不够门槛时说的话不一样 —— 不够就得把门槛摆出来，
+    # 否则用户只看到"31 个自述评分"却看到结论写着"样本不足"（因为门槛现在
+    # 比的是**等效**条数），会以为程序算错了。
+    card_note = f"{len(pairs)} 个自述评分{eff_txt}" + (
+        "" if corr is not None else f"（门槛：等效 {ratings.MIN_PAIRS}）")
     self_html = (
-        f'<p class="sub" style="margin:0 0 14px">配对样本 {len(pairs)} 条 · '
-        f'相关系数 <b>{corr_txt}</b> —— {html.escape(ratings.verdict(corr, len(pairs)))}</p>'
+        f'<p class="sub" style="margin:0 0 14px">配对样本 {len(pairs)} 条{eff_txt} · '
+        f'相关系数 <b>{corr_txt}</b> —— '
+        f'{html.escape(ratings.verdict(corr, n_eff))}</p>'
         + (f'<table><thead><tr><th>你的自评</th><th class="num">样本数</th>'
            f'<th>平均实测投入率</th></tr></thead><tbody>{self_rows}</tbody></table>'
            if by_score else
@@ -956,7 +1016,11 @@ def build_html(rows: list[tuple], nav_html: str = "",
            '这里会出现对照表。</p>')
         + '<p class="note">实测投入率 = (专注 + 中性 + 伏案) ÷ 有效时长。'
           '如果相关性强，说明这套判定和你的真实感受是一回事，黄金时段那张表才可信；'
-          '如果对不上，就先调阈值，别急着信报告里的其他结论。</p>')
+          '如果对不上，就先调阈值，别急着信报告里的其他结论。<br>'
+          '配对不是等权的：块内有效数据越少、打分补得越晚，这一对的分量越小 ——'
+          '所以上面那两个数是「条数」和「降权后的等效条数」，后者才是结论稳不稳的依据。'
+        + (f'<br>{html.escape(drop_note(_drop))}' if _n_drop else '')
+        + '</p>')
 
     avg = lambda xs: sum(xs) / len(xs) if xs else 0.0  # noqa: E731
     days = len({time.strftime("%Y-%m-%d", time.localtime(r[0])) for r in rows})
@@ -1007,7 +1071,7 @@ def build_html(rows: list[tuple], nav_html: str = "",
     # ── 自述对照：这是全报告的信任基础，提到顶部而不是埋在中部 ──
     # README 自己说 r < 0.4 时"别急着信报告里的其他结论"，那就不该让用户
     # 先读完几十行分析才看到它。原来它用 .sub（全文最暗的灰）渲染。
-    trust_tone = trust_banner(corr, len(pairs))
+    trust_tone = trust_banner(corr, len(pairs), n_eff, _n_drop)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -1115,7 +1179,7 @@ def build_html(rows: list[tuple], nav_html: str = "",
     <div class="n">共 {len(sess_rows)} 次会话</div></div>
   <div class="card"><div class="k">测量可信度</div>
     <div class="v" style="font-size:22px">{corr_txt}</div>
-    <div class="n">{len(pairs)}/{ratings.MIN_PAIRS} 个自述评分</div></div>
+    <div class="n">{card_note}</div></div>
 </div>
 
 <h2>黄金时段</h2>

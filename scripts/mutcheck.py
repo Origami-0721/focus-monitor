@@ -717,6 +717,127 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "        if not EYE_BREAK_REMIND:\n            return\n",
         "        if not EYE_BREAK_REMIND:\n            pass\n",
     ),
+    # ── 自述对照：把"不靠谱的配对"降权 / 舍弃 ──
+    #
+    # 每条都打一个**不同的**出口。这一组最容易出的错不是"某条断言没写"，
+    # 而是"写了但只盖住一半" —— 比如只验"满数据 + 刚打完 → 权重 1.0"，
+    # 那么把任一因子写死成 1.0 都照样绿，而"降权"已经名存实亡。
+    (
+        "待评列表不再排除『还没过完的块』（用户会给半场打分，实测就是那 22 条）",
+        "        if now < bs + BLOCK:\n"
+        "            continue                 # 这半小时还没过完，先别问\n",
+        "        if now < 0:\n"
+        "            continue                 # 这半小时还没过完，先别问\n",
+        "ratings.py",
+    ),
+    (
+        "is_ratable 不再排除『还没过完的块』（托盘气泡那条路又漏了）",
+        "    if now < block_start + BLOCK:\n"
+        "        return False             # 块还没过完，没有可评的对象\n",
+        "    if now < 0:\n"
+        "        return False             # 块还没过完，没有可评的对象\n",
+        "ratings.py",
+    ),
+    (
+        "配对权重里的『数据量』项写死 1.0（块里只有 10 分钟数据也当满权）",
+        "    w_data = min(1.0, active / BLOCK)\n",
+        "    w_data = 1.0\n",
+        "ratings.py",
+    ),
+    (
+        "配对权重里的『回忆延迟』项写死 1.0（拖到最后补的分也算满权）",
+        "    w_recall = max(0.0, 1.0 - elapsed / RECENT)\n",
+        "    w_recall = 1.0\n",
+        "ratings.py",
+    ),
+    (
+        "两个权重因子改成相加（0.5+0.5=1.0，降权直接失效）",
+        "    return w_data * w_recall\n",
+        "    return w_data + w_recall\n",
+        "ratings.py",
+    ),
+    (
+        "不丢『块没过完就评了』的配对（评的是半场，实测按整块算）",
+        "        if elapsed < 0:\n"
+        "            drop[\"early\"].append(bs)\n"
+        "            continue\n",
+        "        if elapsed < 0:\n"
+        "            pass\n",
+        "ratings.py",
+    ),
+    (
+        "不丢『补分太晚』的配对（拖了三个多小时的回忆也算数）",
+        "        if elapsed > RECENT:\n"
+        "            drop[\"late\"].append(bs)\n"
+        "            continue\n",
+        "        if elapsed > RECENT:\n"
+        "            pass\n",
+        "ratings.py",
+    ),
+    (
+        "相关门槛比条数而不是有效样本量（90 条几乎没权重的配对也放行）",
+        "    ws = [p[3] for p in pairs]\n"
+        "    if effective_n(ws) < MIN_PAIRS:\n"
+        "        return None\n",
+        "    ws = [p[3] for p in pairs]\n"
+        "    if len(pairs) < MIN_PAIRS:\n"
+        "        return None\n",
+        "ratings.py",
+    ),
+    (
+        "相关系数退回完全等权（权重算了但没用，降权白做）",
+        "    num = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))\n"
+        "    dx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs)) ** 0.5\n"
+        "    dy = sum(w * (y - my) ** 2 for w, y in zip(ws, ys)) ** 0.5\n",
+        "    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))\n"
+        "    dx = sum((x - mx) ** 2 for x in xs) ** 0.5\n"
+        "    dy = sum((y - my) ** 2 for y in ys) ** 0.5\n",
+        "ratings.py",
+    ),
+    (
+        "加权均值退回等权（num/dx/dy 加权了，均值却没有 —— 半吊子加权）",
+        "    mx = sum(w * x for w, x in zip(ws, xs)) / sw\n"
+        "    my = sum(w * y for w, y in zip(ws, ys)) / sw\n",
+        "    mx = sum(xs) / len(xs)\n"
+        "    my = sum(ys) / len(ys)\n",
+        "ratings.py",
+    ),
+    (
+        "有效样本量直接返回条数（降权之后还按条数算显著性）",
+        "    return (sw * sw / sw2) if sw2 > 1e-12 else 0.0\n",
+        "    return float(len(weights))\n",
+        "ratings.py",
+    ),
+    (
+        "报告不解释『有评分没进对照』（用户打了 90 个分、只看到 67 个）",
+        "    bits = [f\"{len(drop[k])} 条{b}\" for k, b in _why if drop.get(k)]\n",
+        "    bits = []\n",
+        "report.py",
+    ),
+    (
+        "页面没接上丢弃解释（drop_note 写好了但没人调）",
+        "        + (f'<br>{html.escape(drop_note(_drop))}' if _n_drop else '')\n",
+        "        + ''\n",
+        "report.py",
+    ),
+    (
+        "没降权也没丢弃时也印一个空括注（每份报告都挂一句废话）",
+        '    return f"（{\'，\'.join(bits)}）" if bits else ""\n',
+        '    return f"（{\'，\'.join(bits)}）"\n',
+        "report.py",
+    ),
+    (
+        "横幅拿条数当有效样本量（降权之后还说『90 条，很扎实』）",
+        "    _eff = eff_note(n_pairs, n_eff if n_eff is not None else float(n_pairs), n_drop)\n",
+        "    _eff = eff_note(n_pairs, float(n_pairs), n_drop)\n",
+        "report.py",
+    ),
+    (
+        "自检不把配置拉回出厂默认（跟着用户的 config.json 变：本机红、CI 绿）",
+        "    apply_config(_DEFAULTS)\n"
+        "    assert DISTRACT_KEYWORDS == _DEFAULTS[\"DISTRACT_KEYWORDS\"], (\n",
+        "    assert DISTRACT_KEYWORDS == _DEFAULTS[\"DISTRACT_KEYWORDS\"], (\n",
+    ),
 ]
 
 

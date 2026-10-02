@@ -2733,6 +2733,29 @@ def uninstall_startup() -> None:
 
 def selftest() -> None:
     """不碰摄像头，只验判定逻辑和报告渲染。"""
+    # **先把配置拉回出厂默认。** 自检必须可复现，而 `config.json` 是用户
+    # 随时会改的东西 —— 它在 import 时就通过 maybe_reload_config() 生效了，
+    # 于是下面那些"哪个关键词命中什么"的断言会跟着用户的设置一起变。
+    #
+    # 实测踩到过：用户按注释里的建议把 `DISTRACT_KEYWORDS` 清空（"想让应用
+    # 完全不参与判定，把表清空即可"），`classify_app("chrome.exe",
+    # "【4K】哔哩哔哩 直播")` 于是返回 other 而不是 distract，自检在**他这台
+    # 机器上**红、在 CI 上绿。这是最难查的一类失败：同一个提交两处结论不同，
+    # 而红的那条断言看起来跟配置毫无关系（B 站直播 vs 关键词表）。
+    #
+    # **先故意弄脏、再重置**，而不是直接重置：直接写的话这条保证在 CI 上
+    # 验不到 —— CI 里没有 config.json，本来就是默认值，把重置那行删掉
+    # 照样全绿，而用户机器上会红。弄脏之后，删掉重置就会被下面两条断言抓住。
+    # 需要非默认配置的断言自己调 apply_config（下面就有几处），不靠环境。
+    apply_config({**_DEFAULTS, "DISTRACT_KEYWORDS": [], "WORK_APPS": []})
+    apply_config(_DEFAULTS)
+    assert DISTRACT_KEYWORDS == _DEFAULTS["DISTRACT_KEYWORDS"], (
+        "自检没把 DISTRACT_KEYWORDS 拉回出厂默认 —— 它会跟着用户的 "
+        "config.json 变（实测：用户清空这张表之后，下面那条 B 站直播的"
+        "断言在他机器上红、在 CI 上绿）")
+    assert WORK_APPS == _DEFAULTS["WORK_APPS"], \
+        "自检没把 WORK_APPS 拉回出厂默认"
+
     # EAR：正三角形似的眼睛 vs 眯成一条缝
     open_eye = [(0, 0), (1, -3), (3, -3), (4, 0), (3, 3), (1, 3)]
     shut_eye = [(0, 0), (1, -0.3), (3, -0.3), (4, 0), (3, 0.3), (1, 0.3)]
@@ -2965,6 +2988,51 @@ def selftest() -> None:
         assert needle in html, f"报告缺少 {needle}"
     assert html.count("<html") == 1
 
+    # ── 没进对照的评分，报告必须**解释**，不能静默丢掉 ──
+    #
+    # 走真实那条路：造一个"块没过完就评了分"的库，看渲染出来的页面里有没有那句
+    # 解释。只测 drop_note() 那个纯函数是不够的 —— 那测的是"这个函数会算"，
+    # 而真正会断的是它有没有被接到页面上（`{drop_note(_drop)}` 那一根线）。
+    # 用户打了 90 个分、报告只认 67 个，不吭声他会以为评分没保存成功。
+    _ratings_mod = __import__("ratings")   # 本文件顶层不 import 它（会成环）
+    _keep_db = globals()["DB_PATH"]
+    _drop_tmp = Path(tempfile.mkdtemp())
+    try:
+        _drop_db = _drop_tmp / "drop.db"
+        _dbs = 1788998400.0          # 1800 的整数倍，块起点
+        _dc = open_db(_drop_db)
+        try:
+            _dc.executescript(SCHEMA)
+            _dc.executescript(_ratings_mod.SCHEMA)
+            _dc.executemany(
+                _SAMPLE_INSERT,
+                [(_dbs + i, "focused", "code.exe", "focus.py", 2.0, 1.0, 0.3,
+                  4.0, 1.0, 1, 0.0, 0.0, 0) for i in range(1800)])
+            # 评分时间在块结束前 10 分钟 —— 就是实测里那 22 条的样子
+            _dc.execute("INSERT INTO ratings(block_start,score,note,rated_at) "
+                        "VALUES(?,?,?,?)", (_dbs, 4, "", _dbs + 1800 - 600))
+            _dc.commit()
+        finally:
+            _dc.close()
+        globals()["DB_PATH"] = _drop_db
+        _drows = [(_dbs + i, "focused", "code.exe", "focus.py", 2.0, 1.0, 0.3,
+                   4.0, 1.0, 1, 0.0) for i in range(1800)]
+        _dh = report.build_html(_drows, eye_rows=(False, []))
+        assert "没进这张表" in _dh, (
+            "报告没解释「有评分没进对照」—— 用户打了 90 个分、只看到 67 个，"
+            "会以为评分没保存成功（或者程序漏了）")
+        assert "在时段结束前就评了" in _dh, "说了有丢弃，但没说是为什么"
+        assert "另有 1 条" in _dh, "丢弃条数没印对"
+        # 反过来：没有丢弃项时不该凭空多印一句。
+        # 指向一个还不存在的库（ratings 会自己建表）—— 绝不能拿上面那份 `html`
+        # 来断言：它是在**用户的真库**上渲染的，有没有丢弃项全看他自己的数据，
+        # 那是"本机红、CI 绿"的经典写法。
+        globals()["DB_PATH"] = _drop_tmp / "empty.db"
+        assert "没进这张表" not in report.build_html(_drows, eye_rows=(False, [])), \
+            "没有丢弃项的报告里也印了那句解释"
+    finally:
+        globals()["DB_PATH"] = _keep_db
+
     # ── 报告的「视疲劳」一节 ──
     #
     # 这里**走真实那条路**（build_html 内部自己调 load_eye() 去读库），
@@ -3069,6 +3137,29 @@ def selftest() -> None:
     assert "数据可信" in report.trust_banner(0.8, 40)
     assert "大致对得上" in report.trust_banner(0.5, 40)
     assert "尚未验证" in report.trust_banner(None, 3)
+
+    # 配对数量后面那个括注：只在和条数不一样时才出现，别挂一句废话
+    assert report.eff_note(90, 90.0, 0) == "", "没降权也没丢弃时不该有括注"
+    assert "等效 57 条" in report.eff_note(67, 56.8, 0)
+    assert "另 23 条未计入" in report.eff_note(67, 67.0, 23)
+    _both = report.eff_note(67, 56.8, 23)
+    assert "等效 57 条" in _both and "另 23 条未计入" in _both, _both
+    # 顶部横幅和「测量可信度」卡片共用同一个括注函数 —— 两处各写一遍，
+    # 口径迟早不一致，而这两处恰好是用户唯一会看的两个数。
+    assert _both in report.trust_banner(0.29, 67, 56.8, 23), \
+        "横幅没用共用的括注函数，或者把等效条数/丢弃条数漏掉了"
+
+    # 没进对照的评分要按原因分开说，因为该采取的动作不一样：
+    # early/late 是"下次早点评"，thin 是"那段本来就没数据，不是你的问题"。
+    assert report.drop_note({"early": [], "late": [], "thin": []}) == "", \
+        "没有丢弃项时不该多印一句"
+    _dn = report.drop_note({"early": [1.0] * 22, "late": [2.0], "thin": []})
+    assert "另有 23 条" in _dn, f"总数算错了：{_dn}"
+    assert "在时段结束前就评了" in _dn and "22 条" in _dn, _dn
+    assert "补分太晚" in _dn, _dn
+    assert "有效数据不足 10 分钟" in report.drop_note(
+        {"early": [], "late": [], "thin": [1.0] * 5}), "thin 的原因没说清楚"
+
     _low = report.trust_banner(0.1, 40)
     assert "先别信" in _low, "低相关的横幅应该明确说「别信其他结论」"
     assert report._FIX_FIELD in _low, (
@@ -3399,17 +3490,95 @@ def selftest() -> None:
                                        + _blk(900, 900, "distracted")))
     assert agg[0.0] == (1800.0, 900.0), agg
 
+    # ── 配对权重：两个因子各自的形状 ──
+    # 这两个因子必须**分别**验。只验"满数据 + 刚打完 → 权重 1.0"的话，
+    # 把其中任何一项写死成 1.0 都照样通过 —— 而那样"降权"就名存实亡了。
+    #
+    # 数据量项：近似逆方差加权，正比于块内有效数据量（比值估计的方差 ∝ 1/n）。
+    assert abs(ratings._pair_weight(1800.0, 0.0) - 1.0) < 1e-9
+    assert abs(ratings._pair_weight(900.0, 0.0) - 0.5) < 1e-9
+    assert abs(ratings._pair_weight(600.0, 0.0) - 1 / 3) < 1e-6, \
+        "刚够门槛（10 分钟）的块该只拿三分之一权重"
+    # 回忆延迟项：刚打完满权，拖到 RECENT 边界降到 0。
+    assert abs(ratings._pair_weight(1800.0, ratings.RECENT / 2) - 0.5) < 1e-9
+    assert ratings._pair_weight(1800.0, ratings.RECENT) == 0.0
+    assert ratings._pair_weight(1800.0, 0.0) == 1.0
+    # 两项是**相乘**：写成相加 / 取最大 / 取最小，这里都会露。
+    assert abs(ratings._pair_weight(900.0, ratings.RECENT / 2) - 0.25) < 1e-9, \
+        "两个因子该相乘（0.5 × 0.5 = 0.25），不是相加或取极值"
+
     # 相关系数。样本数必须过 MIN_PAIRS（现为 30），否则 correlation()
     # 直接返回 None —— 那正是它该做的事，不是 bug。
     _n = ratings.MIN_PAIRS
-    _perfect = [(i, (i % 5) + 1, ((i % 5) + 1) * 0.1) for i in range(_n)]
+    _perfect = [(i, (i % 5) + 1, ((i % 5) + 1) * 0.1, 1.0) for i in range(_n)]
     assert ratings.correlation(_perfect) > 0.99
-    _inverse = [(i, (i % 5) + 1, 1 - ((i % 5) + 1) * 0.1) for i in range(_n)]
+    _inverse = [(i, (i % 5) + 1, 1 - ((i % 5) + 1) * 0.1, 1.0)
+                for i in range(_n)]
     assert ratings.correlation(_inverse) < -0.99
-    assert ratings.correlation([(0, 3, 0.5)] * _n) is None, "评分全一样时算不出相关"
-    assert ratings.correlation([(0, 1, 0.5)] * 3) is None, "样本太少不给结论"
+    assert ratings.correlation([(0, 3, 0.5, 1.0)] * _n) is None, \
+        "评分全一样时算不出相关"
+    assert ratings.correlation([(0, 1, 0.5, 1.0)] * 3) is None, "样本太少不给结论"
     assert ratings.correlation(_perfect[:_n - 1]) is None, \
         f"差一条就该拒绝（门槛 {_n}）"
+
+    # ── 权重必须真的进到公式里，而不是个摆设 ──
+    # 一个"自评最低、实测最高"的离群点（最刺眼的那种矛盾），
+    # 满权时能把 r 从 1.0 拽到 0.62，降到 0.05 权重就只剩 0.97 —— 拽不动了。
+    # 这正是降权的全部意义：让"不靠谱的配对"少说话。
+    _out = (999, 1, 0.9)
+    _heavy = ratings.correlation(_perfect + [_out + (1.0,)])
+    _light = ratings.correlation(_perfect + [_out + (0.05,)])
+    assert _heavy is not None and _light is not None
+    assert _light > _heavy + 0.2, (
+        f"降权没起作用：满权 r={_heavy:.3f}、0.05 权重 r={_light:.3f} —— "
+        "两者该差很多，一样就说明 correlation() 在按等权算")
+    # 权重**只**影响这一对的说话分量，不该顺手改掉"样本够不够"的判断口径：
+    # 有效样本量还是 30 出头，所以照样给结论（不是 None）。
+    assert 30.0 <= ratings.effective_n([p[3] for p in _perfect + [_out + (0.05,)]]) < 31.0
+
+    # ── 有效样本量：衡量的是权重有多**不均匀**，不是有多小 ──
+    assert abs(ratings.effective_n([1.0] * 30) - 30.0) < 1e-9
+    assert abs(ratings.effective_n([0.3] * 90) - 90.0) < 1e-9, (
+        "全部乘同一个常数不该改变有效样本量 —— 相关系数本来就与整体缩放无关，"
+        "把这条写错就会变成「权重越小样本越少」，那是假的")
+    assert abs(ratings.effective_n([1.0] * 27 + [0.01] * 63) - 28.3) < 0.5, (
+        "27 条满权 + 63 条几乎没权重，等效出来该是 28 条左右")
+    assert abs(ratings.effective_n([1.0, 0.0]) - 1.0) < 1e-9
+    assert ratings.effective_n([]) == 0.0
+    assert ratings.effective_n([0.0, 0.0]) == 0.0, "全零权重不能除以零"
+
+    # 门槛比的是**有效样本量**：90 条、但绝大多数没权重，照样不给结论。
+    # 这条是本次改动最容易写漏的地方 —— 用 len(pairs) 比就会在这里放行。
+    _lopsided = [(i, (i % 5) + 1, ((i % 5) + 1) * 0.1,
+                  1.0 if i < 20 else 0.01) for i in range(90)]
+    assert ratings.correlation(_lopsided) is None, (
+        "条数够（90 条）但有效样本量只有 21 条，不能给结论 —— "
+        "MIN_PAIRS 是拿蒙特卡洛标出来的**假阳性率**门槛，假阳性率取决于有效样本量")
+    # 反过来：90 条等权 0.3，有效样本量就是 90，该给结论。
+    assert ratings.correlation([(i, (i % 5) + 1, ((i % 5) + 1) * 0.1, 0.3)
+                                for i in range(90)]) > 0.99
+
+    # ── 均值那一项也必须是加权的（只给 num/dx/dy 加权是"半吊子加权"）──
+    #
+    # 这条单独写，因为**共线数据验不出来**：数据共线时，同一个均值代进
+    # num/dx/dy 三处，结果恒为 ±1，用加权均值还是等权均值都一样。
+    # 所以要用**不共线**的构造 —— 三簇，x=1 和 x=3 满权、x=5 只有 0.05 权重：
+    #
+    #   加权均值 x̄ = 127.5/61.5 ≈ 2.073，等权均值是 3.0，差得远。
+    #   正确加权 → r = −3/√50 ≈ −0.4243（闭式，可手算）
+    #   均值用等权 → r ≈ −0.7237
+    #
+    # 断言闭式值而不是"大概多少"：这条能同时抓住"均值没加权"和"分子分母
+    # 用了不同口径"这两种写法，只差 0.3 的区间判断则会放过后者。
+    _m = ([(i, 1, 0.9, 1.0) for i in range(30)]
+          + [(i, 3, 0.9, 1.0) for i in range(30)]
+          + [(i, 5, 0.1, 0.05) for i in range(30)])
+    _want = -3 / 50 ** 0.5
+    assert abs(ratings.correlation(_m) - _want) < 1e-9, (
+        f"加权皮尔逊算错了：该是 −3/√50 ≈ {_want:.4f}，"
+        f"实际 {ratings.correlation(_m):.4f} —— 均值那一项没按权重算"
+        "（半吊子加权），或者分子分母口径不一致")
+
     assert "强相关" in ratings.verdict(0.8, 20)
     assert "样本" in ratings.verdict(None, 3)
     # 样本量偏少时，结论后面必须挂置信度提示
@@ -3567,17 +3736,93 @@ def selftest() -> None:
     tmp_db = _st_tmp / "ratings.db"
     globals()["DB_PATH"] = tmp_db
     try:
-        ratings.save(0.0, 4)
-        assert ratings.ratings_map()[0.0]["score"] == 4
-        ratings.save(0.0, 2)                      # 同一块重评 → 覆盖而不是新增
-        assert ratings.ratings_map()[0.0]["score"] == 2
+        # 块起点从"现在"往回推，**不能再用 0.0**（=1970 年）：
+        # `ratings.save()` 盖的是 `time.time()`，块起点在 1970 年的话，
+        # "评分比块结束晚了 56 年" → 会被新加的窗口判断判成「补分太晚」丢掉，
+        # 于是这里测的就不是"配对长什么样"，而是"舍弃规则又生效了一次"。
+        #
+        # 取**刚刚结束的那一块**（不是两块之前）：回忆延迟那一项是按"块结束到
+        # 打分隔了多久"扣的，取两块之前的话光是这个就有 20~33% 的扣减，
+        # 下面那条"权重该是满的"断言会假红。
+        _now = time.time()
+        _bs = (int(_now // ratings.BLOCK) - 1) * ratings.BLOCK
+        ratings.save(_bs, 4)
+        assert ratings.ratings_map()[_bs]["score"] == 4
+        ratings.save(_bs, 2)                      # 同一块重评 → 覆盖而不是新增
+        assert ratings.ratings_map()[_bs]["score"] == 2
         assert len(ratings.ratings_map()) == 1
-        full = report._timed(_blk(0, 1800, "focused"))
-        assert ratings.paired(full) == [(0.0, 2, 1.0)], ratings.paired(full)
-        assert ratings.pending(full, now=1900.0) == [], "已评过的块不该再出现"
+
+        # 直接改 rated_at：save() 只会盖当前时间，造不出"早评"和"补太晚"。
+        def _set_rated_at(t: float) -> None:
+            _c = open_db(tmp_db)
+            try:
+                _c.execute("UPDATE ratings SET rated_at=? WHERE block_start=?",
+                           (t, _bs))
+                _c.commit()
+            finally:
+                _c.close()
+
+        _set_rated_at(_bs + ratings.BLOCK)       # 块一结束就评 → 回忆延迟为 0
+        full = report._timed(_blk(_bs, 1800, "focused"))
+        _got = ratings.paired(full)
+        assert len(_got) == 1 and _got[0][:3] == (_bs, 2, 1.0), _got
+        # 块内数据满 30 分钟 + 打完的瞬间就评 → 两个权重因子都是 1，乘积也是 1。
+        # 写成"接近 1"会把公式里的端点错误（比如 1 - elapsed/RECENT 写成
+        # elapsed/RECENT）放过去，所以这里要精确值。
+        assert abs(_got[0][3] - 1.0) < 1e-9, (
+            f"满数据 + 刚打完的分，权重该是 1.0，实际 {_got[0][3]:.4f}")
+        assert ratings.pending(full, now=_now) == [], "已评过的块不该再出现"
         # 数据太少的块不该被要求评分
-        thin = report._timed(_blk(0, 300, "focused"))
-        assert [p for p in ratings.pending(thin, 1900.0)] == []
+        thin = report._timed(_blk(_bs, 300, "focused"))
+        assert [p for p in ratings.pending(thin, _now)] == []
+
+        # ── 块**还没过完**时不能问评分 ──
+        # 原来没有这条判断，而待评列表是"最新的在前" —— 于是正在进行的那半小时
+        # 永远排在第一位，用户打开评分页顺手就评了。实测：90 条评分里 22 条
+        # 是这么来的（最早提前了 18.9 分钟）。评的是"半场"，实测按整块算，
+        # 两者不是同一段时间，混进相关系数就是自己掺噪声。
+        #
+        # 用**下一块**：`_bs` 上面已经评过分了，pending() 会因为它"已评"而跳过，
+        # 那样测到的就不是"块没过完"这条规则（踩过一次：断言假红）。
+        _live_bs = _bs + ratings.BLOCK
+        _live = report._timed(_blk(_live_bs, 900, "focused"))     # 块刚过一半
+        assert ratings.pending(_live, now=_live_bs + 900) == [], (
+            "块还没过完就问评分 —— 评的是半场，实测按整块算，两边对不上")
+        assert ratings.is_ratable(_live, _live_bs, now=_live_bs + 900) is False, \
+            "is_ratable 也该挡住没过完的块"
+        # 块一过完就该出现（只差一秒也该出现，别把边界写错）
+        assert [p["start"] for p in
+                ratings.pending(_live, now=_live_bs + 1801)] == [_live_bs], \
+            "块过完了却还是不给评 —— 边界条件写错了"
+
+        # ── 三条舍弃规则，各造一个反例 ──
+        _set_rated_at(_bs + ratings.BLOCK - 300)         # 块结束前 5 分钟就评了
+        assert ratings.paired(full) == [], "块没过完就评的分必须丢掉"
+        assert ratings.dropped(full)["early"] == [_bs], ratings.dropped(full)
+
+        _set_rated_at(_bs + ratings.BLOCK + ratings.RECENT + 60)   # 拖了 3 小时多
+        assert ratings.paired(full) == [], "补分太晚的分必须丢掉"
+        assert ratings.dropped(full)["late"] == [_bs], ratings.dropped(full)
+
+        _set_rated_at(_bs + ratings.BLOCK)               # 还原成"刚打完"
+        assert ratings.dropped(full) == {"early": [], "late": [], "thin": []}, \
+            ratings.dropped(full)
+
+        # 那个时段一条样本都没有（比如程序没开）→ 实测值无从谈起
+        _ghost = _bs - 4 * ratings.BLOCK
+        ratings.save(_ghost, 3)
+        assert ratings.dropped(full)["thin"] == [_ghost], (
+            "给一个完全没有样本的时段打了分，它既不该进配对、"
+            "也不该从丢弃清单里消失（用户会以为评分丢了）")
+        assert _ghost not in [p[0] for p in ratings.paired(full)]
+
+        # 丢弃清单和配对清单必须**互补**：加起来正好是全部评分。
+        # 两个出口分别判一次的话，迟早漂移成"报告说丢了 3 条、实际丢了 5 条"。
+        _kept = ratings.paired(full)
+        _lost = sum(len(v) for v in ratings.dropped(full).values())
+        assert len(_kept) + _lost == len(ratings.ratings_map()), (
+            f"配对 {len(_kept)} + 丢弃 {_lost} != 评分总数 "
+            f"{len(ratings.ratings_map())} —— 有评分既没进对照、也没被解释")
     finally:
         globals()["DB_PATH"] = real_db
 
