@@ -36,6 +36,14 @@ RECENT = 3 * 3600
 # 样本"下的数，降权之后 90 条低权重的配对并不等于 90 个独立样本。
 MIN_PAIRS = 30
 
+# 判断"档间方向对不对"时，一个自评档至少要几条配对。
+#
+# 只有一条配对的档，它的"档均值"就是那一条自己 —— 一条离群的评分（比如某次
+# 自评 3 分、实测却只有 5%）就能把整段序列弄成"非单调"，于是报告会去说
+# "你的判据反了，该调阈值"。**指错方向比不说话更糟**：用户会照着一句错话
+# 把一套本来正确的判据改坏。所以档位不够时宁可返回"说不清"。
+MIN_BUCKET = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ratings(
     block_start REAL PRIMARY KEY,
@@ -290,12 +298,95 @@ def correlation(pairs: list[tuple]) -> float | None:
     return num / (dx * dy)
 
 
-def verdict(r: float | None, n: float) -> str:
+def measured_diag(pairs: list[tuple]) -> dict:
+    """实测侧还剩多少区分度 —— 用来区分「判据定错了」和「单位太短、分不出来」。
+
+    **为什么非要有这个函数。** r 偏低时报告原来只有一句建议："阈值需要重新调"。
+    可 r 低有两个完全不同的成因，修法相反：
+
+    - **判据错了**：自评高的人实测反而低（档间不单调）→ 该去查阈值。
+    - **单位太短**：方向明明是对的，但**单个 30 分钟块**本身抖得厉害 →
+      这时候去动阈值是**把一套正确的判据改坏**，越调越糟。
+
+    实测量过（67 条配对）：档内池化 σ = 26.9%，档间差平均只有 15.2%，
+    最高的两档（4 分 vs 5 分）只差 **0.9 个百分点** —— 档内抖动是档间差异的
+    1.77 倍。而实测投入率本身的 σ 有 28.9%，**根本不缺区分度**（不是"饱和"）：
+    缺的是"单块这个单位"的分辨率。同一个库按更长的窗口重聚，r 单调上升：
+    30 分钟 0.285 → 3 小时 0.360 → 6 小时 0.547 → 整天 0.631。
+    r 随聚合粒度单调上升，正是"单点噪声主导"的指纹。
+
+    返回的键（空 dict = 档位不够，说不清）：
+
+    - `n_buckets`：参与判断的档数（每档至少 `MIN_BUCKET` 条）。
+    - `within`：**档内**加权池化 σ（同一自评分内部的实测波动）。
+    - `gap`：相邻档之间差的绝对值的平均（想分辨的信号）。
+    - `top_gap`：最高两档之差 —— 最常被拿来区分"还行 / 很好"。
+    - `mono`：档均值是否随自评分**非递减**（方向对不对）。
+
+    `within`/`gap` 都归一在 0~1 尺度上（调用方乘 100 当百分点印）。
+    """
+    acc: dict[int, list[tuple[float, float]]] = {}
+    for _bs, sc, measured, w in pairs:
+        acc.setdefault(sc, []).append((measured, w))
+    st: dict[int, tuple[float, float, float]] = {}
+    for sc, v in acc.items():
+        # 只有一条配对的档，它的"均值"就是那一条自己 —— 一条离群的评分能把
+        # 整段序列弄成"非单调"，然后报告就会去说"你的判据反了，去调阈值"。
+        # 宁可说"看不出来"，也不能指错方向（那会让人把对的判据改坏）。
+        if len(v) < MIN_BUCKET:
+            continue
+        sw = sum(w for _m, w in v)
+        if sw <= 1e-12:
+            continue
+        mean = sum(m * w for m, w in v) / sw
+        var = sum(w * (m - mean) ** 2 for m, w in v) / sw
+        st[sc] = (mean, sw, var ** 0.5)
+    if len(st) < 2:
+        return {}
+    ks = sorted(st)
+    means = [st[k][0] for k in ks]
+    gaps = [means[i + 1] - means[i] for i in range(len(means) - 1)]
+    num = sum(st[k][1] * st[k][2] ** 2 for k in ks)
+    den = sum(st[k][1] for k in ks)
+    return {
+        "n_buckets": len(ks),
+        "within": (num / den) ** 0.5 if den > 1e-12 else 0.0,
+        "gap": sum(abs(g) for g in gaps) / len(gaps),
+        "top_gap": abs(gaps[-1]),
+        "mono": all(g >= 0 for g in gaps),
+    }
+
+
+def diag_kind(diag: dict | None) -> str:
+    """把诊断归成三类成因，`verdict()` / 横幅按它分叉措辞。
+
+    - `"threshold"`：档间**不**单调 —— 自评高的人实测反而低，判据方向可疑，
+      这种情况才该把人指去调阈值。
+    - `"unit"`：档间单调（方向对），但档内抖动 ≥ 档间差 —— 是"单个半小时
+      太短"，调阈值没用。
+    - `""`：说不清（档位不够，或者方向对且档间差本来就够大）。
+      **默认落到原来的措辞**，不新增结论 —— 诊断没把握时不要乱说话。
+    """
+    if not diag or diag.get("n_buckets", 0) < 2:
+        return ""
+    if not diag.get("mono"):
+        return "threshold"
+    if diag["within"] >= diag["gap"]:
+        return "unit"
+    return ""
+
+
+def verdict(r: float | None, n: float, diag: dict | None = None) -> str:
     """把相关系数翻译成人话。
 
     `n` 是**有效样本量**（`effective_n()` 的结果，可能带小数），不是配对条数 ——
     降权之后 90 条只有 0.3 权重的配对，和 27 条满权样本一样虚，
     置信区间该按后者算。
+
+    `diag` 是 `measured_diag()` 的结果（可选）。传了它，措辞就按**成因**分叉：
+    r 低而档间单调时不再说"阈值需要重新调" —— 那种情况动阈值只会把一套正确的
+    判据改坏，真正的原因是对照的单位太短（见 `measured_diag` 里那份实测）。
+    不传（`None`）时行为和以前**逐字一致**，老调用点不受影响。
 
     措辞刻意保守：n 刚过 MIN_PAIRS 时，即使 r 看起来很高，
     95% 置信区间也可能宽到跨过零点（n=30、r=0.6 时区间约 ±0.34）。
@@ -317,10 +408,14 @@ def verdict(r: float | None, n: float) -> str:
     half = 1.96 / (n - 3) ** 0.5 if n > 4 else 1.0
     half = min(half, 1.0)
     loose = "；样本量偏少，这个结论还可能变" if half > 0.25 else ""
+    kind = diag_kind(diag)
 
     if r >= 0.7:
         return f"强相关 —— 测出来的和你感受到的是一回事，数据可信{loose}"
     if r >= 0.4:
+        if kind == "unit":
+            return ("中等相关 —— 大方向对得上；但单个半小时太短、抖动大，"
+                    f"这个数被压低了，阈值不用动{loose}")
         return f"中等相关 —— 大方向对得上，但阈值还有调的空间{loose}"
     # 下面两条**才是真正会推着用户去动阈值**的结论，所以样本量提醒更不能漏。
     # 原来恰好只给上面两条"结论不错"的分支加了 loose，把这两条漏了 ——
@@ -332,9 +427,29 @@ def verdict(r: float | None, n: float) -> str:
     # 设置项的名字由横幅那边管，不在第二个文件里再抄一遍。
     _WHERE = "（在哪调见报告顶部的横幅）"
     if r > -0.4:
+        if kind == "unit":
+            # 这是本轮新增的分支，也是原来最误导的那一种：r 低就一口咬定
+            # "阈值需要重新调"。而逐档表明明显示方向是对的（自评越高、实测
+            # 越高），成因是单块太短 —— 照原来那句话去调阈值，等于把一套
+            # 正确的判据改坏。
+            #
+            # 这一支**排在样本量分支前面**：样本少时那句"再攒一些评分看看"
+            # 在成因是"单位太短"时是误导 —— 再攒评分不会让 r 变大，只会让
+            # 这个数更确定。所以先说清成因，样本量提醒降级成附带一句。
+            return ("基本不相关 —— 但逐档看，你的自评越高、实测投入率也越高，"
+                    "方向是对的；这个数偏低是「单个半小时太短」造成的："
+                    "同一档内部的波动比档与档之间的差还大。阈值不用动，"
+                    "下面那行诊断里有具体数字"
+                    + ("；另外样本量也还偏少，这个数本身还会变。" if half > 0.25
+                       else "。"))
+        if half > 0.25:
+            return ("基本不相关 —— 测量结果和你的感受对不上"
+                    "；但样本量偏少，先别急着动阈值，再攒一些评分看看")
         return ("基本不相关 —— 测量结果和你的感受对不上"
-                + ("；但样本量偏少，先别急着动阈值，再攒一些评分看看"
-                   if half > 0.25 else f"，阈值需要重新调{_WHERE}"))
+                f"，阈值需要重新调{_WHERE}")
+    if kind == "unit":
+        return ("负相关 —— 这很反常，可能是某个判定反了"
+                "；不过逐档看方向是对的，先按下面那行诊断核对一遍")
     return ("负相关 —— 这很反常，可能是某个判定反了"
             + ("；样本量偏少，这个结论还可能变" if half > 0.25
                else f"，建议先查阈值{_WHERE}"))

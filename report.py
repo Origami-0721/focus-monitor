@@ -632,8 +632,41 @@ def drop_note(drop: dict[str, list[float]]) -> str:
             "硬算进去只会污染相关系数。")
 
 
+def diag_note(diag: dict | None) -> str:
+    """「实测侧还剩多少区分度」那一行。说不清时返回空串。
+
+    **为什么必须有这一行。** r 偏低时报告原来只给一句"阈值需要重新调"，
+    可 r 低有两个成因、修法相反：判据错了（该调阈值）vs 对照的单位太短
+    （调阈值只会把对的判据改坏）。没有这行数，用户只能猜，而猜错的方向
+    恰好是破坏性的。见 `ratings.measured_diag` 里的实测量。
+
+    三句话按成因分叉，和 `ratings.diag_kind` 一一对应 —— 措辞不在这里另立
+    一套判据，否则文案和 `verdict()` 会各说各话。
+    """
+    if not diag or diag.get("n_buckets", 0) < 2:
+        return ""
+    head = (f"实测侧还剩多少区分度：同一档内部的波动就有 "
+            f"{diag['within'] * 100:.0f} 个百分点（σ），"
+            f"而档与档之间平均只差 {diag['gap'] * 100:.0f} 个百分点")
+    if diag.get("top_gap") is not None:
+        head += f"，最高的两档只差 {diag['top_gap'] * 100:.0f} 个百分点"
+    head += "。"
+    kind = ratings.diag_kind(diag)
+    if kind == "unit":
+        tail = ("档内抖动比档间差异还大 —— 单个半小时分不出相邻两档，"
+                "所以这个 r 是被「单位长度」压低的，不是阈值定错。"
+                "别去动阈值；要看准不准，看上面那张逐档表，它不依赖 r。")
+    elif kind == "threshold":
+        tail = ("而且档与档之间不是一路上升的 —— 自评更高的人实测反而更低，"
+                "这种情况才真的要去看阈值。")
+    else:
+        tail = "档间差本来就比档内抖动大，说明这个对照粒度是够用的。"
+    return head + tail
+
+
 def trust_banner(corr: float | None, n_pairs: int,
-                 n_eff: float | None = None, n_drop: int = 0) -> str:
+                 n_eff: float | None = None, n_drop: int = 0,
+                 diag: dict | None = None) -> str:
     """自述对照的可信度横幅 —— 全报告的信任基础，放在最上面。
 
     它同时是"这份报告能不能读"的开关：相关系数低的时候，下面所有结论都不该信。
@@ -648,8 +681,13 @@ def trust_banner(corr: float | None, n_pairs: int,
     样本量**（降权之后实际相当于多少条），`n_drop` 是**根本没进对照的条数**。
     三个都打出来：只说条数会让人以为 90 条评分很扎实，而其中一部分可能只值
     三分之一权重、另一部分压根没算进去。
+
+    `diag` 是 `ratings.measured_diag()` 的结果（可选）。传了它，r 偏低时**不再
+    一律把人指去调阈值** —— 逐档方向明明是对的、只是单个半小时太短时，那句话
+    会让人把一套正确的判据改坏。不传时行为和以前逐字一致。
     """
     _eff = eff_note(n_pairs, n_eff if n_eff is not None else float(n_pairs), n_drop)
+    _kind = ratings.diag_kind(diag)
     if corr is None:
         return ("<div class='trust pending'><b>数据可信度尚未验证</b> · "
                 f"已配对 {n_pairs}/{ratings.MIN_PAIRS} 个自述评分{_eff} —— "
@@ -658,8 +696,23 @@ def trust_banner(corr: float | None, n_pairs: int,
         return (f"<div class='trust good'><b>数据可信</b> · 自评和实测"
                 f"相关系数 r = {corr:.2f}{_eff}，两者是一致的。</div>")
     if corr >= 0.4:
+        if _kind == "unit":
+            return (f"<div class='trust mid'><b>大致对得上</b> · r = {corr:.2f}{_eff}，"
+                    "大方向一致；但单个半小时太短、抖动大，这个数被压低了，"
+                    "阈值不用动。</div>")
         return (f"<div class='trust mid'><b>大致对得上</b> · r = {corr:.2f}{_eff}，"
                 "大方向一致，但阈值还有调整空间。</div>")
+    if _kind == "unit":
+        # 逐档方向是对的，只是单位太短 —— 这时候指去"设置 → 判定阈值"是**错的**：
+        # 用户会照着一句错话把一套正确的判据改坏（阈值确实是对的，实测证明
+        # 自评越高投入率越高）。所以这一支不给设置入口，改成指那张逐档表。
+        return (f"<div class='trust bad'><b>先别信其他结论</b> · "
+                f"r = {corr:.2f}{_eff} 偏低，但这<b>不是阈值的问题</b>："
+                "逐档看，你的自评越高、实测投入率也越高，方向是对的；"
+                "偏低是因为「单个半小时」这个单位本身抖动太大"
+                "（同一档内部的波动比档与档之间的差还大）。"
+                "所以先别去动阈值 —— 要看准不准，看下面那张逐档表，"
+                "它不依赖 r。</div>")
     return (f"<div class='trust bad'><b>先别信其他结论</b> · "
             f"r = {corr:.2f}{_eff} 说明测量和你的感受对不上。"
             f"要调阈值就去 <b>{_FIX_PATH}</b>（顺序：先 EAR、再姿态角），"
@@ -999,6 +1052,12 @@ def build_html(rows: list[tuple], nav_html: str = "",
         f'<td>{_rate_cell(sum(m * w for m, w in v) / (sum(w for _m, w in v) or 1) * 100)}</td></tr>'
         for s, v in sorted(by_score.items()))
     corr_txt = f"r = {corr:.2f}" if corr is not None else "样本不足"
+    # 实测侧诊断：r 低到底是"判据错了"还是"单个半小时太短"。
+    # 它决定 verdict / 横幅怎么措辞 —— 没有它，报告只能一律把人指去调阈值，
+    # 而其中一种情况那样做是把正确的判据改坏。
+    _diag = ratings.measured_diag(pairs)
+    _diag_txt = diag_note(_diag)
+    _drop_txt = drop_note(_drop) if _n_drop else ""
     eff_txt = eff_note(len(pairs), n_eff, _n_drop)
     # 卡片里那句副标题：够不够门槛时说的话不一样 —— 不够就得把门槛摆出来，
     # 否则用户只看到"31 个自述评分"却看到结论写着"样本不足"（因为门槛现在
@@ -1008,18 +1067,23 @@ def build_html(rows: list[tuple], nav_html: str = "",
     self_html = (
         f'<p class="sub" style="margin:0 0 14px">配对样本 {len(pairs)} 条{eff_txt} · '
         f'相关系数 <b>{corr_txt}</b> —— '
-        f'{html.escape(ratings.verdict(corr, n_eff))}</p>'
+        f'{html.escape(ratings.verdict(corr, n_eff, _diag))}</p>'
         + (f'<table><thead><tr><th>你的自评</th><th class="num">样本数</th>'
            f'<th>平均实测投入率</th></tr></thead><tbody>{self_rows}</tbody></table>'
            if by_score else
            '<p class="muted">还没有可配对的评分。面板 →「自述评分」给过去的时段打分后，'
            '这里会出现对照表。</p>')
+        # "如果对不上就先调阈值"这句原来是写死的 —— 而现在已知 r 低有两种成因，
+        # 其中"对照单位太短"那一种去调阈值只会把正确的判据改坏。所以改成
+        # 指向下面那行诊断，由它说到底该动什么。
         + '<p class="note">实测投入率 = (专注 + 中性 + 伏案) ÷ 有效时长。'
           '如果相关性强，说明这套判定和你的真实感受是一回事，黄金时段那张表才可信；'
-          '如果对不上，就先调阈值，别急着信报告里的其他结论。<br>'
+          '如果对不上，先看下面那行诊断判断是阈值的问题还是对照粒度的问题，'
+          '别急着信报告里的其他结论。<br>'
           '配对不是等权的：块内有效数据越少、打分补得越晚，这一对的分量越小 ——'
           '所以上面那两个数是「条数」和「降权后的等效条数」，后者才是结论稳不稳的依据。'
-        + (f'<br>{html.escape(drop_note(_drop))}' if _n_drop else '')
+        + (f'<br>{html.escape(_diag_txt)}' if _diag_txt else '')
+        + (f'<br>{html.escape(_drop_txt)}' if _drop_txt else '')
         + '</p>')
 
     avg = lambda xs: sum(xs) / len(xs) if xs else 0.0  # noqa: E731
@@ -1071,7 +1135,7 @@ def build_html(rows: list[tuple], nav_html: str = "",
     # ── 自述对照：这是全报告的信任基础，提到顶部而不是埋在中部 ──
     # README 自己说 r < 0.4 时"别急着信报告里的其他结论"，那就不该让用户
     # 先读完几十行分析才看到它。原来它用 .sub（全文最暗的灰）渲染。
-    trust_tone = trust_banner(corr, len(pairs), n_eff, _n_drop)
+    trust_tone = trust_banner(corr, len(pairs), n_eff, _n_drop, _diag)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -1198,8 +1262,6 @@ def build_html(rows: list[tuple], nav_html: str = "",
 两个平均值都要求该时段至少有 {MIN_BAND_SESSIONS} 个样本，不够就写"样本不足"，不印假数字。</p>
 
 <h2>自述对照（数据准不准）</h2>
-<p class="sub" style="margin:0 0 14px">配对样本 {len(pairs)} 条 · 相关系数
-<b>{corr_txt}</b> —— {html.escape(ratings.verdict(corr, len(pairs)))}</p>
 {self_html}
 
 <details><summary>会话明细与心流片段</summary><div class="dbody">

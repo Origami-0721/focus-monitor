@@ -224,14 +224,20 @@ MUTATIONS: list[tuple[str, str, str]] = [
     ),
     (
         "低相关 + 样本不足时不再劝住用户（直接推着他去动阈值）",
-        '                + ("；但样本量偏少，先别急着动阈值，再攒一些评分看看"\n',
-        '                + ("，阈值需要重新调"\n',
+        "        if half > 0.25:\n"
+        "            return (\"基本不相关 —— 测量结果和你的感受对不上\"\n"
+        "                    \"；但样本量偏少，先别急着动阈值，再攒一些评分看看\")\n",
+        "        if False:\n"
+        "            return (\"基本不相关 —— 测量结果和你的感受对不上\"\n"
+        "                    \"；但样本量偏少，先别急着动阈值，再攒一些评分看看\")\n",
         "ratings.py",
     ),
     (
         "结论里退回「阈值需要重新校准」（又把人指去找一个不存在的功能）",
-        '                   if half > 0.25 else f"，阈值需要重新调{_WHERE}"))\n',
-        '                   if half > 0.25 else "，阈值需要重新校准"))\n',
+        "        return (\"基本不相关 —— 测量结果和你的感受对不上\"\n"
+        "                f\"，阈值需要重新调{_WHERE}\")\n",
+        "        return (\"基本不相关 —— 测量结果和你的感受对不上\"\n"
+        "                f\"，阈值需要重新校准{_WHERE}\")\n",
         "ratings.py",
     ),
     (
@@ -816,7 +822,7 @@ MUTATIONS: list[tuple[str, str, str]] = [
     ),
     (
         "页面没接上丢弃解释（drop_note 写好了但没人调）",
-        "        + (f'<br>{html.escape(drop_note(_drop))}' if _n_drop else '')\n",
+        "        + (f'<br>{html.escape(_drop_txt)}' if _drop_txt else '')\n",
         "        + ''\n",
         "report.py",
     ),
@@ -837,6 +843,81 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "    apply_config(_DEFAULTS)\n"
         "    assert DISTRACT_KEYWORDS == _DEFAULTS[\"DISTRACT_KEYWORDS\"], (\n",
         "    assert DISTRACT_KEYWORDS == _DEFAULTS[\"DISTRACT_KEYWORDS\"], (\n",
+    ),
+    (
+        "成因判反：方向明明是对的，却判成「档内抖动太大」",
+        "    if diag[\"within\"] >= diag[\"gap\"]:\n",
+        "    if diag[\"within\"] < diag[\"gap\"]:\n",
+        "ratings.py",
+    ),
+    (
+        "方向反了（档间不单调）时不吭声（那才是真该去看阈值的情况）",
+        "    if not diag.get(\"mono\"):\n        return \"threshold\"\n",
+        "    if False:\n        return \"threshold\"\n",
+        "ratings.py",
+    ),
+    (
+        "档位判断不做「至少两条」的守卫（一条离群评分就能把方向判反）",
+        "        if len(v) < MIN_BUCKET:\n            continue\n",
+        "        if len(v) < 1:\n            continue\n",
+        "ratings.py",
+    ),
+    (
+        "单调性判反（自评越高、实测越低才算「方向对」）",
+        "        \"mono\": all(g >= 0 for g in gaps),\n",
+        "        \"mono\": all(g <= 0 for g in gaps),\n",
+        "ratings.py",
+    ),
+    (
+        "档内 σ 池化时没按各档权重和加权（两条的档和二十条的档平起平坐）",
+        "    num = sum(st[k][1] * st[k][2] ** 2 for k in ks)\n",
+        "    num = sum(st[k][2] ** 2 for k in ks)\n",
+        "ratings.py",
+    ),
+    (
+        "档位不够时也硬印一行诊断（数据说不出来就别编）",
+        "    if not diag or diag.get(\"n_buckets\", 0) < 2:\n        return \"\"\n",
+        "    if not diag:\n        return \"\"\n",
+        "report.py",
+    ),
+    (
+        "成因是「单位太短」时还指去调阈值（把一套正确的判据改坏）",
+        "        return (f\"<div class='trust bad'><b>先别信其他结论</b> · \"\n"
+        "                f\"r = {corr:.2f}{_eff} 偏低，但这<b>不是阈值的问题</b>：\"\n",
+        "        return (f\"<div class='trust bad'><b>先别信其他结论</b> · \"\n"
+        "                f\"r = {corr:.2f}{_eff} 说明测量和你的感受对不上。\"\n"
+        "                f\"要调阈值就去 <b>{_FIX_PATH}</b>（顺序：先 EAR、再姿态角）。\"\n",
+        "report.py",
+    ),
+    (
+        "verdict 的「中等相关」一支忽略成因（一律说阈值还有调的空间）",
+        "        if kind == \"unit\":\n"
+        "            return (\"中等相关 —— 大方向对得上；但单个半小时太短、抖动大，\"\n",
+        "        if False:\n"
+        "            return (\"中等相关 —— 大方向对得上；但单个半小时太短、抖动大，\"\n",
+        "ratings.py",
+    ),
+    (
+        "verdict 的「基本不相关」一支忽略成因（方向对也让人去调阈值）",
+        "        if kind == \"unit\":\n"
+        "            # 这是本轮新增的分支，也是原来最误导的那一种：r 低就一口咬定\n",
+        "        if False:\n"
+        "            # 这是本轮新增的分支，也是原来最误导的那一种：r 低就一口咬定\n",
+        "ratings.py",
+    ),
+    (
+        "诊断那行写好了却没接到页面上（用户还是只能自己猜）",
+        "        + (f'<br>{html.escape(_diag_txt)}' if _diag_txt else '')\n",
+        "        + ''\n",
+        "report.py",
+    ),
+    (
+        "「配对样本 …」又印成两遍（两遍 n 口径不同 → 结论互相矛盾）",
+        "{self_html}\n",
+        "<p class=\"sub\" style=\"margin:0 0 14px\">配对样本 {len(pairs)} 条 · 相关系数\n"
+        "<b>{corr_txt}</b> —— {html.escape(ratings.verdict(corr, len(pairs)))}</p>\n"
+        "{self_html}\n",
+        "report.py",
     ),
 ]
 

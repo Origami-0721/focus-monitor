@@ -3000,29 +3000,53 @@ def selftest() -> None:
     try:
         _drop_db = _drop_tmp / "drop.db"
         _dbs = 1788998400.0          # 1800 的整数倍，块起点
+        _drows = [(_dbs + i, "focused", "code.exe", "focus.py", 2.0, 1.0, 0.3,
+                   4.0, 1.0, 1, 0.0) for i in range(1800)]
+        # 再加 4 个块、两个自评档 —— 「实测侧还剩多少区分度」那行要至少两个
+        # 档才印得出来（见 ratings.MIN_BUCKET）。上面那个块是**被丢弃**的
+        # （评分早于块结束），只放它一个时诊断必然是空的，接没接上都看不出来。
+        _extra: list[tuple] = []
         _dc = open_db(_drop_db)
         try:
             _dc.executescript(SCHEMA)
             _dc.executescript(_ratings_mod.SCHEMA)
-            _dc.executemany(
-                _SAMPLE_INSERT,
-                [(_dbs + i, "focused", "code.exe", "focus.py", 2.0, 1.0, 0.3,
-                  4.0, 1.0, 1, 0.0, 0.0, 0) for i in range(1800)])
+            _dc.executemany(_SAMPLE_INSERT, [(*_r, 0.0, 0) for _r in _drows])
             # 评分时间在块结束前 10 分钟 —— 就是实测里那 22 条的样子
             _dc.execute("INSERT INTO ratings(block_start,score,note,rated_at) "
                         "VALUES(?,?,?,?)", (_dbs, 4, "", _dbs + 1800 - 600))
+            for _k, _sc in enumerate((2, 2, 5, 5)):
+                _b2 = _dbs + 1800 * (_k + 1)
+                _rows2 = [(_b2 + i, "focused", "code.exe", "focus.py", 2.0, 1.0,
+                           0.3, 4.0, 1.0, 1, 0.0) for i in range(1800)]
+                _dc.executemany(_SAMPLE_INSERT,
+                                [(*_r, 0.0, 0) for _r in _rows2])
+                # 评在块结束之后 1 分钟 —— 既不算"评了半场"，也没超出 3 小时
+                _dc.execute("INSERT INTO ratings(block_start,score,note,rated_at) "
+                            "VALUES(?,?,?,?)", (_b2, _sc, "", _b2 + 1800 + 60))
+                _extra += _rows2
             _dc.commit()
         finally:
             _dc.close()
+        _drows += _extra
         globals()["DB_PATH"] = _drop_db
-        _drows = [(_dbs + i, "focused", "code.exe", "focus.py", 2.0, 1.0, 0.3,
-                   4.0, 1.0, 1, 0.0) for i in range(1800)]
         _dh = report.build_html(_drows, eye_rows=(False, []))
         assert "没进这张表" in _dh, (
             "报告没解释「有评分没进对照」—— 用户打了 90 个分、只看到 67 个，"
             "会以为评分没保存成功（或者程序漏了）")
         assert "在时段结束前就评了" in _dh, "说了有丢弃，但没说是为什么"
         assert "另有 1 条" in _dh, "丢弃条数没印对"
+        # 诊断那行有没有真的接到页面上（`{_diag_txt}` 那根线）。分支逻辑由
+        # 上面那几条纯函数断言守着，这里只管"接线断了没有"。
+        assert "实测侧还剩多少区分度" in _dh, (
+            "报告没接上「实测侧还剩多少区分度」那行 —— 用户只看到 r 低，"
+            "只能自己猜是该动阈值还是动别处")
+        # 「配对样本 …」这句**只能印一遍**。之前它印了两遍，而且两遍拿的 n
+        # 不一样（一遍用条数、一遍用等效条数），于是结论互相矛盾：
+        # 同一节里上面一行写"阈值需要重新调"、下面一行写"先别急着动阈值"。
+        # 这种自相矛盾没有任何报错，用户只会觉得报告不可信。
+        assert _dh.count("配对样本") == 1, (
+            f"「配对样本 …」那句印了 {_dh.count('配对样本')} 次 —— "
+            "两句拿的样本量口径不同时，会给出互相矛盾的结论")
         # 反过来：没有丢弃项时不该凭空多印一句。
         # 指向一个还不存在的库（ratings 会自己建表）—— 绝不能拿上面那份 `html`
         # 来断言：它是在**用户的真库**上渲染的，有没有丢弃项全看他自己的数据，
@@ -3600,18 +3624,122 @@ def selftest() -> None:
     assert "还可能变" not in ratings.verdict(-0.5, 100), \
         "样本够了就不该再挂「结论还可能变」"
 
+    # ── 实测侧诊断：r 低到底是「判据错了」还是「单个半小时太短」 ──
+    #
+    # 这是本轮的核心修复。原来 r 低只有一句建议"阈值需要重新调"，而实测量表明
+    # 用户那份数据里方向明明是对的（自评越高、实测越高），成因是**单块太短**：
+    # 档内抖动 27% > 档间差 15%。照原来那句话去调阈值，等于把一套正确的判据
+    # 改坏 —— 所以文案必须按成因分叉。
+    _D_UNIT = {"n_buckets": 4, "within": 0.27, "gap": 0.15,
+               "top_gap": 0.01, "mono": True}     # 方向对，但档内抖 > 档间差
+    _D_TH = {"n_buckets": 3, "within": 0.10, "gap": 0.20,
+             "top_gap": 0.05, "mono": False}      # 自评高反而实测低 → 方向反了
+    _D_OK = {"n_buckets": 3, "within": 0.08, "gap": 0.20,
+             "top_gap": 0.15, "mono": True}       # 方向对且档间差够大
+    assert ratings.diag_kind(_D_UNIT) == "unit"
+    assert ratings.diag_kind(_D_TH) == "threshold"
+    assert ratings.diag_kind(_D_OK) == "", \
+        "方向对、档间差也够大时不该给出任何成因结论"
+    assert ratings.diag_kind(None) == "" and ratings.diag_kind({}) == ""
+    assert ratings.diag_kind({"n_buckets": 1, "mono": True, "within": 0.3,
+                              "gap": 0.1}) == "", "只有一个档位时说不出任何话"
+
+    # 方向对（单调）时**绝不能再让人去调阈值** —— 那会把对的判据改坏。
+    _v_unit = ratings.verdict(0.29, 100, _D_UNIT)
+    assert "阈值不用动" in _v_unit, \
+        f"方向对、只是单块太短时，不该再指去调阈值：{_v_unit!r}"
+    assert "阈值需要重新调" not in _v_unit, _v_unit
+    # 样本偏少时也不能改口：成因是单位太短，攒评分不会让 r 变大，只会更确定。
+    assert "阈值不用动" in ratings.verdict(0.1, ratings.MIN_PAIRS + 1, _D_UNIT), \
+        "样本偏少时那句「再攒一些评分看看」在成因是单位太短时是误导"
+    # 方向反了那一支仍然要指去调阈值（这条是原来就有的行为，别一起改掉）。
+    assert "阈值需要重新调" in ratings.verdict(0.29, 100, _D_TH), \
+        "档间不单调时该去看阈值，不能一起改成「不用动」"
+    # 诊断说不清时，逐字退回原来的措辞（老调用点不受影响）。
+    assert ratings.verdict(0.1, 100, _D_OK) == ratings.verdict(0.1, 100), \
+        "诊断说不清时应该和没传诊断时逐字一致"
+    assert "阈值不用动" in ratings.verdict(0.5, 100, _D_UNIT)
+    assert "阈值还有调的空间" in ratings.verdict(0.5, 100, _D_TH)
+    assert "阈值还有调的空间" in ratings.verdict(0.5, 100)
+
+    # measured_diag 本身：档内 σ、档间差、单调性、以及"一条离群评分不能
+    # 把方向判反"这条守卫。
+    _d = ratings.measured_diag([(1, 1, 0.2, 1.0), (2, 1, 0.2, 1.0),
+                                (3, 4, 0.8, 1.0), (4, 4, 0.8, 1.0)])
+    assert _d["n_buckets"] == 2 and abs(_d["within"]) < 1e-9, _d
+    assert abs(_d["gap"] - 0.6) < 1e-9 and abs(_d["top_gap"] - 0.6) < 1e-9, _d
+    assert _d["mono"] is True, _d
+    assert ratings.diag_kind(_d) == "", \
+        "档内完全没抖动、档间差 0.6 时，这个粒度是够用的，不该给成因结论"
+    _d2 = ratings.measured_diag([(1, 1, 0.9, 1.0), (2, 1, 0.9, 1.0),
+                                 (3, 4, 0.2, 1.0), (4, 4, 0.2, 1.0)])
+    assert _d2["mono"] is False and ratings.diag_kind(_d2) == "threshold", _d2
+    # 只有一条配对的档不参与判断：它的"档均值"就是那一条自己，一条离群的
+    # 评分就能把整段判成"非单调"，然后报告会去说"你的判据反了"。
+    # 指错方向比不说话更糟 —— 用户会照着一句错话把正确的判据改坏。
+    _d3 = ratings.measured_diag([(1, 1, 0.2, 1.0), (2, 1, 0.3, 1.0),
+                                 (3, 3, 0.5, 1.0), (4, 3, 0.6, 1.0),
+                                 (5, 4, 0.05, 1.0)])
+    assert _d3["n_buckets"] == 2, (
+        f"只有一条配对的档不该参与判断（它会独占那个档的均值）：{_d3}")
+    assert _d3["mono"] is True, (
+        "一条离群的 4 分评分把档间方向判成了递减 —— 这会让人去改一套正确的判据")
+    assert ratings.measured_diag([(1, 1, 0.5, 1.0)]) == {}, \
+        "只有一个档位时诊断该是空的，而不是编一个出来"
+    # 档内 σ 的池化必须按各档的**权重和**加权 —— 不然一个只有两条的档会和
+    # 二十条的档平起平坐，把整体抖动算歪，进而把成因判错。
+    # 手算：档1 两条 w=3.0、σ=0；档5 两条 w=0.1、σ=0.3
+    #   → √((6.0×0 + 0.2×0.09) / 6.2) = 0.05388…
+    #   （若按档数等权池化则是 √(0.09/2) = 0.2121，差了 4 倍）
+    _d5 = ratings.measured_diag([(1, 1, 0.0, 3.0), (2, 1, 0.0, 3.0),
+                                 (3, 5, 0.0, 0.1), (4, 5, 0.6, 0.1)])
+    assert abs(_d5["within"] - 0.0538816) < 1e-6, (
+        f"档内 σ 的池化没按权重和加权：该是 0.05388，实际 {_d5['within']:.5f}"
+        "（等权池化会给 0.2121）")
+
+    # 报告里那行诊断的措辞，以及它和 verdict 用同一套判据（不各说各话）。
+    assert report.diag_note(None) == "" and report.diag_note({}) == ""
+    assert report.diag_note({"n_buckets": 1, "within": 0.3, "gap": 0.1,
+                             "top_gap": 0.05, "mono": True}) == "", \
+        "档位不够时不该硬印一行诊断"
+    _dn_unit = report.diag_note(_D_UNIT)
+    assert "27" in _dn_unit and "15" in _dn_unit and "1 个百分点" in _dn_unit, \
+        _dn_unit
+    assert "不是阈值定错" in _dn_unit and "别去动阈值" in _dn_unit, _dn_unit
+    assert "逐档表" in _dn_unit, "该把用户指到那张不依赖 r 的表上"
+    _dn_th = report.diag_note(_D_TH)
+    assert "才真的要去看阈值" in _dn_th, _dn_th
+    assert "别去动阈值" not in _dn_th, "方向反了的时候还劝人别动阈值是错的"
+    assert "粒度是够用的" in report.diag_note(_D_OK), \
+        "档间差本来就够大时该说这个粒度没问题，而不是硬找毛病"
+
+    # 横幅：成因是"单位太短"时**不能给设置入口** —— 用户会照着去改一个
+    # 本来就对的阈值。这是"照做不了 / 照着做反而更糟"的第三种形态。
+    _b_unit = report.trust_banner(0.29, 67, 56.8, 23, _D_UNIT)
+    assert report._FIX_FIELD not in _b_unit, (
+        f"单位太短时横幅还指去改「{report._FIX_FIELD}」—— "
+        "阈值是对的，照做只会更糟")
+    assert "不是阈值的问题" in _b_unit and "逐档表" in _b_unit, _b_unit
+    assert report._FIX_FIELD in report.trust_banner(0.1, 40, None, 0, _D_TH), \
+        "方向反了那一支仍然要指名道姓给设置入口"
+    assert report.trust_banner(0.1, 40) == report.trust_banner(0.1, 40, None, 0, None), \
+        "不传诊断时的横幅应该逐字和以前一致"
+    assert "阈值不用动" in report.trust_banner(0.5, 40, None, 0, _D_UNIT)
+    assert "阈值还有调整空间" in report.trust_banner(0.5, 40, None, 0, _D_TH)
+
     # 措辞里不许出现「校准」——程序里没有这个功能（EAR 基线是自动学的），
     # 写了就是把人指到一个不存在的地方（实测反馈：用户说「没找到校准交互」）。
-    # 扫全部 (r, n) 组合而不是抽查几条：以后任何分支想加回"重新校准"，
-    # 都会在这里被拦下，不用指望谁记得住这条规则。
+    # 扫全部 (r, n) × 全部诊断 组合，而不是抽查几条：以后任何分支（包括新加的
+    # 成因分叉）想加回"重新校准"，都会在这里被拦下，不用指望谁记得住这条规则。
     for _r in (None, -1.0, -0.5, -0.4, -0.3, 0.0, 0.1, 0.39, 0.4, 0.5,
                0.69, 0.7, 0.8, 1.0):
         for _nn in (3, 4, 5, ratings.MIN_PAIRS, ratings.MIN_PAIRS + 1,
                     64, 65, 100, 500):
-            _v = ratings.verdict(_r, _nn)
-            assert "校准" not in _v, (
-                f"verdict({_r}, {_nn}) 里出现了「校准」：{_v!r} —— "
-                "程序没有校准功能，用户会照着去找（实测反馈过）")
+            for _dg in (None, _D_UNIT, _D_TH, _D_OK):
+                _v = ratings.verdict(_r, _nn, _dg)
+                assert "校准" not in _v, (
+                    f"verdict({_r}, {_nn}, {_dg}) 里出现了「校准」：{_v!r} —— "
+                    "程序没有校准功能，用户会照着去找（实测反馈过）")
 
     # ── 下面四段都用**临时目录里的库**，不再往仓库目录丢 `_selftest_*.db` ──
     #
