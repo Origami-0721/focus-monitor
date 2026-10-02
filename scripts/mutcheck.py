@@ -919,6 +919,23 @@ MUTATIONS: list[tuple[str, str, str]] = [
         "{self_html}\n",
         "report.py",
     ),
+    (
+        "wpearson 也加上样本量门槛（稳健性工具的留一法/bootstrap 全变 None）",
+        "    sw = sum(ws)\n"
+        "    if sw < 1e-9 or len(xs) < 3:\n        return None\n",
+        "    sw = sum(ws)\n"
+        "    if sw < 1e-9 or len(xs) < 3 or effective_n(ws) < MIN_PAIRS:\n"
+        "        return None\n",
+        "ratings.py",
+    ),
+    (
+        "wpearson 退化时返回 nan 而不是 None（nan 会渗进区间和排序，不报错）",
+        "    if dx < 1e-9 or dy < 1e-9:\n"
+        "        return None          # 评分全一样，算不出相关\n",
+        "    if dx < 1e-9 or dy < 1e-9:\n"
+        "        return float('nan')  # 评分全一样，算不出相关\n",
+        "ratings.py",
+    ),
 ]
 
 

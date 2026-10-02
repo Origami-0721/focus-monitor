@@ -269,6 +269,32 @@ def dropped(items: list[tuple]) -> dict[str, list[float]]:
     return _pair_rows(items)[1]
 
 
+def wpearson(xs: list[float], ys: list[float],
+             ws: list[float]) -> float | None:
+    """加权皮尔逊相关系数，**不带任何门槛**。退化输入返回 None。
+
+    单独抽出来是为了**只有一份公式**。`scripts/corr_robust.py` 要拿它做
+    留一法和 bootstrap —— 那些场景**必须**能在样本不足时也算出数
+    （"样本不够时这个数有多不稳"正是要测的东西），所以不能走
+    `correlation()` 的 `MIN_PAIRS` 门槛。
+
+    但"不能走门槛"不等于"该抄一份公式"：抄一份的话，以后改了加权口径，
+    稳健性检验就会在**检验另一个数**，而且不会有任何报错 —— 它会一本正经地
+    告诉你"报告上那个数很稳"，稳的是它自己那份公式。
+    """
+    sw = sum(ws)
+    if sw < 1e-9 or len(xs) < 3:
+        return None
+    mx = sum(w * x for w, x in zip(ws, xs)) / sw
+    my = sum(w * y for w, y in zip(ws, ys)) / sw
+    num = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
+    dx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs)) ** 0.5
+    dy = sum(w * (y - my) ** 2 for w, y in zip(ws, ys)) ** 0.5
+    if dx < 1e-9 or dy < 1e-9:
+        return None          # 评分全一样，算不出相关
+    return num / (dx * dy)
+
+
 def correlation(pairs: list[tuple]) -> float | None:
     """**加权**皮尔逊相关系数。样本不够就返回 None —— 别拿三个点算相关。
 
@@ -283,19 +309,7 @@ def correlation(pairs: list[tuple]) -> float | None:
     ws = [p[3] for p in pairs]
     if effective_n(ws) < MIN_PAIRS:
         return None
-    xs = [p[1] for p in pairs]
-    ys = [p[2] for p in pairs]
-    sw = sum(ws)
-    if sw < 1e-9:
-        return None
-    mx = sum(w * x for w, x in zip(ws, xs)) / sw
-    my = sum(w * y for w, y in zip(ws, ys)) / sw
-    num = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
-    dx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs)) ** 0.5
-    dy = sum(w * (y - my) ** 2 for w, y in zip(ws, ys)) ** 0.5
-    if dx < 1e-9 or dy < 1e-9:
-        return None          # 评分全一样，算不出相关
-    return num / (dx * dy)
+    return wpearson([p[1] for p in pairs], [p[2] for p in pairs], ws)
 
 
 def measured_diag(pairs: list[tuple]) -> dict:

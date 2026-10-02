@@ -3603,6 +3603,34 @@ def selftest() -> None:
         f"实际 {ratings.correlation(_m):.4f} —— 均值那一项没按权重算"
         "（半吊子加权），或者分子分母口径不一致")
 
+    # `wpearson` 是**不带门槛**的原始公式，`correlation` 只是它加了门槛的包装。
+    # 两件事都要钉住：
+    #   1) 同一个闭式值 —— `scripts/corr_robust.py` 靠它做留一法和 bootstrap，
+    #      口径一旦分叉，那个工具会去**检验另一个数**而毫无报错，
+    #      然后一本正经地报告"报告上那个数很稳"（稳的是它自己那份公式）。
+    #   2) **不许有门槛** —— 稳健性检验要的正是"样本不够时这个数是多少"。
+    _wp = ratings.wpearson([p[1] for p in _m], [p[2] for p in _m],
+                           [p[3] for p in _m])
+    assert abs(_wp - _want) < 1e-9, (
+        f"wpearson 的闭式值不对：该是 {_want:.4f}，实际 {_wp:.4f}")
+    assert _wp == ratings.correlation(_m), \
+        "correlation 必须就是「wpearson + 门槛」，不能各算一份公式"
+    _tiny = [(1, 1, 0.9, 1.0), (2, 2, 0.5, 1.0),
+             (3, 3, 0.2, 1.0), (4, 4, 0.1, 1.0)]
+    assert ratings.correlation(_tiny) is None, "4 个点时 correlation 该拒绝"
+    assert ratings.wpearson([p[1] for p in _tiny], [p[2] for p in _tiny],
+                            [p[3] for p in _tiny]) is not None, (
+        "wpearson 不该有样本量门槛 —— 留一法和 bootstrap 在样本不足时"
+        "也必须能算出数，加门槛会让那个工具静默失效（全变成 None）")
+    # 退化输入一律 None，**不能给 nan**：nan 会一路渗进区间、排序和"最敏感点"
+    # 的挑选，全程不报错，只是结论变成乱码。
+    assert ratings.wpearson([1, 2, 3], [1, 1, 1], [1, 1, 1]) is None, \
+        "一侧完全没有变化时该返回 None，不是 nan"
+    assert ratings.wpearson([1, 2], [1, 2], [1, 1]) is None, \
+        "少于 3 个点算不出相关"
+    assert ratings.wpearson([1, 2, 3], [1, 2, 3], [0.0, 0.0, 0.0]) is None, \
+        "权重全为 0 时该返回 None，不是除零"
+
     assert "强相关" in ratings.verdict(0.8, 20)
     assert "样本" in ratings.verdict(None, 3)
     # 样本量偏少时，结论后面必须挂置信度提示
